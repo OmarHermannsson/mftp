@@ -70,16 +70,16 @@ where
     // Read the first byte with read() so we can distinguish a clean EOF
     // (returns 0) from a mid-frame truncation.
     let mut len_buf = [0u8; 4];
-    if stream.read(&mut len_buf[..1]).await? == 0 {
+    if stream.read(&mut len_buf[..1]).await.context("read frame header byte 0")? == 0 {
         return Ok(None); // clean EOF at a frame boundary
     }
-    stream.read_exact(&mut len_buf[1..]).await?;
+    stream.read_exact(&mut len_buf[1..]).await.context("read frame header bytes 1-3")?;
 
     let len = u32::from_le_bytes(len_buf);
     if len > max_size {
         bail!("frame too large: {len} bytes (limit {max_size})");
     }
     let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await?;
+    stream.read_exact(&mut buf).await.with_context(|| format!("read frame body ({len} bytes)"))?;
     Ok(Some(bincode::deserialize(&buf)?))
 }

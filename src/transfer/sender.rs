@@ -16,6 +16,7 @@ use tracing::{debug, info};
 
 use crate::compress;
 use crate::net::connection::make_client_endpoint;
+use crate::net::tcp::connect_tls;
 use crate::protocol::{
     framing,
     messages::{
@@ -34,23 +35,57 @@ pub struct SendConfig {
     pub compress: bool,
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
-    /// Ignored in TCP mode (no TLS).
     pub trusted_fingerprint: Option<String>,
-    /// Use plain TCP instead of QUIC. Faster on LAN; no encryption.
+    /// Force TCP+TLS instead of QUIC. Normally not needed — the sender tries
+    /// QUIC first and auto-falls-back to TCP+TLS if UDP is blocked.
     pub use_tcp: bool,
 }
 
+/// How long to wait for a QUIC connection before falling back to TCP+TLS.
+const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     if config.use_tcp {
-        send_tcp(file, destination, config).await
-    } else {
-        send_quic(file, destination, config).await
+        return send_tcp(file, destination, config).await;
+    }
+
+    // Try QUIC first; fall back to TCP+TLS if UDP is blocked or the connection
+    // times out.  Only the connect phase triggers a fallback — errors during
+    // the transfer itself are surfaced as real errors.
+    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref())?;
+    info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
+    let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
+        let connecting = endpoint
+            .connect(destination, "mftp")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        connecting.await.map_err(|e| anyhow::anyhow!("{e}"))
+    })
+    .await;
+
+    match quic_result {
+        Ok(Ok(conn)) => {
+            info!("connected via QUIC");
+            send_quic_with_conn(file, destination, config, conn).await
+        }
+        Ok(Err(e)) => {
+            eprintln!("[mftp] QUIC connect failed ({e:#}), retrying over TCP+TLS…");
+            send_tcp(file, destination, config).await
+        }
+        Err(_timeout) => {
+            eprintln!("[mftp] QUIC connect timed out (UDP may be blocked), retrying over TCP+TLS…");
+            send_tcp(file, destination, config).await
+        }
     }
 }
 
 // ── QUIC path ─────────────────────────────────────────────────────────────────
 
-async fn send_quic(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
+async fn send_quic_with_conn(
+    file: PathBuf,
+    _destination: SocketAddr,
+    config: SendConfig,
+    conn: quinn::Connection,
+) -> Result<()> {
     // ── Gather file metadata ──────────────────────────────────────────────────
     let meta = tokio::fs::metadata(&file)
         .await
@@ -78,15 +113,6 @@ async fn send_quic(file: PathBuf, destination: SocketAddr, config: SendConfig) -
 
     let sender_cores =
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-
-    // ── Connect ───────────────────────────────────────────────────────────────
-    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref())?;
-    info!("connecting to {destination}");
-    let conn = endpoint
-        .connect(destination, "mftp")?
-        .await
-        .context("QUIC connect failed")?;
-    info!("connected");
 
     // ── Control stream: negotiate parameters ──────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
@@ -232,9 +258,9 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
 
     // ── Connect control stream ────────────────────────────────────────────────
-    info!("connecting to {destination} (TCP)");
-    let ctrl = crate::net::tcp::connect_tcp(destination).await?;
-    let (mut ctrl_recv, mut ctrl_send) = ctrl.into_split();
+    info!("connecting to {destination} (TCP+TLS)");
+    let ctrl = connect_tls(destination, config.trusted_fingerprint.as_deref()).await?;
+    let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl);
     info!("connected");
 
     // ── Negotiate + measure RTT ───────────────────────────────────────────────
@@ -305,7 +331,8 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..actual_streams {
-        let data_stream = crate::net::tcp::connect_tcp(destination).await?;
+        let data_stream =
+            connect_tls(destination, config.trusted_fingerprint.as_deref()).await?;
         let queue = queue.clone();
         let have = have.clone();
         let file_path = file.clone();
@@ -334,18 +361,25 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
 }
 
 async fn tcp_stream_worker(
-    stream: tokio::net::TcpStream,
+    mut stream: crate::net::tcp::ClientTlsStream<tokio::net::TcpStream>,
     queue: Arc<ChunkQueue>,
     skip: Arc<HashSet<u64>>,
     file_path: PathBuf,
     transfer_id: [u8; 16],
     compression: Compression,
 ) -> Result<()> {
-    // Split: we only write on data streams; dropping the read half half-closes
-    // the connection, which is harmless (receiver only reads).
-    let (_read, mut write) = stream.into_split();
-    send_chunks(&mut write, queue, skip, &file_path, transfer_id, &compression).await
-    // write (and thus the TCP stream's write side) closes on drop → receiver sees EOF
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression)
+        .await
+        .context("send_chunks")?;
+    // Send TLS close_notify so the receiver sees a clean EOF.
+    stream.shutdown().await.context("TLS shutdown on data stream")?;
+    // Drain the server's close_notify before dropping.  Without this, the
+    // kernel sends a RST when the socket is dropped with unread data in the
+    // receive buffer, which arrives on the server side as ECONNRESET mid-read.
+    let mut drain = [0u8; 1];
+    let _ = stream.read(&mut drain).await;
+    Ok(())
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────

@@ -66,7 +66,8 @@ fn sender_transport() -> Arc<quinn::TransportConfig> {
 /// certificate, which should be printed for the user to share with the sender.
 pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)> {
     install_crypto_provider();
-    let (cert_der, key_der) = generate_self_signed_cert()?;
+    let (cert_der, key_bytes) = generate_self_signed_cert()?;
+    let key_der = make_private_key(key_bytes)?;
     let fingerprint = cert_fingerprint(&cert_der);
 
     let server_crypto = rustls::ServerConfig::builder()
@@ -93,6 +94,39 @@ pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)>
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
+
+/// Bind a QUIC server endpoint using a pre-generated certificate.
+///
+/// Use this when you want QUIC and TCP to share the same self-signed certificate
+/// (and therefore the same fingerprint).
+pub fn make_server_endpoint_with_cert(
+    bind_addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Endpoint> {
+    install_crypto_provider();
+
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .context("failed to build rustls server config")?;
+
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
+    ));
+    server_config.transport_config(receiver_transport());
+
+    let socket = make_udp_socket(bind_addr)?;
+    let runtime = quinn::default_runtime().context("no async runtime")?;
+    let endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        runtime,
+    )?;
+
+    Ok(endpoint)
+}
 
 /// Build a QUIC client endpoint.
 ///
@@ -154,17 +188,54 @@ fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
 
 // ── TLS certificate helpers ───────────────────────────────────────────────────
 
-fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+/// Generate a fresh self-signed certificate for this endpoint.
+///
+/// Returns the DER-encoded certificate and the raw private-key bytes.
+/// The raw key bytes can be cloned freely; call [`make_private_key`] to
+/// reconstruct a [`PrivateKeyDer`] from them.
+pub fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["mftp".into()])
         .context("cert generation failed")?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .map_err(|e| anyhow::anyhow!("bad private key: {e}"))?;
-    Ok((cert_der, key_der))
+    let key_bytes = cert.key_pair.serialize_der();
+    Ok((cert_der, key_bytes))
 }
 
-fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
+/// Wrap raw key bytes in a [`PrivateKeyDer`].
+pub fn make_private_key(key_bytes: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::try_from(key_bytes)
+        .map_err(|e| anyhow::anyhow!("bad private key: {e}"))
+}
+
+/// SHA-256 fingerprint of a DER certificate, hex-encoded.
+pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
     hex::encode(Sha256::digest(cert.as_ref()))
+}
+
+/// Build a rustls `ServerConfig` for the TCP+TLS path (no QUIC-specific settings).
+pub fn make_server_tls_config(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<rustls::ServerConfig> {
+    install_crypto_provider();
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .context("failed to build rustls server config")
+}
+
+/// Build a rustls `ClientConfig` for the TCP+TLS path (no QUIC-specific settings).
+pub fn make_client_tls_config(trusted_fingerprint: Option<&str>) -> Result<rustls::ClientConfig> {
+    install_crypto_provider();
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        match trusted_fingerprint {
+            Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
+            None => Arc::new(TofuVerifier),
+        };
+    Ok(rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
 }
 
 // ── Certificate verifiers ─────────────────────────────────────────────────────

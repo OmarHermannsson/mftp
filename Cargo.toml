@@ -17,6 +17,7 @@ path = "src/lib.rs"
 # QUIC transport
 quinn = "0.11"
 rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
 rcgen = "0.13"
 socket2 = { version = "0.5", features = ["all"] }
 

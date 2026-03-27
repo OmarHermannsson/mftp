@@ -6,14 +6,19 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::compress;
-use crate::net::connection::make_server_endpoint;
+use crate::net::connection::{
+    cert_fingerprint, generate_self_signed_cert, make_private_key, make_server_endpoint,
+};
+use crate::net::tcp::{ServerTlsStream, make_tls_acceptor};
 use crate::protocol::{
     framing,
     messages::{
@@ -31,15 +36,9 @@ pub struct ReceiveConfig {
 // ── QUIC server ───────────────────────────────────────────────────────────────
 
 /// A bound QUIC server endpoint, ready to accept incoming transfers.
-///
-/// Separating bind from serve lets callers (and tests) inspect `local_addr`
-/// and `fingerprint` before starting the accept loop.
 pub struct Server {
     endpoint: quinn::Endpoint,
-    /// The actual bound address — useful when binding on port 0.
     pub local_addr: SocketAddr,
-    /// Hex SHA-256 fingerprint of the server's self-signed certificate.
-    /// Pass this to the sender's `--trust` flag for non-interactive use.
     pub fingerprint: String,
     output_dir: PathBuf,
 }
@@ -51,8 +50,22 @@ impl Server {
         Ok(Self { endpoint, local_addr, fingerprint, output_dir })
     }
 
+    /// Build from a pre-generated certificate so QUIC and TCP can share one cert.
+    pub fn bind_with_cert(
+        addr: SocketAddr,
+        output_dir: PathBuf,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+    ) -> Result<Self> {
+        use crate::net::connection::{make_server_endpoint_with_cert};
+        let endpoint = make_server_endpoint_with_cert(addr, cert, key)?;
+        let local_addr = endpoint.local_addr()?;
+        Ok(Self { endpoint, local_addr, fingerprint, output_dir })
+    }
+
     /// Accept and handle exactly one incoming connection, then return.
-    /// Intended for integration tests; production code should use `serve`.
+    /// Intended for integration tests.
     pub async fn accept_one(&self) -> Result<()> {
         let incoming = self
             .endpoint
@@ -64,13 +77,8 @@ impl Server {
         handle_quic_connection(conn, self.output_dir.clone()).await
     }
 
-    /// Accept and handle connections indefinitely.
+    /// Accept and handle connections indefinitely (QUIC only; use `listen` for auto mode).
     pub async fn serve(self) -> Result<()> {
-        println!("Listening on {}", self.local_addr);
-        println!(
-            "Certificate fingerprint (share with sender --trust):\n  {}",
-            self.fingerprint
-        );
         while let Some(incoming) = self.endpoint.accept().await {
             let out = self.output_dir.clone();
             tokio::spawn(async move {
@@ -89,116 +97,135 @@ impl Server {
     }
 }
 
-/// Convenience wrapper for the CLI; binds and serves indefinitely.
-pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
-    Server::bind(bind, config.output_dir)?.serve().await
-}
+// ── TCP+TLS server ────────────────────────────────────────────────────────────
 
-// ── TCP server ────────────────────────────────────────────────────────────────
-
-/// A bound TCP server, ready to accept incoming transfers.
+/// A bound TCP+TLS server, ready to accept incoming transfers.
 ///
-/// TCP mode is intended for trusted LAN / same-datacenter transfers where the
-/// lower per-packet overhead of kernel TCP outweighs QUIC's features.
-/// There is no TLS — do not use over untrusted networks.
-///
-/// Transfers are served sequentially (one at a time) because the protocol
-/// uses connection ordering to assign data streams to the active transfer.
+/// Uses the same self-signed-certificate / TOFU model as QUIC so the
+/// fingerprint can be shared across both transports.  Transfers are served
+/// sequentially (one at a time) — connection ordering is used to assign data
+/// streams without an extra protocol header.
 pub struct TcpServer {
     listener: Arc<TcpListener>,
-    /// The actual bound address — useful when binding on port 0.
+    acceptor: Arc<TlsAcceptor>,
     pub local_addr: SocketAddr,
+    pub fingerprint: String,
     output_dir: PathBuf,
 }
 
 impl TcpServer {
+    /// Bind and generate a fresh self-signed certificate.
     pub async fn bind(addr: SocketAddr, output_dir: PathBuf) -> Result<Self> {
-        let (listener, local_addr) = crate::net::tcp::bind_tcp(addr).await?;
-        Ok(Self { listener: Arc::new(listener), local_addr, output_dir })
+        let (cert, key_bytes) = generate_self_signed_cert()?;
+        let fingerprint = cert_fingerprint(&cert);
+        let key = make_private_key(key_bytes)?;
+        Self::bind_with_cert(addr, output_dir, cert, key, fingerprint).await
     }
 
-    /// Accept and handle exactly one incoming transfer (control + data streams), then return.
+    /// Bind using a pre-generated certificate (for sharing with the QUIC server).
+    pub async fn bind_with_cert(
+        addr: SocketAddr,
+        output_dir: PathBuf,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+    ) -> Result<Self> {
+        let (listener, local_addr) = crate::net::tcp::bind_tcp(addr).await?;
+        let acceptor = Arc::new(make_tls_acceptor(cert, key)?);
+        Ok(Self { listener: Arc::new(listener), acceptor, local_addr, fingerprint, output_dir })
+    }
+
+    /// Accept and handle exactly one complete transfer (control + data streams), then return.
     /// Intended for integration tests.
     pub async fn accept_one(&self) -> Result<()> {
-        let (ctrl_stream, peer_addr) = self.listener.accept().await?;
-        ctrl_stream.set_nodelay(true)?;
+        let (raw, peer_addr) = self.listener.accept().await?;
+        raw.set_nodelay(true)?;
         info!("TCP connection from {peer_addr}");
-        // Clone the Arc so handle_tcp_connection owns it — avoids a self-referential
-        // future that would make this async fn non-Send.
-        handle_tcp_connection(ctrl_stream, Arc::clone(&self.listener), self.output_dir.clone())
+        let tls = Arc::clone(&self.acceptor)
+            .accept(raw)
             .await
+            .context("TLS handshake on control stream")?;
+        handle_tcp_connection(tls, Arc::clone(&self.listener), Arc::clone(&self.acceptor), self.output_dir.clone()).await
     }
 
     /// Accept and handle transfers sequentially, indefinitely.
     pub async fn serve(self) -> Result<()> {
-        println!("Listening on {} (TCP mode, no TLS)", self.local_addr);
         loop {
-            let (ctrl_stream, peer_addr) = self.listener.accept().await?;
-            ctrl_stream.set_nodelay(true)?;
+            let (raw, peer_addr) = self.listener.accept().await?;
+            raw.set_nodelay(true)?;
             info!("TCP connection from {peer_addr}");
+            let tls = match Arc::clone(&self.acceptor).accept(raw).await {
+                Ok(s) => s,
+                Err(e) => { warn!("TLS handshake failed from {peer_addr}: {e}"); continue; }
+            };
             if let Err(e) = handle_tcp_connection(
-                ctrl_stream,
+                tls,
                 Arc::clone(&self.listener),
+                Arc::clone(&self.acceptor),
                 self.output_dir.clone(),
-            )
-            .await
-            {
+            ).await {
                 tracing::error!("transfer error: {e:#}");
             }
         }
     }
 }
 
-/// Convenience wrapper for the CLI; binds and serves indefinitely.
+// ── Public listen functions ───────────────────────────────────────────────────
+
+/// Bind and serve both QUIC and TCP+TLS on the same port using one shared certificate.
+///
+/// The sender auto-detects which transport is available: it tries QUIC first
+/// (with a short timeout) and falls back to TCP+TLS if UDP is blocked.
+pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
+    // Generate one cert — used by both QUIC and TCP so the fingerprint is the same.
+    let (cert, key_bytes) = generate_self_signed_cert()?;
+    let fingerprint = cert_fingerprint(&cert);
+
+    let quic_key = make_private_key(key_bytes.clone())?;
+    let tcp_key = make_private_key(key_bytes)?;
+
+    let quic_server =
+        Server::bind_with_cert(bind, config.output_dir.clone(), cert.clone(), quic_key, fingerprint.clone())?;
+    let tcp_server =
+        TcpServer::bind_with_cert(bind, config.output_dir, cert, tcp_key, fingerprint.clone()).await?;
+
+    println!("Listening on {} (QUIC + TCP+TLS, auto-fallback)", quic_server.local_addr);
+    println!("Certificate fingerprint (share with sender --trust):\n  {fingerprint}");
+
+    tokio::try_join!(quic_server.serve(), tcp_server.serve())?;
+    Ok(())
+}
+
+/// Bind and serve TCP+TLS only (explicit `--tcp` mode).
 pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
-    TcpServer::bind(bind, config.output_dir).await?.serve().await
+    let server = TcpServer::bind(bind, config.output_dir).await?;
+    println!("Listening on {} (TCP+TLS)", server.local_addr);
+    println!("Certificate fingerprint (share with sender --trust):\n  {}", server.fingerprint);
+    server.serve().await
 }
 
 // ── Per-connection logic: QUIC ────────────────────────────────────────────────
 
 async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
-    // Keep conn alive until the end so we can call conn.closed() before dropping it.
-    // ── Negotiation ───────────────────────────────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
 
-    let neg_req: NegotiateRequest =
-        framing::recv_message_required(&mut ctrl_recv).await?;
+    let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     let receiver_cores =
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-    framing::send_message(
-        &mut ctrl_send,
-        &NegotiateResponse { cpu_cores: receiver_cores },
-    )
-    .await?;
-    debug!(
-        sender_cores = neg_req.cpu_cores,
-        receiver_cores,
-        file_size = neg_req.file_size,
-        "negotiation complete"
-    );
+    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores }).await?;
+    debug!(sender_cores = neg_req.cpu_cores, receiver_cores, "negotiation complete");
 
-    // ── Manifest ──────────────────────────────────────────────────────────────
-    let manifest: TransferManifest =
-        framing::recv_message_required(&mut ctrl_recv).await?;
-
+    let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
     validate_manifest(&manifest)?;
-
-    info!(
-        file = %manifest.file_name,
-        size = manifest.file_size,
-        chunks = manifest.total_chunks,
-        streams = manifest.num_streams,
-        "transfer started"
-    );
+    info!(file = %manifest.file_name, size = manifest.file_size, chunks = manifest.total_chunks, streams = manifest.num_streams, "transfer started");
 
     let (out_file, resume, pb, hasher, bytes_already_received) =
         prepare_transfer(&manifest, &output_dir)?;
 
-    let have_chunks = resume.lock().unwrap().received_chunks();
+    let have_chunks = { resume.lock().unwrap().received_chunks() };
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
     pb.set_position(bytes_already_received);
 
-    // ── Accept exactly num_streams unidirectional data streams ────────────────
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..manifest.num_streams {
         let stream = conn.accept_uni().await.context("accept data stream")?;
@@ -218,61 +245,32 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
         bail!("{e}");
     }
 
-    finish_transfer(
-        &mut ctrl_send,
-        &mut ctrl_recv,
-        resume,
-        hasher,
-        &output_dir,
-        &manifest,
-    )
-    .await?;
+    finish_transfer(&mut ctrl_send, &mut ctrl_recv, resume, hasher, &output_dir, &manifest).await?;
 
     let _ = ctrl_send.finish();
-    // Wait for the sender to close the connection before we drop `conn`.
     let _ = conn.closed().await;
     Ok(())
 }
 
-// ── Per-connection logic: TCP ─────────────────────────────────────────────────
+// ── Per-connection logic: TCP+TLS ─────────────────────────────────────────────
 
 async fn handle_tcp_connection(
-    ctrl_stream: tokio::net::TcpStream,
+    ctrl_stream: ServerTlsStream<tokio::net::TcpStream>,
     listener: Arc<TcpListener>,
+    acceptor: Arc<TlsAcceptor>,
     output_dir: PathBuf,
 ) -> Result<()> {
-    let (mut ctrl_recv, mut ctrl_send) = ctrl_stream.into_split();
+    let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl_stream);
 
-    // ── Negotiation ───────────────────────────────────────────────────────────
-    let neg_req: NegotiateRequest =
-        framing::recv_message_required(&mut ctrl_recv).await?;
+    let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     let receiver_cores =
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-    framing::send_message(
-        &mut ctrl_send,
-        &NegotiateResponse { cpu_cores: receiver_cores },
-    )
-    .await?;
-    debug!(
-        sender_cores = neg_req.cpu_cores,
-        receiver_cores,
-        file_size = neg_req.file_size,
-        "negotiation complete"
-    );
+    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores }).await?;
+    debug!(sender_cores = neg_req.cpu_cores, receiver_cores, "negotiation complete");
 
-    // ── Manifest ──────────────────────────────────────────────────────────────
-    let manifest: TransferManifest =
-        framing::recv_message_required(&mut ctrl_recv).await?;
-
+    let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
     validate_manifest(&manifest)?;
-
-    info!(
-        file = %manifest.file_name,
-        size = manifest.file_size,
-        chunks = manifest.total_chunks,
-        streams = manifest.num_streams,
-        "transfer started"
-    );
+    info!(file = %manifest.file_name, size = manifest.file_size, chunks = manifest.total_chunks, streams = manifest.num_streams, "transfer started");
 
     let (out_file, resume, pb, hasher, bytes_already_received) =
         prepare_transfer(&manifest, &output_dir)?;
@@ -281,21 +279,24 @@ async fn handle_tcp_connection(
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
     pb.set_position(bytes_already_received);
 
-    // ── Accept exactly num_streams data connections ───────────────────────────
-    // The sender connects in order after receiving Ready; we accept them here.
-    // Sequential serve guarantees no other transfers compete for connections.
+    // Accept exactly num_streams TLS-wrapped data connections.
+    // The sender opens them in order after receiving Ready; sequential serve
+    // guarantees no other transfer competes for these connections.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..manifest.num_streams {
-        let (data_stream, _peer) = listener.accept().await.context("accept data stream")?;
-        data_stream.set_nodelay(true)?;
-        let (read_half, _write_half) = data_stream.into_split();
+        let (raw, _peer) = listener.accept().await.context("accept data stream")?;
+        raw.set_nodelay(true)?;
+        // Pass the full TLS stream (no split): data streams are read-only, and
+        // keeping the stream whole avoids split-half interactions in the TLS
+        // state machine.
+        let data_tls = acceptor.accept(raw).await.context("TLS handshake on data stream")?;
         let out_file = out_file.clone();
         let resume = resume.clone();
         let manifest = manifest.clone();
         let pb = pb.clone();
         let hasher = hasher.clone();
         tasks.spawn(async move {
-            recv_stream_worker(read_half, out_file, resume, manifest, pb, hasher).await
+            recv_stream_worker(data_tls, out_file, resume, manifest, pb, hasher).await
         });
     }
 
@@ -305,23 +306,12 @@ async fn handle_tcp_connection(
         bail!("{e}");
     }
 
-    finish_transfer(
-        &mut ctrl_send,
-        &mut ctrl_recv,
-        resume,
-        hasher,
-        &output_dir,
-        &manifest,
-    )
-    .await?;
-
+    finish_transfer(&mut ctrl_send, &mut ctrl_recv, resume, hasher, &output_dir, &manifest).await?;
     Ok(())
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Set up the output file, resume state, progress bar, and chunk hasher.
-/// Returns them along with the number of bytes already on disk (for progress).
 #[allow(clippy::type_complexity)]
 fn prepare_transfer(
     manifest: &TransferManifest,
@@ -347,7 +337,7 @@ fn prepare_transfer(
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(false) // we size the file explicitly via fallocate/set_len below
+            .truncate(false) // sized explicitly via fallocate/set_len below
             .open(&out_path)
             .with_context(|| format!("open output {}", out_path.display()))?;
         #[cfg(target_os = "linux")]
@@ -382,8 +372,6 @@ fn prepare_transfer(
     Ok((out_file, resume, pb, hasher, bytes_already_received))
 }
 
-/// Drain all stream-worker tasks; on first error notify the sender.
-/// Returns the first error encountered, if any.
 async fn drain_tasks<S>(
     tasks: &mut JoinSet<Result<()>>,
     ctrl_send: &mut S,
@@ -411,7 +399,6 @@ where
     task_err
 }
 
-/// Check completeness, verify file hash, send Complete to sender.
 async fn finish_transfer<S, R>(
     ctrl_send: &mut S,
     ctrl_recv: &mut R,
@@ -424,7 +411,7 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    let missing = resume.lock().unwrap().missing_chunks();
+    let missing = { resume.lock().unwrap().missing_chunks() };
     if !missing.is_empty() {
         warn!("{} chunks missing, requesting retransmit", missing.len());
         framing::send_message(
@@ -472,18 +459,11 @@ async fn recv_stream_worker<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    // Pipelined processing: keep up to MAX_IN_FLIGHT blocking tasks running
-    // concurrently per stream.  While one chunk is being SHA-256 verified and
-    // written to disk, the next chunk arrives over the network — overlapping
-    // CPU/disk with network receive.  On a fast LAN this is the difference
-    // between network being idle half the time and being fully utilised.
     const MAX_IN_FLIGHT: usize = 4;
     let mut processing: JoinSet<Result<()>> = JoinSet::new();
+    let mut chunk_count = 0u64;
 
     loop {
-        // Before receiving the next chunk, drain any completed tasks and
-        // propagate errors early.  When at the pipeline limit, wait for a
-        // slot to free up.
         if processing.len() >= MAX_IN_FLIGHT {
             match processing.join_next().await {
                 Some(Ok(Ok(()))) => {}
@@ -493,12 +473,12 @@ where
             }
         }
 
-        let chunk: ChunkData = match framing::recv_data_message(&mut stream).await? {
+        let chunk: ChunkData = match framing::recv_data_message(&mut stream).await
+            .with_context(|| format!("recv chunk#{chunk_count}"))? {
             Some(c) => c,
-            None => break, // sender closed the stream — normal end
+            None => break,
         };
 
-        // Reject out-of-range chunk indices before doing any work with them.
         if chunk.chunk_index >= manifest.total_chunks {
             bail!(
                 "chunk index {} out of range (total_chunks {})",
@@ -540,9 +520,9 @@ where
             debug!(chunk = chunk_index, "received");
             Ok(())
         });
+        chunk_count += 1;
     }
 
-    // Drain all remaining in-flight tasks.
     while let Some(res) = processing.join_next().await {
         match res {
             Ok(Ok(())) => {}
@@ -556,12 +536,9 @@ where
 
 // ── Manifest validation ───────────────────────────────────────────────────────
 
-/// Maximum file size we are willing to accept (16 TiB).
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
-/// Chunk size must be between 4 KiB and 128 MiB.
 const MIN_CHUNK_SIZE: usize = 4 * 1024;
 const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
-/// Sanity cap on stream count to prevent an accept loop that never ends.
 const MAX_STREAMS: usize = 1024;
 
 fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<()> {
@@ -574,39 +551,24 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
     if m.file_name == ".." || m.file_name == "." {
         bail!("manifest: file_name is a relative-path component: {:?}", m.file_name);
     }
-
     if m.file_size > MAX_FILE_SIZE {
-        bail!(
-            "manifest: file_size {} exceeds limit of {} bytes",
-            m.file_size,
-            MAX_FILE_SIZE
-        );
+        bail!("manifest: file_size {} exceeds limit of {} bytes", m.file_size, MAX_FILE_SIZE);
     }
-
     if m.chunk_size < MIN_CHUNK_SIZE || m.chunk_size > MAX_CHUNK_SIZE {
         bail!(
             "manifest: chunk_size {} out of allowed range [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]",
             m.chunk_size
         );
     }
-
     let expected = m.file_size.div_ceil(m.chunk_size as u64);
     if m.total_chunks != expected {
         bail!(
             "manifest: total_chunks {} inconsistent with file_size {}/chunk_size {} (expected {})",
-            m.total_chunks,
-            m.file_size,
-            m.chunk_size,
-            expected
+            m.total_chunks, m.file_size, m.chunk_size, expected
         );
     }
-
     if m.num_streams == 0 || m.num_streams > MAX_STREAMS {
-        bail!(
-            "manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]",
-            m.num_streams
-        );
+        bail!("manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]", m.num_streams);
     }
-
     Ok(())
 }
