@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 use mftp::transfer::{receiver, sender};
 
 #[derive(Parser)]
-#[command(name = "mftp", about = "High-throughput file transfer over high-latency links")]
+#[command(name = "mftp", about = "High-throughput file transfer over high-latency links", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -22,7 +22,7 @@ struct Cli {
     #[arg(long, global = true)]
     no_compress: bool,
 
-    /// Use plain TCP instead of QUIC (faster on LAN / same-datacenter; no encryption)
+    /// Use TCP+TLS instead of QUIC (useful when UDP is blocked)
     #[arg(long, global = true)]
     tcp: bool,
 
