@@ -62,11 +62,18 @@ pub fn compute_params(
 
     // ── Stream count ──────────────────────────────────────────────────────────
     let streams = override_streams.unwrap_or_else(|| {
-        // One stream per 5 ms of RTT, minimum 2.
+        // One stream per 5 ms of RTT to fill the bandwidth-delay product on
+        // high-latency links.
         let rtt_streams = ((rtt_ms / 5) as usize).max(2);
-        // Cap at 2× the weaker side's CPU count so neither end is overwhelmed.
+        // Cap at 2× the weaker side's CPU count.
         let cpu_cap = (receiver_cores.min(sender_cores) as usize).max(1) * 2;
-        rtt_streams.min(cpu_cap).max(2)
+        // On low-latency links rtt_streams is tiny (2 for <10 ms), but streams
+        // also serve a second purpose: pipelining CPU work (SHA-256, disk write)
+        // with network receives across streams.  Use the weaker side's core
+        // count as a floor so we always have enough streams to keep CPUs busy
+        // even on LAN/loopback where the bottleneck is compute, not BDP.
+        let cpu_floor = receiver_cores.min(sender_cores) as usize;
+        rtt_streams.max(cpu_floor).min(cpu_cap).max(2)
     });
 
     // Never open more streams than chunks.
@@ -81,7 +88,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loopback_large_chunks_few_streams() {
+    fn loopback_uses_cpu_floor_not_rtt() {
+        // RTT=1ms → rtt_streams=2, but cpu_floor=8 cores → streams=8.
+        // On LAN the bottleneck is CPU/disk, not BDP, so we use cpu_floor.
         let p = compute_params(
             Duration::from_millis(1),
             100 * 1024 * 1024,
@@ -91,7 +100,7 @@ mod tests {
             None,
         );
         assert_eq!(p.chunk_size, 8 * 1024 * 1024);
-        assert_eq!(p.streams, 2); // rtt_ms/5 = 0, clamped to 2
+        assert_eq!(p.streams, 8); // cpu_floor=8 > rtt_streams=2
     }
 
     #[test]

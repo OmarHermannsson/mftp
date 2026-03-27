@@ -275,15 +275,33 @@ async fn recv_stream_worker(
     pb: Arc<ProgressBar>,
     hasher: Arc<ChunkHasher>,
 ) -> Result<()> {
+    // Pipelined processing: keep up to MAX_IN_FLIGHT blocking tasks running
+    // concurrently per stream.  While one chunk is being SHA-256 verified and
+    // written to disk, the next chunk arrives over the network — overlapping
+    // CPU/disk with network receive.  On a fast LAN this is the difference
+    // between network being idle half the time and being fully utilised.
+    const MAX_IN_FLIGHT: usize = 4;
+    let mut processing: JoinSet<Result<()>> = JoinSet::new();
+
     loop {
+        // Before receiving the next chunk, drain any completed tasks and
+        // propagate errors early.  When at the pipeline limit, wait for a
+        // slot to free up.
+        if processing.len() >= MAX_IN_FLIGHT {
+            match processing.join_next().await {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => return Err(e),
+                Some(Err(e)) => bail!("chunk processing task panicked: {e}"),
+                None => {}
+            }
+        }
+
         let chunk: ChunkData = match framing::recv_data_message(&mut stream).await? {
             Some(c) => c,
             None => break, // sender called finish() — normal stream end
         };
 
         // Reject out-of-range chunk indices before doing any work with them.
-        // A malicious sender could otherwise craft an index that causes a write
-        // at an arbitrary offset (or an overflow in the offset calculation).
         if chunk.chunk_index >= manifest.total_chunks {
             bail!(
                 "chunk index {} out of range (total_chunks {})",
@@ -292,58 +310,55 @@ async fn recv_stream_worker(
             );
         }
 
-        // Move all CPU and blocking I/O off the async executor.
-        //
-        // SHA-256 verification, decompression, and pwrite are all blocking
-        // operations. Running them directly in an async task blocks the tokio
-        // worker thread, preventing other streams from processing their network
-        // data concurrently. spawn_blocking hands this work to a dedicated
-        // thread pool, freeing the async worker immediately.
         let chunk_index = chunk.chunk_index;
         let chunk_size = manifest.chunk_size;
         let out_file = Arc::clone(&out_file);
         let hasher = Arc::clone(&hasher);
         let resume = Arc::clone(&resume);
         let pb = Arc::clone(&pb);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            // Verify chunk integrity
+
+        // spawn_blocking hands SHA-256 + decompress + pwrite to the blocking
+        // thread pool.  We do NOT await here — control returns to the top of
+        // the loop immediately so the next chunk can arrive while this one
+        // is being processed.
+        processing.spawn_blocking(move || -> Result<()> {
             let computed: [u8; 32] = Sha256::digest(&chunk.payload).into();
             if computed != chunk.chunk_hash {
                 bail!("chunk {} hash mismatch", chunk_index);
             }
 
-            // Decompress if the sender flagged it.
-            // chunk_size is the upper bound on the uncompressed output; reject
-            // any decompressed result larger than that to prevent memory exhaustion
-            // from a crafted "decompression bomb" payload.
+            // chunk_size bounds decompressed output against decompression bombs.
             let data = if chunk.compressed {
                 compress::decompress_chunk(&chunk.payload, chunk_size)?
             } else {
                 chunk.payload
             };
 
-            // pwrite: safe for concurrent callers on the same file descriptor
             let offset = chunk_index * chunk_size as u64;
             {
                 use std::os::unix::fs::FileExt;
                 out_file
                     .write_all_at(&data, offset)
-                    .with_context(|| {
-                        format!("write chunk {chunk_index} at offset {offset}")
-                    })?;
+                    .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
             }
 
-            // Feed into the inline hasher (in chunk-index order; buffers if needed)
             hasher.feed(chunk_index, &data);
-
             pb.inc(data.len() as u64);
             resume.lock().unwrap().mark_received(chunk_index);
             debug!(chunk = chunk_index, "received");
             Ok(())
-        })
-        .await
-        .context("chunk processing task panicked")??;
+        });
     }
+
+    // Drain all remaining in-flight tasks.
+    while let Some(res) = processing.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => bail!("chunk processing task panicked: {e}"),
+        }
+    }
+
     Ok(())
 }
 
