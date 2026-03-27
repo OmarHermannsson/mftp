@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
@@ -133,28 +135,31 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     let remaining = total_chunks - skip_count;
     info!("{skip_count} chunks already at receiver, {remaining} to send");
 
-    // ── Progress bar ──────────────────────────────────────────────────────────
-    let bytes_to_send: u64 = (0..total_chunks)
-        .filter(|i| !have.contains(i))
-        .map(|i| chunk_byte_len(i, chunk_size, file_size))
-        .sum();
-
-    // Use file_size as the total so the bar is on the same scale as the
-    // receiver's bar.  On resume, advance to the bytes already at the
-    // receiver so both bars start from the same visual position.
-    let bytes_already_sent = file_size.saturating_sub(bytes_to_send);
-    let pb = Arc::new({
-        let pb = ProgressBar::new(file_size);
-        pb.set_position(bytes_already_sent);
-        pb.set_style(
+    // ── Sender spinner ────────────────────────────────────────────────────────
+    // quinn::SendStream::write_all() returns when data enters quinn's send
+    // buffer, not when the receiver has written it to disk.  A bytes/sec bar
+    // on the sender would measure buffer-fill rate (~RAM speed), not the actual
+    // transfer rate.  Instead: show a spinner with elapsed time while chunks
+    // are being queued, then print true end-to-end throughput once the receiver
+    // confirms delivery.
+    let spinner = Arc::new({
+        let sp = ProgressBar::new_spinner();
+        sp.set_style(
             ProgressStyle::with_template(
-                "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-                 {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
+                "[send] {spinner:.green} [{elapsed_precise}] {msg}",
             )
             .unwrap(),
         );
-        pb
+        sp.enable_steady_tick(Duration::from_millis(100));
+        sp.set_message(format!(
+            "sending {} ({} chunks remaining)",
+            file_name, remaining
+        ));
+        sp
     });
+
+    // Start timing from when we actually begin streaming data.
+    let transfer_start = Instant::now();
 
     // ── Parallel data streams ─────────────────────────────────────────────────
     let actual_streams = num_streams.min(remaining.max(1) as usize);
@@ -168,10 +173,9 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         let have = have.clone();
         let file_path = file.clone();
         let compression = compression.clone();
-        let pb = pb.clone();
 
         tasks.spawn(async move {
-            stream_worker(stream, queue, have, file_path, chunk_size, transfer_id, compression, pb)
+            stream_worker(stream, queue, have, file_path, chunk_size, transfer_id, compression)
                 .await
         });
     }
@@ -179,22 +183,32 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     while let Some(res) = tasks.join_next().await {
         res??;
     }
-    pb.finish_with_message("all chunks sent");
+
+    spinner.set_message("waiting for receiver to confirm delivery…");
 
     // ── Send file hash — await the background task (almost certainly done) ────
     let file_hash = hash_task.await.context("hash task panicked")??;
     framing::send_message(&mut ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // ── Wait for receiver's completion ack ────────────────────────────────────
-    // The receiver now hashes its copy and sends Complete; keep_alive_interval
-    // on our transport config keeps the connection alive during that time.
+    // The receiver writes every chunk to disk, verifies the whole-file hash,
+    // then sends Complete.  The elapsed time here is the true end-to-end wall
+    // time: from first byte queued to last byte confirmed on disk.
     let msg: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
+    spinner.finish_and_clear();
     match msg {
         ReceiverMessage::Complete { file_hash: recv_hash } => {
             if recv_hash != file_hash {
                 bail!("file hash mismatch: receiver computed a different hash");
             }
-            println!("Transfer complete. Hash verified.");
+            let elapsed = transfer_start.elapsed();
+            let mib = file_size as f64 / (1024.0 * 1024.0);
+            let throughput = mib / elapsed.as_secs_f64();
+            println!(
+                "Transfer complete: {file_name} ({mib:.0} MiB) in {:.1}s \
+                 ({throughput:.0} MiB/s end-to-end). Hash verified.",
+                elapsed.as_secs_f64(),
+            );
         }
         ReceiverMessage::Retransmit { chunk_indices } => {
             bail!(
@@ -219,7 +233,6 @@ async fn stream_worker(
     _chunk_size: usize,
     transfer_id: [u8; 16],
     compression: Compression,
-    pb: Arc<ProgressBar>,
 ) -> Result<()> {
     // Each worker opens its own file handle — avoids cross-task locking on seeks.
     let file = std::fs::File::open(&file_path)
@@ -240,7 +253,6 @@ async fn stream_worker(
         )
         .await?;
 
-        pb.inc(chunk.len as u64);
         debug!(chunk = chunk.index, "sent");
     }
 
@@ -268,10 +280,6 @@ fn maybe_compress(data: &[u8], compression: &Compression) -> Result<(Vec<u8>, bo
     }
 }
 
-fn chunk_byte_len(index: u64, chunk_size: usize, file_size: u64) -> u64 {
-    let offset = index * chunk_size as u64;
-    ((file_size - offset) as usize).min(chunk_size) as u64
-}
 
 pub(crate) fn hash_file_sync(path: &Path) -> Result<[u8; 32]> {
     use std::io::Read;
