@@ -2,26 +2,46 @@
 //!
 //! Frame format: [u32 little-endian length][bincode payload]
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use quinn::{RecvStream, SendStream};
 
-const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB guard
+/// Hard cap for chunk data frames (the payload of a single compressed chunk).
+const MAX_DATA_FRAME_SIZE: u32 = 128 * 1024 * 1024; // 128 MiB
+/// Tight cap for control frames (NegotiateRequest/Response, TransferManifest,
+/// SenderMessage, ReceiverMessage).  Prevents a malicious peer from forcing a
+/// large heap allocation before deserialization even begins.
+const MAX_CTRL_FRAME_SIZE: u32 = 1 * 1024 * 1024; // 1 MiB
 
 pub async fn send_message<T: serde::Serialize>(stream: &mut SendStream, msg: &T) -> Result<()> {
     let payload = bincode::serialize(msg)?;
-    let len = payload.len() as u32;
+    let len = u32::try_from(payload.len())
+        .context("serialized message exceeds 4 GiB — cannot frame")?;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&payload).await?;
     Ok(())
 }
 
-/// Read one framed message from `stream`.
+/// Variant for chunk data streams; allows frames up to 128 MiB.
+pub async fn recv_data_message<T: serde::de::DeserializeOwned>(
+    stream: &mut RecvStream,
+) -> Result<Option<T>> {
+    recv_message_inner(stream, MAX_DATA_FRAME_SIZE).await
+}
+
+/// Read one framed message from `stream` (control stream variant, 1 MiB cap).
 ///
 /// Returns `Ok(None)` when the stream ends cleanly at a frame boundary
 /// (i.e. the sender called `finish()` with no more frames pending).
 /// Returns `Err` for any mid-frame truncation or deserialization failure.
 pub async fn recv_message<T: serde::de::DeserializeOwned>(
     stream: &mut RecvStream,
+) -> Result<Option<T>> {
+    recv_message_inner(stream, MAX_CTRL_FRAME_SIZE).await
+}
+
+async fn recv_message_inner<T: serde::de::DeserializeOwned>(
+    stream: &mut RecvStream,
+    max_size: u32,
 ) -> Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
@@ -33,8 +53,8 @@ pub async fn recv_message<T: serde::de::DeserializeOwned>(
         Err(quinn::ReadExactError::ReadError(e)) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(len_buf);
-    if len > MAX_FRAME_SIZE {
-        bail!("frame too large: {len} bytes");
+    if len > max_size {
+        bail!("frame too large: {len} bytes (limit {max_size})");
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await.map_err(|e| match e {

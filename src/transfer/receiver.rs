@@ -14,7 +14,10 @@ use crate::compress;
 use crate::net::connection::make_server_endpoint;
 use crate::protocol::{
     framing,
-    messages::{ChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest},
+    messages::{
+        ChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage, SenderMessage,
+        TransferManifest,
+    },
 };
 use crate::transfer::hash::ChunkHasher;
 use crate::transfer::resume::ResumeState;
@@ -113,6 +116,10 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
     // ── Manifest ──────────────────────────────────────────────────────────────
     let manifest: TransferManifest =
         framing::recv_message_required(&mut ctrl_recv).await?;
+
+    // ── Validate manifest — all fields come from an untrusted sender ──────────
+    validate_manifest(&manifest)?;
+
     info!(
         file = %manifest.file_name,
         size = manifest.file_size,
@@ -131,6 +138,7 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
 
     // ── Pre-allocate output file ──────────────────────────────────────────────
+    // Path traversal is already ruled out by validate_manifest.
     let out_path = output_dir.join(&manifest.file_name);
     let out_file = Arc::new({
         let f = std::fs::OpenOptions::new()
@@ -192,9 +200,15 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
     }
 
     // Drain all tasks; on first error notify the sender before bailing.
+    // Convert JoinError (task panic) to a regular error so we always send the
+    // ReceiverMessage::Error to the sender rather than silently propagating.
     let mut task_err: Option<anyhow::Error> = None;
-    while let Some(res) = tasks.join_next().await {
-        if let Err(e) = res? {
+    while let Some(join_res) = tasks.join_next().await {
+        let task_result = match join_res {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("stream worker panicked: {e}")),
+        };
+        if let Err(e) = task_result {
             if task_err.is_none() {
                 let _ = framing::send_message(
                     &mut ctrl_send,
@@ -262,10 +276,21 @@ async fn recv_stream_worker(
     hasher: Arc<ChunkHasher>,
 ) -> Result<()> {
     loop {
-        let chunk: ChunkData = match framing::recv_message(&mut stream).await? {
+        let chunk: ChunkData = match framing::recv_data_message(&mut stream).await? {
             Some(c) => c,
             None => break, // sender called finish() — normal stream end
         };
+
+        // Reject out-of-range chunk indices before doing any work with them.
+        // A malicious sender could otherwise craft an index that causes a write
+        // at an arbitrary offset (or an overflow in the offset calculation).
+        if chunk.chunk_index >= manifest.total_chunks {
+            bail!(
+                "chunk index {} out of range (total_chunks {})",
+                chunk.chunk_index,
+                manifest.total_chunks
+            );
+        }
 
         // Move all CPU and blocking I/O off the async executor.
         //
@@ -287,9 +312,12 @@ async fn recv_stream_worker(
                 bail!("chunk {} hash mismatch", chunk_index);
             }
 
-            // Decompress if the sender flagged it
+            // Decompress if the sender flagged it.
+            // chunk_size is the upper bound on the uncompressed output; reject
+            // any decompressed result larger than that to prevent memory exhaustion
+            // from a crafted "decompression bomb" payload.
             let data = if chunk.compressed {
-                compress::decompress_chunk(&chunk.payload)?
+                compress::decompress_chunk(&chunk.payload, chunk_size)?
             } else {
                 chunk.payload
             };
@@ -316,5 +344,72 @@ async fn recv_stream_worker(
         .await
         .context("chunk processing task panicked")??;
     }
+    Ok(())
+}
+
+// ── Manifest validation ───────────────────────────────────────────────────────
+
+/// Maximum file size we are willing to accept (16 TiB).
+const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+/// Chunk size must be between 4 KiB and 128 MiB.
+const MIN_CHUNK_SIZE: usize = 4 * 1024;
+const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+/// Sanity cap on stream count to prevent an accept_uni loop that never ends.
+const MAX_STREAMS: usize = 1024;
+
+fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<()> {
+    // ── file_name: path traversal ─────────────────────────────────────────────
+    // Reject empty names, names with directory separators, and names with
+    // leading dots that would create hidden files or relative paths.
+    if m.file_name.is_empty() {
+        bail!("manifest: file_name is empty");
+    }
+    if m.file_name.contains('/') || m.file_name.contains('\\') {
+        bail!("manifest: file_name contains path separator: {:?}", m.file_name);
+    }
+    if m.file_name == ".." || m.file_name == "." {
+        bail!("manifest: file_name is a relative-path component: {:?}", m.file_name);
+    }
+
+    // ── file_size ─────────────────────────────────────────────────────────────
+    if m.file_size > MAX_FILE_SIZE {
+        bail!(
+            "manifest: file_size {} exceeds limit of {} bytes",
+            m.file_size,
+            MAX_FILE_SIZE
+        );
+    }
+
+    // ── chunk_size ────────────────────────────────────────────────────────────
+    if m.chunk_size < MIN_CHUNK_SIZE || m.chunk_size > MAX_CHUNK_SIZE {
+        bail!(
+            "manifest: chunk_size {} out of allowed range [{MIN_CHUNK_SIZE}, {MAX_CHUNK_SIZE}]",
+            m.chunk_size
+        );
+    }
+
+    // ── total_chunks must be consistent with file_size and chunk_size ─────────
+    // This prevents a sender from claiming a huge total_chunks (which would
+    // cause the ResumeState bit-vector to allocate gigabytes) independent of
+    // what the actual file data warrants.
+    let expected = m.file_size.div_ceil(m.chunk_size as u64);
+    if m.total_chunks != expected {
+        bail!(
+            "manifest: total_chunks {} inconsistent with file_size {}/chunk_size {} (expected {})",
+            m.total_chunks,
+            m.file_size,
+            m.chunk_size,
+            expected
+        );
+    }
+
+    // ── num_streams ───────────────────────────────────────────────────────────
+    if m.num_streams == 0 || m.num_streams > MAX_STREAMS {
+        bail!(
+            "manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]",
+            m.num_streams
+        );
+    }
+
     Ok(())
 }
