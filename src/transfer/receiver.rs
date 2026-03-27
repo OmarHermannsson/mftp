@@ -633,6 +633,14 @@ where
                 manifest.total_chunks
             );
         }
+        if chunk.transfer_id != manifest.transfer_id {
+            bail!(
+                "chunk {}: transfer_id mismatch (got {}, expected {})",
+                chunk.chunk_index,
+                hex::encode(chunk.transfer_id),
+                hex::encode(manifest.transfer_id),
+            );
+        }
 
         let chunk_index = chunk.chunk_index;
         let chunk_size = manifest.chunk_size;
@@ -667,7 +675,11 @@ where
             pb.inc(n);
             // Non-blocking: progress updates are best-effort; never slow the data path.
             let _ = progress_tx.try_send(n);
-            resume.lock().unwrap().mark_received(chunk_index);
+            {
+                let mut r = resume.lock().unwrap();
+                r.mark_received(chunk_index);
+                r.save()?;
+            }
             debug!(chunk = chunk_index, "received");
             Ok(())
         });

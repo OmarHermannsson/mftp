@@ -60,6 +60,21 @@ struct ServerHandshake {
     fingerprint: String,
 }
 
+/// RAII guard that kills a child process when dropped.
+///
+/// Used to ensure the remote `mftp server` (and the SSH multiplexer) are
+/// always reaped, even when the transfer fails and the function returns early
+/// via `?`.
+struct KillOnDrop(tokio::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // start_kill is non-blocking (sends SIGKILL) and ignores errors (e.g.
+        // if the process already exited).
+        let _ = self.0.start_kill();
+    }
+}
+
 /// Launch `mftp server` on the remote via SSH and transfer `file`.
 ///
 /// Steps:
@@ -75,7 +90,7 @@ pub async fn send_via_ssh(
 ) -> Result<()> {
     let mftp_bin = remote_mftp.as_deref().unwrap_or("mftp");
 
-    let mut ssh = tokio::process::Command::new("ssh")
+    let child = tokio::process::Command::new("ssh")
         .arg(&dest.user_host)
         .arg(mftp_bin)
         .arg("server")
@@ -86,8 +101,11 @@ pub async fn send_via_ssh(
         .spawn()
         .context("failed to spawn ssh(1) — is it installed and in PATH?")?;
 
+    // Wrap immediately so the process is killed on any early return.
+    let mut ssh = KillOnDrop(child);
+
     // Read the one-line JSON handshake printed by the remote server.
-    let stdout = ssh.stdout.take().expect("stdout is piped");
+    let stdout = ssh.0.stdout.take().expect("stdout is piped");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     reader.read_line(&mut line).await.context("reading server handshake from ssh")?;
@@ -104,7 +122,7 @@ pub async fn send_via_ssh(
     eprintln!(
         "Remote server ready  port={}  fp={}…",
         hs.port,
-        &hs.fingerprint[..16],
+        hs.fingerprint.get(..16).unwrap_or(&hs.fingerprint),
     );
 
     let direct_addr = resolve_host(&dest.host, hs.port).await?;
@@ -114,11 +132,13 @@ pub async fn send_via_ssh(
     if let Err(e) = direct_result {
         eprintln!("[mftp] direct connection to {direct_addr} failed ({e:#})");
         eprintln!("[mftp] retrying via SSH port-forward tunnel…");
+        // ? propagation here is safe: KillOnDrop ensures ssh is killed on exit.
         send_via_tunnel(file, &dest, hs.port, &hs.fingerprint, config).await?;
     }
 
-    // Give the remote server a chance to exit cleanly before we return.
-    let _ = ssh.wait().await;
+    // Transfer complete — give the remote server a moment to exit cleanly.
+    // KillOnDrop fires on drop regardless, so this is best-effort.
+    let _ = ssh.0.wait().await;
     Ok(())
 }
 
