@@ -84,7 +84,7 @@ pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)>
     let endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
-        socket.into(),
+        socket,
         runtime,
     )?;
 
@@ -124,7 +124,7 @@ pub fn make_client_endpoint(trusted_fingerprint: Option<&str>) -> Result<Endpoin
     let mut endpoint = Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
-        socket.into(),
+        socket,
         runtime,
     )?;
     endpoint.set_default_client_config(client_config);

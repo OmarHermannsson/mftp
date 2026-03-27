@@ -10,3 +10,4 @@
 //! prior measurement we default to 32 MiB which covers a ~250ms RTT at 1 Gbps.
 
 pub mod connection;
+pub mod tcp;

@@ -48,7 +48,7 @@ pub fn compute_params(
     let rtt_ms = rtt.as_millis() as u64;
 
     // ── Chunk size ────────────────────────────────────────────────────────────
-    let chunk_size = override_chunk_size.unwrap_or_else(|| {
+    let chunk_size = override_chunk_size.unwrap_or({
         if rtt_ms < 10 {
             8 * 1024 * 1024 // 8 MiB — LAN / loopback
         } else if rtt_ms < 50 {
@@ -56,12 +56,12 @@ pub fn compute_params(
         } else if rtt_ms < 150 {
             2 * 1024 * 1024 // 2 MiB — intercontinental
         } else {
-            1 * 1024 * 1024 // 1 MiB — satellite / very high latency
+            1024 * 1024 // 1 MiB — satellite / very high latency
         }
     });
 
     // ── Stream count ──────────────────────────────────────────────────────────
-    let streams = override_streams.unwrap_or_else(|| {
+    let streams = override_streams.unwrap_or({
         // One stream per 5 ms of RTT to fill the bandwidth-delay product on
         // high-latency links.
         let rtt_streams = ((rtt_ms / 5) as usize).max(2);

@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use mftp::transfer::{
-    receiver::Server,
+    receiver::{Server, TcpServer},
     sender::{self, SendConfig},
 };
 use tempfile::TempDir;
@@ -56,6 +56,7 @@ async fn roundtrip(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            use_tcp: false,
         },
     )
     .await?;
@@ -145,6 +146,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             compress: true,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            use_tcp: false,
         },
     )
     .await?;
@@ -174,4 +176,65 @@ async fn test_single_byte_file() -> anyhow::Result<()> {
     let path = send_dir.path().join("one.bin");
     std::fs::write(&path, [42u8])?;
     roundtrip(path, &recv_dir, 1, 4 * 1024 * 1024, false).await
+}
+
+// ── TCP path tests ────────────────────────────────────────────────────────────
+
+/// Core TCP helper: send `src` over loopback using plain TCP.
+///
+/// Uses `tokio::join!` instead of `tokio::spawn` because `handle_tcp_connection`
+/// is not `Send` (it uses `std::sync::MutexGuard` internally). Sequential TCP
+/// serve never spawns, so this is not a production concern.
+async fn roundtrip_tcp(
+    src: std::path::PathBuf,
+    recv_dir: &TempDir,
+    streams: usize,
+    chunk_size: usize,
+    compress: bool,
+) -> anyhow::Result<()> {
+    let server = TcpServer::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned()).await?;
+    let addr = server.local_addr;
+
+    let (recv_res, send_res) = tokio::join!(
+        server.accept_one(),
+        sender::send(
+            src.clone(),
+            addr,
+            SendConfig {
+                streams: Some(streams),
+                chunk_size: Some(chunk_size),
+                compress,
+                compress_level: 3,
+                trusted_fingerprint: None,
+                use_tcp: true,
+            },
+        )
+    );
+    recv_res?;
+    send_res?;
+
+    let file_name = src.file_name().unwrap().to_string_lossy();
+    let received = std::fs::read(recv_dir.path().join(file_name.as_ref()))?;
+    let original = std::fs::read(&src)?;
+    assert_eq!(received, original, "TCP: received file differs from original");
+    Ok(())
+}
+
+/// Basic TCP round-trip with multiple streams and chunks.
+#[tokio::test]
+async fn test_tcp_multi_chunk_multi_stream() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "tcp_random.bin", 3 * 1024 * 1024);
+    roundtrip_tcp(src, &recv_dir, 2, 1024 * 1024, false).await
+}
+
+/// TCP path with compression enabled.
+#[tokio::test]
+async fn test_tcp_compressible_data() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let src = send_dir.path().join("tcp_zeros.bin");
+    std::fs::write(&src, vec![0u8; 2 * 1024 * 1024])?;
+    roundtrip_tcp(src, &recv_dir, 1, 1024 * 1024, true).await
 }

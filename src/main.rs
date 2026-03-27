@@ -10,7 +10,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of parallel QUIC streams (default: auto-negotiated from RTT + CPU cores)
+    /// Number of parallel streams (default: auto-negotiated from RTT + CPU cores)
     #[arg(short = 'n', long, global = true)]
     streams: Option<usize>,
 
@@ -21,6 +21,10 @@ struct Cli {
     /// Disable adaptive zstd compression
     #[arg(long, global = true)]
     no_compress: bool,
+
+    /// Use plain TCP instead of QUIC (faster on LAN / same-datacenter; no encryption)
+    #[arg(long, global = true)]
+    tcp: bool,
 
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -37,6 +41,7 @@ enum Command {
         destination: String,
         /// Pin the receiver's certificate fingerprint (hex SHA-256).
         /// Omit to use TOFU: fingerprint is printed and accepted on first connect.
+        /// Ignored when --tcp is set.
         #[arg(long)]
         trust: Option<String>,
     },
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
                     compress: !cli.no_compress,
                     compress_level: 3,
                     trusted_fingerprint: trust,
+                    use_tcp: cli.tcp,
                 },
             )
             .await
@@ -87,11 +93,11 @@ async fn main() -> Result<()> {
             let addr = bind
                 .parse()
                 .with_context(|| format!("invalid bind address: {bind}"))?;
-            receiver::listen(
-                addr,
-                receiver::ReceiveConfig { output_dir },
-            )
-            .await
+            if cli.tcp {
+                receiver::listen_tcp(addr, receiver::ReceiveConfig { output_dir }).await
+            } else {
+                receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
+            }
         }
     }
 }

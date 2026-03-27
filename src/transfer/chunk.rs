@@ -32,15 +32,13 @@ impl ChunkQueue {
 
     /// Returns the next chunk index to send, or `None` if all chunks are claimed.
     pub fn next_chunk(&self) -> Option<ChunkInfo> {
-        loop {
-            let idx = self.next.fetch_add(1, Ordering::Relaxed);
-            if idx >= self.total {
-                return None;
-            }
-            let offset = idx * self.chunk_size as u64;
-            let len = ((self.file_size - offset) as usize).min(self.chunk_size);
-            return Some(ChunkInfo { index: idx, offset, len });
+        let idx = self.next.fetch_add(1, Ordering::Relaxed);
+        if idx >= self.total {
+            return None;
         }
+        let offset = idx * self.chunk_size as u64;
+        let len = ((self.file_size - offset) as usize).min(self.chunk_size);
+        Some(ChunkInfo { index: idx, offset, len })
     }
 
     pub fn total_chunks(&self) -> u64 {

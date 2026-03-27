@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWrite;
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
@@ -33,10 +34,23 @@ pub struct SendConfig {
     pub compress: bool,
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
+    /// Ignored in TCP mode (no TLS).
     pub trusted_fingerprint: Option<String>,
+    /// Use plain TCP instead of QUIC. Faster on LAN; no encryption.
+    pub use_tcp: bool,
 }
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
+    if config.use_tcp {
+        send_tcp(file, destination, config).await
+    } else {
+        send_quic(file, destination, config).await
+    }
+}
+
+// ── QUIC path ─────────────────────────────────────────────────────────────────
+
+async fn send_quic(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     // ── Gather file metadata ──────────────────────────────────────────────────
     let meta = tokio::fs::metadata(&file)
         .await
@@ -49,8 +63,6 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         .into_owned();
 
     // ── Start hashing immediately — runs concurrently with everything below ───
-    // For large files this can take tens of seconds. By running it in parallel
-    // with the QUIC handshake and the data transfer we avoid blocking the start.
     let hash_task = {
         let path = file.clone();
         tokio::task::spawn_blocking(move || hash_file_sync(&path))
@@ -135,30 +147,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     let remaining = total_chunks - skip_count;
     info!("{skip_count} chunks already at receiver, {remaining} to send");
 
-    // ── Sender spinner ────────────────────────────────────────────────────────
-    // quinn::SendStream::write_all() returns when data enters quinn's send
-    // buffer, not when the receiver has written it to disk.  A bytes/sec bar
-    // on the sender would measure buffer-fill rate (~RAM speed), not the actual
-    // transfer rate.  Instead: show a spinner with elapsed time while chunks
-    // are being queued, then print true end-to-end throughput once the receiver
-    // confirms delivery.
-    let spinner = Arc::new({
-        let sp = ProgressBar::new_spinner();
-        sp.set_style(
-            ProgressStyle::with_template(
-                "[send] {spinner:.green} [{elapsed_precise}] {msg}",
-            )
-            .unwrap(),
-        );
-        sp.enable_steady_tick(Duration::from_millis(100));
-        sp.set_message(format!(
-            "sending {} ({} chunks remaining)",
-            file_name, remaining
-        ));
-        sp
-    });
-
-    // Start timing from when we actually begin streaming data.
+    let spinner = make_spinner(&file_name, remaining);
     let transfer_start = Instant::now();
 
     // ── Parallel data streams ─────────────────────────────────────────────────
@@ -175,8 +164,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         let compression = compression.clone();
 
         tasks.spawn(async move {
-            stream_worker(stream, queue, have, file_path, chunk_size, transfer_id, compression)
-                .await
+            quic_stream_worker(stream, queue, have, file_path, transfer_id, compression).await
         });
     }
 
@@ -191,11 +179,239 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     framing::send_message(&mut ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // ── Wait for receiver's completion ack ────────────────────────────────────
-    // The receiver writes every chunk to disk, verifies the whole-file hash,
-    // then sends Complete.  The elapsed time here is the true end-to-end wall
-    // time: from first byte queued to last byte confirmed on disk.
     let msg: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
     spinner.finish_and_clear();
+    print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
+
+    let _ = ctrl_send.finish();
+    conn.close(0u32.into(), b"done");
+    Ok(())
+}
+
+async fn quic_stream_worker(
+    mut stream: quinn::SendStream,
+    queue: Arc<ChunkQueue>,
+    skip: Arc<HashSet<u64>>,
+    file_path: PathBuf,
+    transfer_id: [u8; 16],
+    compression: Compression,
+) -> Result<()> {
+    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression).await?;
+    stream.finish()?;
+    Ok(())
+}
+
+// ── TCP path ──────────────────────────────────────────────────────────────────
+
+async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
+    // ── Gather file metadata ──────────────────────────────────────────────────
+    let meta = tokio::fs::metadata(&file)
+        .await
+        .with_context(|| format!("cannot stat {}", file.display()))?;
+    let file_size = meta.len();
+    let file_name = file
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy()
+        .into_owned();
+
+    let hash_task = {
+        let path = file.clone();
+        tokio::task::spawn_blocking(move || hash_file_sync(&path))
+    };
+
+    let transfer_id: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+
+    let compression = if config.compress {
+        Compression::Zstd { level: config.compress_level }
+    } else {
+        Compression::None
+    };
+
+    let sender_cores =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
+
+    // ── Connect control stream ────────────────────────────────────────────────
+    info!("connecting to {destination} (TCP)");
+    let ctrl = crate::net::tcp::connect_tcp(destination).await?;
+    let (mut ctrl_recv, mut ctrl_send) = ctrl.into_split();
+    info!("connected");
+
+    // ── Negotiate + measure RTT ───────────────────────────────────────────────
+    // Quinn gives us an RTT measurement from the QUIC handshake; for TCP we
+    // time the NegotiateRequest/Response round trip instead.
+    let rtt_start = Instant::now();
+    framing::send_message(
+        &mut ctrl_send,
+        &NegotiateRequest { cpu_cores: sender_cores, file_size },
+    )
+    .await?;
+    let neg_resp: NegotiateResponse =
+        framing::recv_message_required(&mut ctrl_recv).await?;
+    let rtt = rtt_start.elapsed();
+
+    let params = compute_params(
+        rtt,
+        file_size,
+        sender_cores,
+        neg_resp.cpu_cores,
+        config.streams,
+        config.chunk_size,
+    );
+    println!(
+        "Negotiated: {} streams, {} MiB chunks (RTT {:.1} ms, sender {} cores, receiver {} cores)",
+        params.streams,
+        params.chunk_size / (1024 * 1024),
+        rtt.as_secs_f64() * 1000.0,
+        sender_cores,
+        neg_resp.cpu_cores,
+    );
+
+    let chunk_size = params.chunk_size;
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let num_streams = params.streams;
+
+    let manifest = TransferManifest {
+        transfer_id,
+        file_name: file_name.clone(),
+        file_size,
+        chunk_size,
+        total_chunks,
+        num_streams,
+        compression: compression.clone(),
+        fec: None,
+    };
+    framing::send_message(&mut ctrl_send, &manifest).await?;
+
+    let ready: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
+    let have: HashSet<u64> = match ready {
+        ReceiverMessage::Ready { have_chunks } => have_chunks.into_iter().collect(),
+        ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
+        other => bail!("unexpected message from receiver: {other:?}"),
+    };
+    let skip_count = have.len() as u64;
+    let remaining = total_chunks - skip_count;
+    info!("{skip_count} chunks already at receiver, {remaining} to send");
+
+    let spinner = make_spinner(&file_name, remaining);
+    let transfer_start = Instant::now();
+
+    // ── Parallel data connections ─────────────────────────────────────────────
+    // Each data connection maps to one QUIC stream in the QUIC path.
+    // The receiver accepts them in order after sending Ready.
+    let actual_streams = num_streams.min(remaining.max(1) as usize);
+    let queue = ChunkQueue::new(file_size, chunk_size);
+    let have = Arc::new(have);
+
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    for _ in 0..actual_streams {
+        let data_stream = crate::net::tcp::connect_tcp(destination).await?;
+        let queue = queue.clone();
+        let have = have.clone();
+        let file_path = file.clone();
+        let compression = compression.clone();
+
+        tasks.spawn(async move {
+            tcp_stream_worker(data_stream, queue, have, file_path, transfer_id, compression).await
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        res??;
+    }
+
+    spinner.set_message("waiting for receiver to confirm delivery…");
+
+    let file_hash = hash_task.await.context("hash task panicked")??;
+    framing::send_message(&mut ctrl_send, &SenderMessage::Complete { file_hash }).await?;
+
+    let msg: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
+    spinner.finish_and_clear();
+    print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
+
+    // ctrl_send and ctrl_recv drop here, closing the TCP control connection.
+    Ok(())
+}
+
+async fn tcp_stream_worker(
+    stream: tokio::net::TcpStream,
+    queue: Arc<ChunkQueue>,
+    skip: Arc<HashSet<u64>>,
+    file_path: PathBuf,
+    transfer_id: [u8; 16],
+    compression: Compression,
+) -> Result<()> {
+    // Split: we only write on data streams; dropping the read half half-closes
+    // the connection, which is harmless (receiver only reads).
+    let (_read, mut write) = stream.into_split();
+    send_chunks(&mut write, queue, skip, &file_path, transfer_id, &compression).await
+    // write (and thus the TCP stream's write side) closes on drop → receiver sees EOF
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Send all queued chunks (skipping already-received ones) to any [`AsyncWrite`].
+///
+/// Used by both the QUIC and TCP stream workers so the chunk-sending logic
+/// lives in exactly one place.
+async fn send_chunks<W>(
+    writer: &mut W,
+    queue: Arc<ChunkQueue>,
+    skip: Arc<HashSet<u64>>,
+    file_path: &Path,
+    transfer_id: [u8; 16],
+    compression: &Compression,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Each worker opens its own file handle — avoids cross-task locking on seeks.
+    let file = std::fs::File::open(file_path)
+        .with_context(|| format!("open {}", file_path.display()))?;
+
+    while let Some(chunk) = queue.next_chunk() {
+        if skip.contains(&chunk.index) {
+            continue;
+        }
+
+        let raw = read_chunk(&file, &chunk)?;
+        let (payload, compressed) = maybe_compress(&raw, compression)?;
+        let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+
+        framing::send_message(
+            writer,
+            &ChunkData { transfer_id, chunk_index: chunk.index, chunk_hash, compressed, payload },
+        )
+        .await?;
+
+        debug!(chunk = chunk.index, "sent");
+    }
+
+    Ok(())
+}
+
+fn make_spinner(file_name: &str, remaining: u64) -> Arc<ProgressBar> {
+    Arc::new({
+        let sp = ProgressBar::new_spinner();
+        sp.set_style(
+            ProgressStyle::with_template(
+                "[send] {spinner:.green} [{elapsed_precise}] {msg}",
+            )
+            .unwrap(),
+        );
+        sp.enable_steady_tick(Duration::from_millis(100));
+        sp.set_message(format!("sending {file_name} ({remaining} chunks remaining)"));
+        sp
+    })
+}
+
+fn print_completion(
+    msg: ReceiverMessage,
+    file_name: &str,
+    file_size: u64,
+    file_hash: [u8; 32],
+    transfer_start: Instant,
+) -> Result<()> {
     match msg {
         ReceiverMessage::Complete { file_hash: recv_hash } => {
             if recv_hash != file_hash {
@@ -219,48 +435,8 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
         other => bail!("unexpected final message: {other:?}"),
     }
-
-    let _ = ctrl_send.finish();
-    conn.close(0u32.into(), b"done");
     Ok(())
 }
-
-async fn stream_worker(
-    mut stream: quinn::SendStream,
-    queue: Arc<ChunkQueue>,
-    skip: Arc<HashSet<u64>>,
-    file_path: PathBuf,
-    _chunk_size: usize,
-    transfer_id: [u8; 16],
-    compression: Compression,
-) -> Result<()> {
-    // Each worker opens its own file handle — avoids cross-task locking on seeks.
-    let file = std::fs::File::open(&file_path)
-        .with_context(|| format!("open {}", file_path.display()))?;
-
-    while let Some(chunk) = queue.next_chunk() {
-        if skip.contains(&chunk.index) {
-            continue;
-        }
-
-        let raw = read_chunk(&file, &chunk)?;
-        let (payload, compressed) = maybe_compress(&raw, &compression)?;
-        let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
-
-        framing::send_message(
-            &mut stream,
-            &ChunkData { transfer_id, chunk_index: chunk.index, chunk_hash, compressed, payload },
-        )
-        .await?;
-
-        debug!(chunk = chunk.index, "sent");
-    }
-
-    stream.finish()?;
-    Ok(())
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn read_chunk(file: &std::fs::File, chunk: &ChunkInfo) -> Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
@@ -279,7 +455,6 @@ fn maybe_compress(data: &[u8], compression: &Compression) -> Result<(Vec<u8>, bo
         },
     }
 }
-
 
 pub(crate) fn hash_file_sync(path: &Path) -> Result<[u8; 32]> {
     use std::io::Read;
