@@ -1,6 +1,5 @@
 //! Receiver-side transfer orchestration. See `transfer/mod.rs` for the full flow.
 
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -17,6 +16,7 @@ use crate::protocol::{
     framing,
     messages::{ChunkData, ReceiverMessage, SenderMessage, TransferManifest},
 };
+use crate::transfer::hash::ChunkHasher;
 use crate::transfer::resume::ResumeState;
 
 pub struct ReceiveConfig {
@@ -138,6 +138,12 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
         pb
     });
 
+    // ── Inline hasher — accumulates the file hash as chunks arrive ────────────
+    // Chunks arrive out of order; ChunkHasher buffers ahead-of-time chunks
+    // and drains them into SHA-256 in index order.  When the last chunk is
+    // received the hash is ready instantly — no extra disk read needed.
+    let hasher = Arc::new(ChunkHasher::new(manifest.total_chunks));
+
     // ── Accept exactly num_streams unidirectional data streams ────────────────
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..manifest.num_streams {
@@ -146,8 +152,9 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
         let resume = resume.clone();
         let manifest = manifest.clone();
         let pb = pb.clone();
+        let hasher = hasher.clone();
         tasks.spawn(async move {
-            recv_stream_worker(stream, out_file, resume, manifest, pb).await
+            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher).await
         });
     }
 
@@ -182,16 +189,15 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
         bail!("transfer incomplete; retransmit requested");
     }
 
-    // ── Read sender's file hash, then verify our copy ─────────────────────────
-    // The sender computed the hash concurrently with the transfer and sends it
-    // here, after all data streams are done. We then hash our received file and
-    // compare. The connection is kept alive by the sender's keep_alive_interval.
+    // ── Verify integrity — hash is already computed, no disk re-read ─────────
+    let file_hash = Arc::try_unwrap(hasher)
+        .expect("all stream tasks finished so no other Arc references exist")
+        .finish()?;
+
     let expected_hash = match framing::recv_message_required(&mut ctrl_recv).await? {
         SenderMessage::Complete { file_hash } => file_hash,
     };
 
-    info!("verifying file integrity...");
-    let file_hash = hash_file(&out_path).await?;
     if file_hash != expected_hash {
         framing::send_message(
             &mut ctrl_send,
@@ -220,6 +226,7 @@ async fn recv_stream_worker(
     resume: Arc<Mutex<ResumeState>>,
     manifest: TransferManifest,
     pb: Arc<ProgressBar>,
+    hasher: Arc<ChunkHasher>,
 ) -> Result<()> {
     loop {
         let chunk: ChunkData = match framing::recv_message(&mut stream).await? {
@@ -251,27 +258,12 @@ async fn recv_stream_worker(
                 })?;
         }
 
+        // Feed into the inline hasher (in chunk-index order; buffers if needed)
+        hasher.feed(chunk.chunk_index, &data);
+
         pb.inc(data.len() as u64);
         resume.lock().unwrap().mark_received(chunk.chunk_index);
         debug!(chunk = chunk.chunk_index, "received");
     }
     Ok(())
-}
-
-async fn hash_file(path: &PathBuf) -> Result<[u8; 32]> {
-    let path = path.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(&path)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1024 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok::<[u8; 32], anyhow::Error>(hasher.finalize().into())
-    })
-    .await?
 }
