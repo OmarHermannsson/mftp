@@ -1,0 +1,67 @@
+[package]
+name = "mftp"
+version = "0.1.0"
+edition = "2021"
+description = "High-throughput file transfer over high-latency internet links"
+license = "MIT"
+
+[[bin]]
+name = "mftp"
+path = "src/main.rs"
+
+[lib]
+name = "mftp"
+path = "src/lib.rs"
+
+[dependencies]
+# QUIC transport
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization (protocol messages)
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+# Compression
+zstd = "0.13"
+
+# Hashing / integrity
+sha2 = "0.10"
+hex = "0.4"
+
+# Forward error correction
+reed-solomon-erasure = "6"
+
+# Progress reporting
+indicatif = "0.17"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Misc
+bytes = "1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
