@@ -38,21 +38,31 @@ pub struct SendConfig {
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
     pub trusted_fingerprint: Option<String>,
     /// Force TCP+TLS instead of QUIC. Normally not needed — the sender tries
-    /// QUIC first and auto-falls-back to TCP+TLS if UDP is blocked.
+    /// QUIC first and auto-falls-back to TCP+TLS if UDP is blocked or RTT is low.
     pub use_tcp: bool,
+    /// Switch to TCP+TLS when measured RTT is at or below this threshold.
+    /// On LAN / same-datacenter links QUIC's per-packet overhead costs more
+    /// than it saves, so TCP+TLS matches or beats it at short distances.
+    /// Defaults to 1 ms; set to zero to disable the check.
+    pub tcp_rtt_threshold: Duration,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
 const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// RTT at or below which the sender switches to TCP+TLS even after a
+/// successful QUIC handshake.
+pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(1);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     if config.use_tcp {
         return send_tcp(file, destination, config).await;
     }
 
-    // Try QUIC first; fall back to TCP+TLS if UDP is blocked or the connection
-    // times out.  Only the connect phase triggers a fallback — errors during
-    // the transfer itself are surfaced as real errors.
+    // Try QUIC first; fall back to TCP+TLS if:
+    //   • UDP is blocked or the handshake times out, OR
+    //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter —
+    //     QUIC overhead outweighs its benefits at short distances).
     let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref())?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
     let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
@@ -65,8 +75,20 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
 
     match quic_result {
         Ok(Ok(conn)) => {
-            info!("connected via QUIC");
-            send_quic_with_conn(file, destination, config, conn).await
+            let rtt = conn.stats().path.rtt;
+            let threshold = config.tcp_rtt_threshold;
+            if threshold > Duration::ZERO && rtt <= threshold {
+                eprintln!(
+                    "[mftp] RTT {:.2} ms (≤ {:.2} ms threshold) — switching to TCP+TLS for LAN throughput…",
+                    rtt.as_secs_f64() * 1000.0,
+                    threshold.as_secs_f64() * 1000.0,
+                );
+                conn.close(0u32.into(), b"switching to tcp");
+                send_tcp(file, destination, config).await
+            } else {
+                info!("connected via QUIC (RTT {:.1} ms)", rtt.as_secs_f64() * 1000.0);
+                send_quic_with_conn(file, destination, config, conn).await
+            }
         }
         Ok(Err(e)) => {
             eprintln!("[mftp] QUIC connect failed ({e:#}), retrying over TCP+TLS…");

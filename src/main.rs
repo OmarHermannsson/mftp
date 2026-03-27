@@ -26,6 +26,12 @@ struct Cli {
     #[arg(long, global = true)]
     tcp: bool,
 
+    /// Switch to TCP+TLS when measured RTT is at or below this value (milliseconds).
+    /// Prevents QUIC overhead from hurting throughput on LAN / same-datacenter links.
+    /// Set to 0 to always use QUIC regardless of RTT.
+    #[arg(long, global = true, default_value = "1.0", value_name = "MS")]
+    tcp_below_rtt: f64,
+
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -83,6 +89,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Send { file, destination, trust, remote_mftp } => {
+            let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
             let config = sender::SendConfig {
                 streams: cli.streams,
                 chunk_size: cli.chunk_size,
@@ -90,6 +97,7 @@ async fn main() -> Result<()> {
                 compress_level: 3,
                 trusted_fingerprint: trust,
                 use_tcp: cli.tcp,
+                tcp_rtt_threshold,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
                 mftp::ssh::send_via_ssh(file, dest, config, remote_mftp).await
