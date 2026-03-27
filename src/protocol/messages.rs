@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+// ── Parameter negotiation (first round-trip on the control stream) ────────────
+
+/// Sent by the sender immediately after opening the control stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NegotiateRequest {
+    /// Logical CPU cores available on the sender.
+    pub cpu_cores: u32,
+    /// Total file size in bytes (helps receiver recommend chunk size).
+    pub file_size: u64,
+}
+
+/// Receiver's reply to `NegotiateRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NegotiateResponse {
+    /// Logical CPU cores available on the receiver.
+    pub cpu_cores: u32,
+}
+
 /// Sent by the sender on the control stream before data transfer begins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferManifest {

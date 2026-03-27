@@ -51,8 +51,8 @@ async fn roundtrip(
         src.clone(),
         addr,
         SendConfig {
-            streams,
-            chunk_size,
+            streams: Some(streams),
+            chunk_size: Some(chunk_size),
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
@@ -140,8 +140,8 @@ async fn test_compressible_data() -> anyhow::Result<()> {
         path,
         addr,
         SendConfig {
-            streams: 2,
-            chunk_size: 1024 * 1024,
+            streams: Some(2),
+            chunk_size: Some(1024 * 1024),
             compress: true,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),

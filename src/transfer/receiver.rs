@@ -14,7 +14,7 @@ use crate::compress;
 use crate::net::connection::make_server_endpoint;
 use crate::protocol::{
     framing,
-    messages::{ChunkData, ReceiverMessage, SenderMessage, TransferManifest},
+    messages::{ChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest},
 };
 use crate::transfer::hash::ChunkHasher;
 use crate::transfer::resume::ResumeState;
@@ -91,8 +91,26 @@ pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 
 async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
     // Keep conn alive until the end so we can call conn.closed() before dropping it.
-    // ── Handshake ─────────────────────────────────────────────────────────────
+    // ── Negotiation ───────────────────────────────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
+
+    let neg_req: NegotiateRequest =
+        framing::recv_message_required(&mut ctrl_recv).await?;
+    let receiver_cores =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
+    framing::send_message(
+        &mut ctrl_send,
+        &NegotiateResponse { cpu_cores: receiver_cores },
+    )
+    .await?;
+    debug!(
+        sender_cores = neg_req.cpu_cores,
+        receiver_cores,
+        file_size = neg_req.file_size,
+        "negotiation complete"
+    );
+
+    // ── Manifest ──────────────────────────────────────────────────────────────
     let manifest: TransferManifest =
         framing::recv_message_required(&mut ctrl_recv).await?;
     info!(

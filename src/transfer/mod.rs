@@ -18,6 +18,7 @@
 
 pub mod chunk;
 pub mod hash;
+pub mod negotiate;
 pub mod receiver;
 pub mod resume;
 pub mod sender;

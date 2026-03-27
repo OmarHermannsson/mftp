@@ -15,13 +15,19 @@ use crate::compress;
 use crate::net::connection::make_client_endpoint;
 use crate::protocol::{
     framing,
-    messages::{ChunkData, Compression, ReceiverMessage, SenderMessage, TransferManifest},
+    messages::{
+        ChunkData, Compression, NegotiateRequest, NegotiateResponse, ReceiverMessage,
+        SenderMessage, TransferManifest,
+    },
 };
 use crate::transfer::chunk::{ChunkInfo, ChunkQueue};
+use crate::transfer::negotiate::compute_params;
 
 pub struct SendConfig {
-    pub streams: usize,
-    pub chunk_size: usize,
+    /// Override parallel stream count. `None` = auto-negotiate from RTT + CPU.
+    pub streams: Option<usize>,
+    /// Override chunk size in bytes. `None` = auto-negotiate from RTT.
+    pub chunk_size: Option<usize>,
     pub compress: bool,
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
@@ -48,8 +54,6 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         tokio::task::spawn_blocking(move || hash_file_sync(&path))
     };
 
-    let chunk_size = config.chunk_size;
-    let total_chunks = file_size.div_ceil(chunk_size as u64);
     let transfer_id: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
 
     let compression = if config.compress {
@@ -57,6 +61,9 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     } else {
         Compression::None
     };
+
+    let sender_cores =
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
 
     // ── Connect ───────────────────────────────────────────────────────────────
     let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref())?;
@@ -67,10 +74,41 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         .context("QUIC connect failed")?;
     info!("connected");
 
-    // ── Control stream: handshake ─────────────────────────────────────────────
+    // ── Control stream: negotiate parameters ──────────────────────────────────
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
 
-    let num_streams = config.streams.min(total_chunks as usize).max(1);
+    framing::send_message(
+        &mut ctrl_send,
+        &NegotiateRequest { cpu_cores: sender_cores, file_size },
+    )
+    .await?;
+
+    let neg_resp: NegotiateResponse =
+        framing::recv_message_required(&mut ctrl_recv).await?;
+
+    // RTT is available right after the handshake.
+    let rtt = conn.stats().path.rtt;
+    let params = compute_params(
+        rtt,
+        file_size,
+        sender_cores,
+        neg_resp.cpu_cores,
+        config.streams,
+        config.chunk_size,
+    );
+    println!(
+        "Negotiated: {} streams, {} MiB chunks (RTT {:.1} ms, sender {} cores, receiver {} cores)",
+        params.streams,
+        params.chunk_size / (1024 * 1024),
+        rtt.as_secs_f64() * 1000.0,
+        sender_cores,
+        neg_resp.cpu_cores,
+    );
+
+    let chunk_size = params.chunk_size;
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let num_streams = params.streams;
+
     let manifest = TransferManifest {
         transfer_id,
         file_name: file_name.clone(),

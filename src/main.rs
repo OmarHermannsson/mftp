@@ -10,13 +10,13 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of parallel QUIC streams
-    #[arg(short = 'n', long, default_value = "8", global = true)]
-    streams: usize,
+    /// Number of parallel QUIC streams (default: auto-negotiated from RTT + CPU cores)
+    #[arg(short = 'n', long, global = true)]
+    streams: Option<usize>,
 
-    /// Chunk size in bytes
-    #[arg(long, default_value = "4194304", global = true)] // 4 MiB
-    chunk_size: usize,
+    /// Chunk size in bytes (default: auto-negotiated from RTT)
+    #[arg(long, global = true)]
+    chunk_size: Option<usize>,
 
     /// Disable adaptive zstd compression
     #[arg(long, global = true)]
