@@ -138,7 +138,22 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
             .create(true)
             .open(&out_path)
             .with_context(|| format!("open output {}", out_path.display()))?;
-        // Pre-allocate so parallel pwrite calls don't race on extending the file.
+        // fallocate(0) allocates real disk blocks upfront so every subsequent
+        // pwrite hits a pre-allocated block — no on-demand extent allocation.
+        // Much faster than ftruncate (sparse file) on spinning disks and most
+        // SSDs.  Fall back to set_len on kernels/filesystems that don't
+        // support fallocate (e.g. tmpfs, NFS, macOS).
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe {
+                libc::fallocate(f.as_raw_fd(), 0, 0, manifest.file_size as libc::off_t)
+            };
+            if rc != 0 {
+                f.set_len(manifest.file_size)?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         f.set_len(manifest.file_size)?;
         f
     });
@@ -252,36 +267,54 @@ async fn recv_stream_worker(
             None => break, // sender called finish() — normal stream end
         };
 
-        // Verify chunk integrity
-        let computed: [u8; 32] = Sha256::digest(&chunk.payload).into();
-        if computed != chunk.chunk_hash {
-            bail!("chunk {} hash mismatch", chunk.chunk_index);
-        }
+        // Move all CPU and blocking I/O off the async executor.
+        //
+        // SHA-256 verification, decompression, and pwrite are all blocking
+        // operations. Running them directly in an async task blocks the tokio
+        // worker thread, preventing other streams from processing their network
+        // data concurrently. spawn_blocking hands this work to a dedicated
+        // thread pool, freeing the async worker immediately.
+        let chunk_index = chunk.chunk_index;
+        let chunk_size = manifest.chunk_size;
+        let out_file = Arc::clone(&out_file);
+        let hasher = Arc::clone(&hasher);
+        let resume = Arc::clone(&resume);
+        let pb = Arc::clone(&pb);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Verify chunk integrity
+            let computed: [u8; 32] = Sha256::digest(&chunk.payload).into();
+            if computed != chunk.chunk_hash {
+                bail!("chunk {} hash mismatch", chunk_index);
+            }
 
-        // Decompress if the sender flagged it
-        let data = if chunk.compressed {
-            compress::decompress_chunk(&chunk.payload)?
-        } else {
-            chunk.payload
-        };
+            // Decompress if the sender flagged it
+            let data = if chunk.compressed {
+                compress::decompress_chunk(&chunk.payload)?
+            } else {
+                chunk.payload
+            };
 
-        // pwrite: safe for concurrent callers on the same file descriptor
-        let offset = chunk.chunk_index * manifest.chunk_size as u64;
-        {
-            use std::os::unix::fs::FileExt;
-            out_file
-                .write_all_at(&data, offset)
-                .with_context(|| {
-                    format!("write chunk {} at offset {}", chunk.chunk_index, offset)
-                })?;
-        }
+            // pwrite: safe for concurrent callers on the same file descriptor
+            let offset = chunk_index * chunk_size as u64;
+            {
+                use std::os::unix::fs::FileExt;
+                out_file
+                    .write_all_at(&data, offset)
+                    .with_context(|| {
+                        format!("write chunk {chunk_index} at offset {offset}")
+                    })?;
+            }
 
-        // Feed into the inline hasher (in chunk-index order; buffers if needed)
-        hasher.feed(chunk.chunk_index, &data);
+            // Feed into the inline hasher (in chunk-index order; buffers if needed)
+            hasher.feed(chunk_index, &data);
 
-        pb.inc(data.len() as u64);
-        resume.lock().unwrap().mark_received(chunk.chunk_index);
-        debug!(chunk = chunk.chunk_index, "received");
+            pb.inc(data.len() as u64);
+            resume.lock().unwrap().mark_received(chunk_index);
+            debug!(chunk = chunk_index, "received");
+            Ok(())
+        })
+        .await
+        .context("chunk processing task panicked")??;
     }
     Ok(())
 }
