@@ -139,11 +139,16 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         .map(|i| chunk_byte_len(i, chunk_size, file_size))
         .sum();
 
+    // Use file_size as the total so the bar is on the same scale as the
+    // receiver's bar.  On resume, advance to the bytes already at the
+    // receiver so both bars start from the same visual position.
+    let bytes_already_sent = file_size.saturating_sub(bytes_to_send);
     let pb = Arc::new({
-        let pb = ProgressBar::new(bytes_to_send);
+        let pb = ProgressBar::new(file_size);
+        pb.set_position(bytes_already_sent);
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {bar:50.cyan/blue} \
+                "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
                  {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
             )
             .unwrap(),

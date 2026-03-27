@@ -135,6 +135,16 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
         manifest.total_chunks,
     )));
     let have_chunks = resume.lock().unwrap().received_chunks();
+    // Compute bytes already on disk before consuming have_chunks.
+    // Used to start the progress bar at the right position so it matches
+    // the sender's bar on the same file_size scale.
+    let bytes_already_received: u64 = have_chunks
+        .iter()
+        .map(|&i| {
+            let offset = i * manifest.chunk_size as u64;
+            ((manifest.file_size - offset) as usize).min(manifest.chunk_size) as u64
+        })
+        .sum();
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
 
     // ── Pre-allocate output file ──────────────────────────────────────────────
@@ -167,11 +177,16 @@ async fn handle_connection(conn: quinn::Connection, output_dir: PathBuf) -> Resu
     });
 
     // ── Progress ──────────────────────────────────────────────────────────────
+    // Total = file_size (same scale as sender).  On resume, start at the
+    // bytes already written so both bars advance through the same range.
+    // Note: [send] shows network TX speed; [recv] shows disk write speed —
+    // they measure different operations so the rates will legitimately differ.
     let pb = Arc::new({
         let pb = ProgressBar::new(manifest.file_size);
+        pb.set_position(bytes_already_received);
         pb.set_style(
             ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] {bar:50.cyan/blue} \
+                "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
                  {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
             )
             .unwrap(),
