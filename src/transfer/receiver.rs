@@ -241,17 +241,49 @@ pub async fn serve_one_stdio(output_dir: PathBuf) -> Result<()> {
     // Machine-readable handshake — the SSH launcher reads exactly this line.
     println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\"}}");
 
-    // Accept whichever transport the sender uses; the other is simply dropped.
+    // Race QUIC and TCP.  If the QUIC connection is immediately closed by the
+    // sender with the "switching to tcp" sentinel (RTT-based LAN detection),
+    // fall through to accept the follow-up TCP+TLS connection instead of
+    // exiting — the TCP listener is still bound and waiting.
     tokio::select! {
-        res = quic_server.accept_one() => res,
+        res = quic_server.accept_one() => {
+            match res {
+                Ok(()) => Ok(()),
+                Err(e) if e.is::<SwitchToTcp>() => tcp_server.accept_one().await,
+                Err(e) => Err(e),
+            }
+        }
         res = tcp_server.accept_one() => res,
     }
 }
 
 // ── Per-connection logic: QUIC ────────────────────────────────────────────────
 
+/// Returned when the sender probed RTT over QUIC and then closed the connection
+/// to switch to TCP+TLS.  `serve_one_stdio` catches this and falls through to
+/// the TCP server instead of treating it as a real error.
+#[derive(Debug)]
+struct SwitchToTcp;
+impl std::fmt::Display for SwitchToTcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sender is switching to TCP+TLS")
+    }
+}
+impl std::error::Error for SwitchToTcp {}
+
 async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
-    let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
+    let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+        Ok(s) => s,
+        // Sender connected only to measure RTT, found it was within the LAN
+        // threshold, and closed the connection to retry over TCP+TLS.
+        Err(quinn::ConnectionError::ApplicationClosed(close))
+            if close.error_code.into_inner() == 0
+                && close.reason.as_ref() == b"switching to tcp" =>
+        {
+            return Err(anyhow::Error::new(SwitchToTcp));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     let receiver_cores =
