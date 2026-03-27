@@ -37,19 +37,30 @@ enum Command {
     Send {
         /// File to send
         file: std::path::PathBuf,
-        /// Destination address (host:port or IP:port)
+        /// Destination: `host:port` for a running receiver, or
+        /// `[user@]host:/path` to launch the receiver automatically via SSH
         destination: String,
         /// Pin the receiver's certificate fingerprint (hex SHA-256).
         /// Omit to use TOFU: fingerprint is printed and accepted on first connect.
-        /// Ignored when --tcp is set.
+        /// Ignored when connecting via SSH (fingerprint is obtained from the server).
         #[arg(long)]
         trust: Option<String>,
+        /// Path to the mftp binary on the remote host (if not in PATH)
+        #[arg(long)]
+        remote_mftp: Option<String>,
     },
     /// Receive files (run as server)
     Receive {
         /// Address to listen on
         #[arg(default_value = "0.0.0.0:7777")]
         bind: String,
+        /// Directory to write received files into
+        #[arg(short, long, default_value = ".")]
+        output_dir: std::path::PathBuf,
+    },
+    /// One-shot server mode launched by the sender via SSH (not for direct use)
+    #[command(hide = true)]
+    Server {
         /// Directory to write received files into
         #[arg(short, long, default_value = ".")]
         output_dir: std::path::PathBuf,
@@ -71,23 +82,23 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Command::Send { file, destination, trust } => {
-            let addr = destination
-                .parse()
-                .with_context(|| format!("invalid address: {destination}"))?;
-            sender::send(
-                file,
-                addr,
-                sender::SendConfig {
-                    streams: cli.streams,
-                    chunk_size: cli.chunk_size,
-                    compress: !cli.no_compress,
-                    compress_level: 3,
-                    trusted_fingerprint: trust,
-                    use_tcp: cli.tcp,
-                },
-            )
-            .await
+        Command::Send { file, destination, trust, remote_mftp } => {
+            let config = sender::SendConfig {
+                streams: cli.streams,
+                chunk_size: cli.chunk_size,
+                compress: !cli.no_compress,
+                compress_level: 3,
+                trusted_fingerprint: trust,
+                use_tcp: cli.tcp,
+            };
+            if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
+                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp).await
+            } else {
+                let addr = destination
+                    .parse()
+                    .with_context(|| format!("invalid address: {destination}"))?;
+                sender::send(file, addr, config).await
+            }
         }
         Command::Receive { bind, output_dir } => {
             let addr = bind
@@ -98,6 +109,9 @@ async fn main() -> Result<()> {
             } else {
                 receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
             }
+        }
+        Command::Server { output_dir } => {
+            receiver::serve_one_stdio(output_dir).await
         }
     }
 }

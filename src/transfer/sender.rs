@@ -27,6 +27,7 @@ use crate::protocol::{
 use crate::transfer::chunk::{ChunkInfo, ChunkQueue};
 use crate::transfer::negotiate::compute_params;
 
+#[derive(Clone)]
 pub struct SendConfig {
     /// Override parallel stream count. `None` = auto-negotiate from RTT + CPU.
     pub streams: Option<usize>,

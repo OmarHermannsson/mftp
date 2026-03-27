@@ -204,6 +204,49 @@ pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
     server.serve().await
 }
 
+/// Bind on a random port, write a JSON handshake to stdout for the SSH
+/// launcher to read, accept exactly one transfer (QUIC or TCP+TLS), then exit.
+///
+/// Both transports are offered on the same port number so the sender's
+/// auto-fallback (QUIC → TCP+TLS) works without any extra configuration.
+pub async fn serve_one_stdio(output_dir: PathBuf) -> Result<()> {
+    use std::net::SocketAddr;
+
+    let (cert, key_bytes) = generate_self_signed_cert()?;
+    let fingerprint = cert_fingerprint(&cert);
+
+    let quic_key = make_private_key(key_bytes.clone())?;
+    let tcp_key = make_private_key(key_bytes)?;
+
+    // Bind QUIC on a random UDP port, then reuse that port number for TCP.
+    // UDP and TCP port spaces are independent, so this always works.
+    let quic_server = Server::bind_with_cert(
+        "0.0.0.0:0".parse::<SocketAddr>()?,
+        output_dir.clone(),
+        cert.clone(),
+        quic_key,
+        fingerprint.clone(),
+    )?;
+    let port = quic_server.local_addr.port();
+    let tcp_server = TcpServer::bind_with_cert(
+        format!("0.0.0.0:{port}").parse::<SocketAddr>()?,
+        output_dir,
+        cert,
+        tcp_key,
+        fingerprint.clone(),
+    )
+    .await?;
+
+    // Machine-readable handshake — the SSH launcher reads exactly this line.
+    println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\"}}");
+
+    // Accept whichever transport the sender uses; the other is simply dropped.
+    tokio::select! {
+        res = quic_server.accept_one() => res,
+        res = tcp_server.accept_one() => res,
+    }
+}
+
 // ── Per-connection logic: QUIC ────────────────────────────────────────────────
 
 async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
