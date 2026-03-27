@@ -174,8 +174,35 @@ async fn send_quic_with_conn(
     let remaining = total_chunks - skip_count;
     info!("{skip_count} chunks already at receiver, {remaining} to send");
 
-    let spinner = make_spinner(&file_name, remaining);
+    let pb = make_progress_bar(&file_name, file_size);
+    // Seed progress bar with bytes the receiver already has (resume).
+    let resume_bytes: u64 = have.iter().map(|&i| {
+        let offset = i * chunk_size as u64;
+        (file_size - offset).min(chunk_size as u64)
+    }).sum();
+    pb.set_position(resume_bytes);
     let transfer_start = Instant::now();
+
+    // Spawn a task that reads ReceiverMessage::Progress from the control stream
+    // and advances the progress bar.  It captures the terminal message
+    // (Complete / Retransmit / Error) via a oneshot channel so the main task
+    // can retrieve it after data workers finish.
+    let pb_for_reader = pb.clone();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    let reader = tokio::spawn(async move {
+        loop {
+            match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
+                Ok(Some(ReceiverMessage::Progress { bytes_written })) => {
+                    pb_for_reader.set_position(bytes_written);
+                }
+                Ok(Some(other)) => {
+                    let _ = completion_tx.send(other);
+                    return;
+                }
+                _ => return, // EOF or error — completion_rx will surface this
+            }
+        }
+    });
 
     // ── Parallel data streams ─────────────────────────────────────────────────
     let actual_streams = num_streams.min(remaining.max(1) as usize);
@@ -199,15 +226,17 @@ async fn send_quic_with_conn(
         res??;
     }
 
-    spinner.set_message("waiting for receiver to confirm delivery…");
+    pb.set_message("verifying…");
 
     // ── Send file hash — await the background task (almost certainly done) ────
     let file_hash = hash_task.await.context("hash task panicked")??;
     framing::send_message(&mut ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // ── Wait for receiver's completion ack ────────────────────────────────────
-    let msg: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
-    spinner.finish_and_clear();
+    // The reader task keeps consuming Progress messages until Complete arrives.
+    let msg = completion_rx.await.context("receiver closed without completing")?;
+    reader.await.ok();
+    pb.finish_and_clear();
     print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
 
     let _ = ctrl_send.finish();
@@ -320,8 +349,30 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     let remaining = total_chunks - skip_count;
     info!("{skip_count} chunks already at receiver, {remaining} to send");
 
-    let spinner = make_spinner(&file_name, remaining);
+    let pb = make_progress_bar(&file_name, file_size);
+    let resume_bytes: u64 = have.iter().map(|&i| {
+        let offset = i * chunk_size as u64;
+        (file_size - offset).min(chunk_size as u64)
+    }).sum();
+    pb.set_position(resume_bytes);
     let transfer_start = Instant::now();
+
+    let pb_for_reader = pb.clone();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    let reader = tokio::spawn(async move {
+        loop {
+            match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
+                Ok(Some(ReceiverMessage::Progress { bytes_written })) => {
+                    pb_for_reader.set_position(bytes_written);
+                }
+                Ok(Some(other)) => {
+                    let _ = completion_tx.send(other);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    });
 
     // ── Parallel data connections ─────────────────────────────────────────────
     // Each data connection maps to one QUIC stream in the QUIC path.
@@ -348,13 +399,14 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         res??;
     }
 
-    spinner.set_message("waiting for receiver to confirm delivery…");
+    pb.set_message("verifying…");
 
     let file_hash = hash_task.await.context("hash task panicked")??;
     framing::send_message(&mut ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    let msg: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
-    spinner.finish_and_clear();
+    let msg = completion_rx.await.context("receiver closed without completing")?;
+    reader.await.ok();
+    pb.finish_and_clear();
     print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
 
     // ctrl_send and ctrl_recv drop here, closing the TCP control connection.
@@ -425,18 +477,19 @@ where
     Ok(())
 }
 
-fn make_spinner(file_name: &str, remaining: u64) -> Arc<ProgressBar> {
+fn make_progress_bar(file_name: &str, file_size: u64) -> Arc<ProgressBar> {
     Arc::new({
-        let sp = ProgressBar::new_spinner();
-        sp.set_style(
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
             ProgressStyle::with_template(
-                "[send] {spinner:.green} [{elapsed_precise}] {msg}",
+                "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
+                 {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {msg}",
             )
             .unwrap(),
         );
-        sp.enable_steady_tick(Duration::from_millis(100));
-        sp.set_message(format!("sending {file_name} ({remaining} chunks remaining)"));
-        sp
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_message(file_name.to_owned());
+        pb
     })
 }
 

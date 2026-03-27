@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -269,6 +270,9 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
     pb.set_position(bytes_already_received);
 
+    // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
+
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..manifest.num_streams {
         let stream = conn.accept_uni().await.context("accept data stream")?;
@@ -277,14 +281,28 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
         let manifest = manifest.clone();
         let pb = pb.clone();
         let hasher = hasher.clone();
+        let progress_tx = progress_tx.clone();
         tasks.spawn(async move {
-            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher).await
+            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx).await
         });
     }
+    // Drop the original sender so the channel closes when all workers finish.
+    drop(progress_tx);
 
-    let task_err = drain_tasks(&mut tasks, &mut ctrl_send).await;
+    // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
+    // It runs concurrently with the data workers and returns ctrl_send when done.
+    let reporter = tokio::spawn(progress_reporter(ctrl_send, progress_rx, bytes_already_received));
+
+    let task_err = drain_tasks(&mut tasks).await;
     pb.finish();
+
+    let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
+
     if let Some(e) = task_err {
+        let _ = framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Error { message: e.to_string() },
+        ).await;
         bail!("{e}");
     }
 
@@ -322,6 +340,8 @@ async fn handle_tcp_connection(
     framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
     pb.set_position(bytes_already_received);
 
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
+
     // Accept exactly num_streams TLS-wrapped data connections.
     // The sender opens them in order after receiving Ready; sequential serve
     // guarantees no other transfer competes for these connections.
@@ -338,14 +358,25 @@ async fn handle_tcp_connection(
         let manifest = manifest.clone();
         let pb = pb.clone();
         let hasher = hasher.clone();
+        let progress_tx = progress_tx.clone();
         tasks.spawn(async move {
-            recv_stream_worker(data_tls, out_file, resume, manifest, pb, hasher).await
+            recv_stream_worker(data_tls, out_file, resume, manifest, pb, hasher, progress_tx).await
         });
     }
+    drop(progress_tx);
 
-    let task_err = drain_tasks(&mut tasks, &mut ctrl_send).await;
+    let reporter = tokio::spawn(progress_reporter(ctrl_send, progress_rx, bytes_already_received));
+
+    let task_err = drain_tasks(&mut tasks).await;
     pb.finish();
+
+    let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
+
     if let Some(e) = task_err {
+        let _ = framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Error { message: e.to_string() },
+        ).await;
         bail!("{e}");
     }
 
@@ -415,13 +446,7 @@ fn prepare_transfer(
     Ok((out_file, resume, pb, hasher, bytes_already_received))
 }
 
-async fn drain_tasks<S>(
-    tasks: &mut JoinSet<Result<()>>,
-    ctrl_send: &mut S,
-) -> Option<anyhow::Error>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
+async fn drain_tasks(tasks: &mut JoinSet<Result<()>>) -> Option<anyhow::Error> {
     let mut task_err: Option<anyhow::Error> = None;
     while let Some(join_res) = tasks.join_next().await {
         let task_result = match join_res {
@@ -430,16 +455,62 @@ where
         };
         if let Err(e) = task_result {
             if task_err.is_none() {
-                let _ = framing::send_message(
-                    ctrl_send,
-                    &ReceiverMessage::Error { message: e.to_string() },
-                )
-                .await;
                 task_err = Some(e);
             }
         }
     }
     task_err
+}
+
+/// Receives confirmed-written byte counts from data workers and sends
+/// throttled `ReceiverMessage::Progress` updates on the control stream.
+///
+/// Takes ownership of `ctrl_send` and returns it when the channel closes
+/// (i.e. when all data workers have finished), so the caller can use it
+/// for the final `ReceiverMessage::Complete` / `Error` exchange.
+async fn progress_reporter<W>(
+    mut ctrl_send: W,
+    mut rx: tokio::sync::mpsc::Receiver<u64>,
+    initial_bytes: u64,
+) -> Result<W>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut bytes_written = initial_bytes;
+    let mut last_reported = initial_bytes;
+    let report_interval = Duration::from_millis(100);
+    let mut next_report = tokio::time::Instant::now() + report_interval;
+
+    loop {
+        tokio::select! {
+            n = rx.recv() => {
+                match n {
+                    Some(n) => bytes_written += n,
+                    None => break, // all workers finished, channel closed
+                }
+            }
+            _ = tokio::time::sleep_until(next_report) => {
+                if bytes_written != last_reported {
+                    framing::send_message(
+                        &mut ctrl_send,
+                        &ReceiverMessage::Progress { bytes_written },
+                    ).await?;
+                    last_reported = bytes_written;
+                }
+                next_report = tokio::time::Instant::now() + report_interval;
+            }
+        }
+    }
+
+    // Final update to make sure the sender sees 100%.
+    if bytes_written != last_reported {
+        framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Progress { bytes_written },
+        ).await?;
+    }
+
+    Ok(ctrl_send)
 }
 
 async fn finish_transfer<S, R>(
@@ -498,6 +569,7 @@ async fn recv_stream_worker<R>(
     manifest: TransferManifest,
     pb: Arc<ProgressBar>,
     hasher: Arc<ChunkHasher>,
+    progress_tx: tokio::sync::mpsc::Sender<u64>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -536,6 +608,7 @@ where
         let hasher = Arc::clone(&hasher);
         let resume = Arc::clone(&resume);
         let pb = Arc::clone(&pb);
+        let progress_tx = progress_tx.clone();
 
         processing.spawn_blocking(move || -> Result<()> {
             let computed: [u8; 32] = Sha256::digest(&chunk.payload).into();
@@ -558,7 +631,10 @@ where
             }
 
             hasher.feed(chunk_index, &data);
-            pb.inc(data.len() as u64);
+            let n = data.len() as u64;
+            pb.inc(n);
+            // Non-blocking: progress updates are best-effort; never slow the data path.
+            let _ = progress_tx.try_send(n);
             resume.lock().unwrap().mark_received(chunk_index);
             debug!(chunk = chunk_index, "received");
             Ok(())

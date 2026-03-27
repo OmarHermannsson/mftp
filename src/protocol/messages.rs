@@ -78,6 +78,10 @@ pub enum SenderMessage {
 pub enum ReceiverMessage {
     /// Receiver is ready; lists chunk indices already on disk (resume).
     Ready { have_chunks: Vec<u64> },
+    /// Periodic progress update: total bytes written to disk so far.
+    /// Sent at most every 100 ms during the data-transfer phase so the
+    /// sender can display an accurate progress bar.
+    Progress { bytes_written: u64 },
     /// All chunks received and verified; echoes the file hash.
     Complete { file_hash: [u8; 32] },
     /// Some chunks are missing; sender should retransmit them.
