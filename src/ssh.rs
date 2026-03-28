@@ -110,17 +110,32 @@ pub async fn send_via_ssh(
     // Wrap immediately so the process is killed on any early return.
     let mut ssh = KillOnDrop(child);
 
-    // Read the one-line JSON handshake printed by the remote server.
+    // Read lines from ssh stdout until we find the JSON handshake.
+    // Shell startup files (.bashrc, /etc/profile, etc.) often print to stdout
+    // before our script runs — we skip those lines and look for the first one
+    // that begins with '{'.
     let stdout = ssh.0.stdout.take().expect("stdout is piped");
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.context("reading server handshake from ssh")?;
-    let line = line.trim();
-    if line.is_empty() {
-        bail!("remote mftp server exited without printing a handshake");
-    }
-    let hs: ServerHandshake = serde_json::from_str(line)
-        .with_context(|| format!("invalid server handshake: {line:?}"))?;
+    let hs: ServerHandshake = loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("reading server handshake from ssh")?;
+        if n == 0 {
+            bail!(
+                "remote mftp server exited without printing a handshake \
+                 (check that the remote shell startup files don't produce errors)"
+            );
+        }
+        let line = line.trim();
+        if line.starts_with('{') {
+            break serde_json::from_str(line)
+                .with_context(|| format!("invalid server handshake: {line:?}"))?;
+        }
+        // Shell preamble noise — log at debug and skip.
+        tracing::debug!("ssh preamble: {line}");
+    };
 
     eprintln!(
         "Remote server ready  port={}  fp={}…",
