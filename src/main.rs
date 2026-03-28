@@ -51,7 +51,9 @@ enum Command {
         /// Ignored when connecting via SSH (fingerprint is obtained from the server).
         #[arg(long)]
         trust: Option<String>,
-        /// Path to the mftp binary on the remote host (if not in PATH)
+        /// Use this pre-installed binary on the remote instead of copying the
+        /// local binary.  By default mftp pipes itself to the remote so no
+        /// prior installation is required.
         #[arg(long)]
         remote_mftp: Option<String>,
     },

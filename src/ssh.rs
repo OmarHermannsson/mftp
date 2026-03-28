@@ -4,6 +4,15 @@
 //! If the direct connection fails (e.g. a firewall blocks the transfer port),
 //! the sender falls back to routing data through an SSH port-forward tunnel,
 //! which is available whenever SSH itself is available.
+//!
+//! # Binary delivery
+//!
+//! When `--remote-mftp` is not given the local binary is piped to the remote
+//! over SSH stdin.  The remote shell writes it to a content-addressed cache
+//! path (`~/.cache/mftp-<hash16>`), making subsequent transfers with the same
+//! binary version instant (the remote already has it; stdin is drained to
+//! `/dev/null`).  Only the first transfer — or after a version upgrade — pays
+//! the copy cost.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::transfer::sender::SendConfig;
 
@@ -77,29 +87,25 @@ impl Drop for KillOnDrop {
 
 /// Launch `mftp server` on the remote via SSH and transfer `file`.
 ///
-/// Steps:
-/// 1. Spawns `ssh [user@]host mftp server --output-dir /path`
-/// 2. Reads `{"port":N,"fingerprint":"…"}` from the child's stdout.
-/// 3. Attempts a direct connection (QUIC first, auto-falls-back to TCP+TLS).
-/// 4. On failure, retries via an SSH port-forward tunnel.
+/// When `remote_mftp` is `None` (the default), the local binary is piped to
+/// the remote over SSH stdin so mftp does not need to be pre-installed there.
+/// When `remote_mftp` is `Some(path)`, that pre-installed binary is used
+/// instead and nothing is copied.
+///
+/// In both cases:
+/// 1. A JSON handshake `{"port":N,"fingerprint":"…"}` is read from stdout.
+/// 2. A direct connection is attempted (QUIC first, auto-falls-back to TCP+TLS).
+/// 3. On failure, the transfer is retried via an SSH port-forward tunnel.
 pub async fn send_via_ssh(
     file: PathBuf,
     dest: SshDest,
     config: SendConfig,
     remote_mftp: Option<String>,
 ) -> Result<()> {
-    let mftp_bin = remote_mftp.as_deref().unwrap_or("mftp");
-
-    let child = tokio::process::Command::new("ssh")
-        .arg(&dest.user_host)
-        .arg(mftp_bin)
-        .arg("server")
-        .arg("--output-dir")
-        .arg(&dest.remote_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("failed to spawn ssh(1) — is it installed and in PATH?")?;
+    let child = match remote_mftp {
+        Some(ref bin) => spawn_remote_binary(&dest, bin)?,
+        None => pipe_self_to_remote(&dest).await?,
+    };
 
     // Wrap immediately so the process is killed on any early return.
     let mut ssh = KillOnDrop(child);
@@ -111,13 +117,10 @@ pub async fn send_via_ssh(
     reader.read_line(&mut line).await.context("reading server handshake from ssh")?;
     let line = line.trim();
     if line.is_empty() {
-        bail!(
-            "remote mftp server exited without printing a handshake\n  \
-             Is `{mftp_bin}` installed and in PATH on the remote host?"
-        );
+        bail!("remote mftp server exited without printing a handshake");
     }
     let hs: ServerHandshake = serde_json::from_str(line)
-        .with_context(|| format!("invalid server handshake line: {line:?}"))?;
+        .with_context(|| format!("invalid server handshake: {line:?}"))?;
 
     eprintln!(
         "Remote server ready  port={}  fp={}…",
@@ -126,7 +129,10 @@ pub async fn send_via_ssh(
     );
 
     let direct_addr = resolve_host(&dest.host, hs.port).await?;
-    let direct_cfg = SendConfig { trusted_fingerprint: Some(hs.fingerprint.clone()), ..config.clone() };
+    let direct_cfg = SendConfig {
+        trusted_fingerprint: Some(hs.fingerprint.clone()),
+        ..config.clone()
+    };
     let direct_result = crate::transfer::sender::send(file.clone(), direct_addr, direct_cfg).await;
 
     if let Err(e) = direct_result {
@@ -140,6 +146,97 @@ pub async fn send_via_ssh(
     // KillOnDrop fires on drop regardless, so this is best-effort.
     let _ = ssh.0.wait().await;
     Ok(())
+}
+
+// ── Binary delivery ───────────────────────────────────────────────────────────
+
+/// Spawn SSH to run a pre-installed binary on the remote.
+fn spawn_remote_binary(dest: &SshDest, bin: &str) -> Result<tokio::process::Child> {
+    tokio::process::Command::new("ssh")
+        .arg(&dest.user_host)
+        .arg(bin)
+        .arg("server")
+        .arg("--output-dir")
+        .arg(&dest.remote_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn ssh(1) — is it installed and in PATH?")
+}
+
+/// Pipe the local binary to the remote over SSH stdin and run it as a server.
+///
+/// The remote shell script caches the binary at `~/.cache/mftp-<hash16>` so
+/// that a second call with an identical binary skips the copy and just runs
+/// the cached file.
+async fn pipe_self_to_remote(dest: &SshDest) -> Result<tokio::process::Child> {
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let binary = tokio::fs::read(&exe)
+        .await
+        .with_context(|| format!("cannot read {}", exe.display()))?;
+
+    // 16 hex chars of SHA-256 — enough to identify a binary version uniquely.
+    let hash: String = {
+        let digest: [u8; 32] = Sha256::digest(&binary).into();
+        hex::encode(&digest[..8])
+    };
+
+    let quoted_dir = shell_quote(&dest.remote_path);
+
+    // Remote script:
+    //   • Derive a stable cache path from the binary's content hash.
+    //   • If the cached file does not exist: write stdin to it and chmod +x.
+    //   • Otherwise: drain stdin (cat > /dev/null) so the pipe is clean.
+    //   • Exec the cached binary as a one-shot server.
+    let remote_cmd = format!(
+        r#"set -e
+f="${{HOME:-/tmp}}/.cache/mftp-{hash}"
+if [ ! -x "$f" ]; then
+  mkdir -p "$(dirname "$f")"
+  cat > "$f"
+  chmod +x "$f"
+else
+  cat > /dev/null
+fi
+exec "$f" server --output-dir {quoted_dir}"#
+    );
+
+    let mut child = tokio::process::Command::new("ssh")
+        .arg(&dest.user_host)
+        .arg("sh")
+        .arg("-c")
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn ssh(1) — is it installed and in PATH?")?;
+
+    // Write the binary to ssh's stdin, then close it so the remote `cat`
+    // sees EOF and the script continues to the exec.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin.write_all(&binary).await.context("writing binary to ssh stdin")?;
+    drop(stdin);
+
+    eprintln!(
+        "[mftp] binary delivered ({})",
+        if binary.len() >= 1024 * 1024 {
+            format!("{:.1} MiB", binary.len() as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{} KiB", binary.len() / 1024)
+        }
+    );
+
+    Ok(child)
+}
+
+/// Single-quote a string for safe embedding in a POSIX shell command.
+///
+/// Wraps `s` in single quotes and escapes any literal `'` by ending the
+/// quoted section, inserting `'\''`, and reopening.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 // ── SSH tunnel fallback ───────────────────────────────────────────────────────
@@ -210,5 +307,27 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
             bail!("timed out waiting for port {} to become available", addr.port());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_plain() {
+        assert_eq!(shell_quote("/tmp/out"), "'/tmp/out'");
+    }
+
+    #[test]
+    fn shell_quote_spaces() {
+        assert_eq!(shell_quote("/my files/out dir"), "'/my files/out dir'");
+    }
+
+    #[test]
+    fn shell_quote_single_quote() {
+        assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
     }
 }
