@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -20,9 +20,11 @@ path = "src/lib.rs"
 
 [dependencies]
 # QUIC transport
-quinn = "0.11"
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# default-features = false drops aws-lc-rs (a C library) from both rustls and
+# tokio-rustls; we only use the pure-Rust ring provider.
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 socket2 = { version = "0.5", features = ["all"] }
 
