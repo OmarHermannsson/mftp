@@ -1,1 +1,12 @@
 /target
+
+# Editor artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment / secrets
+.env

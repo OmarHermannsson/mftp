@@ -33,13 +33,13 @@ That's it. No receiver daemon to start first, no firewall rules to configure.
 ### Install
 
 ```sh
-cargo install --git https://github.com/you/mftp
+cargo install --git https://github.com/OmarHermannsson/mftp
 ```
 
 Or build from source:
 
 ```sh
-git clone https://github.com/you/mftp
+git clone https://github.com/OmarHermannsson/mftp
 cd mftp
 cargo build --release
 # binary is at target/release/mftp
