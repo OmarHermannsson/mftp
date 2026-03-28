@@ -261,7 +261,7 @@ async fn test_tls_two_streams_raw() -> anyhow::Result<()> {
     // Client: open 2 TLS connections and write DATA_SIZE bytes each
     for i in 0..2 {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
-        let config = make_client_tls_config(None)?;
+        let config = make_client_tls_config(None, addr)?;
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = ServerName::IpAddress(addr.ip().into());
         let mut tls = connector.connect(server_name, tcp).await?;

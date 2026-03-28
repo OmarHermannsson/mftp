@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 pub struct NegotiateRequest {
     /// Logical CPU cores available on the sender.
     pub cpu_cores: u32,
-    /// Total file size in bytes (helps receiver recommend chunk size).
-    pub file_size: u64,
 }
 
 /// Receiver's reply to `NegotiateRequest`.

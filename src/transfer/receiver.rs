@@ -1,5 +1,6 @@
 //! Receiver-side transfer orchestration. See `transfer/mod.rs` for the full flow.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -59,7 +60,7 @@ impl Server {
         key: PrivateKeyDer<'static>,
         fingerprint: String,
     ) -> Result<Self> {
-        use crate::net::connection::{make_server_endpoint_with_cert};
+        use crate::net::connection::make_server_endpoint_with_cert;
         let endpoint = make_server_endpoint_with_cert(addr, cert, key)?;
         let local_addr = endpoint.local_addr()?;
         Ok(Self { endpoint, local_addr, fingerprint, output_dir })
@@ -146,7 +147,13 @@ impl TcpServer {
             .accept(raw)
             .await
             .context("TLS handshake on control stream")?;
-        handle_tcp_connection(tls, Arc::clone(&self.listener), Arc::clone(&self.acceptor), self.output_dir.clone()).await
+        handle_tcp_connection(
+            tls,
+            Arc::clone(&self.listener),
+            Arc::clone(&self.acceptor),
+            self.output_dir.clone(),
+        )
+        .await
     }
 
     /// Accept and handle transfers sequentially, indefinitely.
@@ -157,14 +164,19 @@ impl TcpServer {
             info!("TCP connection from {peer_addr}");
             let tls = match Arc::clone(&self.acceptor).accept(raw).await {
                 Ok(s) => s,
-                Err(e) => { warn!("TLS handshake failed from {peer_addr}: {e}"); continue; }
+                Err(e) => {
+                    warn!("TLS handshake failed from {peer_addr}: {e}");
+                    continue;
+                }
             };
             if let Err(e) = handle_tcp_connection(
                 tls,
                 Arc::clone(&self.listener),
                 Arc::clone(&self.acceptor),
                 self.output_dir.clone(),
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("transfer error: {e:#}");
             }
         }
@@ -185,10 +197,16 @@ pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
     let quic_key = make_private_key(key_bytes.clone())?;
     let tcp_key = make_private_key(key_bytes)?;
 
-    let quic_server =
-        Server::bind_with_cert(bind, config.output_dir.clone(), cert.clone(), quic_key, fingerprint.clone())?;
+    let quic_server = Server::bind_with_cert(
+        bind,
+        config.output_dir.clone(),
+        cert.clone(),
+        quic_key,
+        fingerprint.clone(),
+    )?;
     let tcp_server =
-        TcpServer::bind_with_cert(bind, config.output_dir, cert, tcp_key, fingerprint.clone()).await?;
+        TcpServer::bind_with_cert(bind, config.output_dir, cert, tcp_key, fingerprint.clone())
+            .await?;
 
     println!("Listening on {} (QUIC + TCP+TLS, auto-fallback)", quic_server.local_addr);
     println!("Certificate fingerprint (share with sender --trust):\n  {fingerprint}");
@@ -272,7 +290,7 @@ impl std::fmt::Display for SwitchToTcp {
 impl std::error::Error for SwitchToTcp {}
 
 async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
-    let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+    let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
         Ok(s) => s,
         // Sender connected only to measure RTT, found it was within the LAN
         // threshold, and closed the connection to retry over TCP+TLS.
@@ -285,61 +303,22 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
         Err(e) => return Err(e.into()),
     };
 
-    let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
-    let receiver_cores =
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores }).await?;
-    debug!(sender_cores = neg_req.cpu_cores, receiver_cores, "negotiation complete");
+    let conn_for_accept = conn.clone();
+    let mut ctrl_send = run_receive(
+        ctrl_send,
+        ctrl_recv,
+        output_dir,
+        move || {
+            let conn = conn_for_accept.clone();
+            async move {
+                let stream = conn.accept_uni().await.context("accept QUIC data stream")?;
+                Ok(Box::new(stream) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+            }
+        },
+    )
+    .await?;
 
-    let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
-    validate_manifest(&manifest)?;
-    info!(file = %manifest.file_name, size = manifest.file_size, chunks = manifest.total_chunks, streams = manifest.num_streams, "transfer started");
-
-    let (out_file, resume, pb, hasher, bytes_already_received) =
-        prepare_transfer(&manifest, &output_dir)?;
-
-    let have_chunks = { resume.lock().unwrap().received_chunks() };
-    framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
-    pb.set_position(bytes_already_received);
-
-    // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
-    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
-
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    for _ in 0..manifest.num_streams {
-        let stream = conn.accept_uni().await.context("accept data stream")?;
-        let out_file = out_file.clone();
-        let resume = resume.clone();
-        let manifest = manifest.clone();
-        let pb = pb.clone();
-        let hasher = hasher.clone();
-        let progress_tx = progress_tx.clone();
-        tasks.spawn(async move {
-            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx).await
-        });
-    }
-    // Drop the original sender so the channel closes when all workers finish.
-    drop(progress_tx);
-
-    // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
-    // It runs concurrently with the data workers and returns ctrl_send when done.
-    let reporter = tokio::spawn(progress_reporter(ctrl_send, progress_rx, bytes_already_received));
-
-    let task_err = drain_tasks(&mut tasks).await;
-    pb.finish();
-
-    let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
-
-    if let Some(e) = task_err {
-        let _ = framing::send_message(
-            &mut ctrl_send,
-            &ReceiverMessage::Error { message: e.to_string() },
-        ).await;
-        bail!("{e}");
-    }
-
-    finish_transfer(&mut ctrl_send, &mut ctrl_recv, resume, hasher, &output_dir, &manifest).await?;
-
+    // Gracefully close the control stream so the sender sees a clean FIN.
     let _ = ctrl_send.finish();
     let _ = conn.closed().await;
     Ok(())
@@ -353,54 +332,101 @@ async fn handle_tcp_connection(
     acceptor: Arc<TlsAcceptor>,
     output_dir: PathBuf,
 ) -> Result<()> {
-    let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl_stream);
+    let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
+    run_receive(
+        ctrl_send,
+        ctrl_recv,
+        output_dir,
+        move || {
+            let listener = Arc::clone(&listener);
+            let acceptor = Arc::clone(&acceptor);
+            async move {
+                let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
+                raw.set_nodelay(true)?;
+                let tls =
+                    acceptor.accept(raw).await.context("TLS handshake on data stream")?;
+                Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+            }
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+// ── Shared transfer body ──────────────────────────────────────────────────────
+
+/// Core receive logic shared by both the QUIC and TCP paths.
+///
+/// Handles the full negotiation → manifest → data transfer → verification flow.
+/// `accept_stream` is a factory called once per data stream; it must return a
+/// future that yields a readable stream (QUIC `RecvStream` or TCP+TLS stream).
+///
+/// Returns the write half of the control stream so the QUIC caller can send
+/// a graceful FIN; TCP callers may discard it.
+async fn run_receive<CW, CR, F, Fut>(
+    mut ctrl_send: CW,
+    mut ctrl_recv: CR,
+    output_dir: PathBuf,
+    mut accept_stream: F,
+) -> Result<CW>
+where
+    CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    CR: tokio::io::AsyncRead + Unpin,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>>,
+{
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     let receiver_cores =
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores }).await?;
+    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores })
+        .await?;
     debug!(sender_cores = neg_req.cpu_cores, receiver_cores, "negotiation complete");
 
     let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
     validate_manifest(&manifest)?;
-    info!(file = %manifest.file_name, size = manifest.file_size, chunks = manifest.total_chunks, streams = manifest.num_streams, "transfer started");
+    info!(
+        file = %manifest.file_name,
+        size = manifest.file_size,
+        chunks = manifest.total_chunks,
+        streams = manifest.num_streams,
+        "transfer started"
+    );
 
-    let (out_file, resume, pb, hasher, bytes_already_received) =
-        prepare_transfer(&manifest, &output_dir)?;
+    let pt = prepare_transfer(&manifest, &output_dir)?;
+    framing::send_message(
+        &mut ctrl_send,
+        &ReceiverMessage::Ready { have_chunks: pt.have_chunks },
+    )
+    .await?;
+    pt.pb.set_position(pt.bytes_already_received);
 
-    let have_chunks = { resume.lock().unwrap().received_chunks() };
-    framing::send_message(&mut ctrl_send, &ReceiverMessage::Ready { have_chunks }).await?;
-    pb.set_position(bytes_already_received);
-
+    // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
 
-    // Accept exactly num_streams TLS-wrapped data connections.
-    // The sender opens them in order after receiving Ready; sequential serve
-    // guarantees no other transfer competes for these connections.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..manifest.num_streams {
-        let (raw, _peer) = listener.accept().await.context("accept data stream")?;
-        raw.set_nodelay(true)?;
-        // Pass the full TLS stream (no split): data streams are read-only, and
-        // keeping the stream whole avoids split-half interactions in the TLS
-        // state machine.
-        let data_tls = acceptor.accept(raw).await.context("TLS handshake on data stream")?;
-        let out_file = out_file.clone();
-        let resume = resume.clone();
+        let stream = accept_stream().await?;
+        let out_file = pt.out_file.clone();
+        let resume = pt.resume.clone();
         let manifest = manifest.clone();
-        let pb = pb.clone();
-        let hasher = hasher.clone();
+        let pb = pt.pb.clone();
+        let hasher = pt.hasher.clone();
         let progress_tx = progress_tx.clone();
         tasks.spawn(async move {
-            recv_stream_worker(data_tls, out_file, resume, manifest, pb, hasher, progress_tx).await
+            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx).await
         });
     }
+    // Drop the original sender so the channel closes when all workers finish.
     drop(progress_tx);
 
-    let reporter = tokio::spawn(progress_reporter(ctrl_send, progress_rx, bytes_already_received));
+    // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
+    // It runs concurrently with the data workers and returns ctrl_send when done.
+    let reporter =
+        tokio::spawn(progress_reporter(ctrl_send, progress_rx, pt.bytes_already_received));
 
     let task_err = drain_tasks(&mut tasks).await;
-    pb.finish();
+    pt.pb.finish();
 
     let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
@@ -408,22 +434,42 @@ async fn handle_tcp_connection(
         let _ = framing::send_message(
             &mut ctrl_send,
             &ReceiverMessage::Error { message: e.to_string() },
-        ).await;
+        )
+        .await;
         bail!("{e}");
     }
 
-    finish_transfer(&mut ctrl_send, &mut ctrl_recv, resume, hasher, &output_dir, &manifest).await?;
-    Ok(())
+    finish_transfer(
+        &mut ctrl_send,
+        &mut ctrl_recv,
+        pt.resume,
+        pt.hasher,
+        &output_dir,
+        &manifest,
+    )
+    .await?;
+
+    Ok(ctrl_send)
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-#[allow(clippy::type_complexity)]
+/// Prepared state for a transfer: open output file, resume state, progress bar,
+/// and the list of chunks already on disk (for the Ready message).
+struct PreparedTransfer {
+    out_file: Arc<std::fs::File>,
+    resume: Arc<Mutex<ResumeState>>,
+    pb: Arc<ProgressBar>,
+    hasher: Arc<ChunkHasher>,
+    bytes_already_received: u64,
+    /// Chunk indices already written to disk; sent in ReceiverMessage::Ready.
+    have_chunks: Vec<u64>,
+}
+
 fn prepare_transfer(
     manifest: &TransferManifest,
     output_dir: &std::path::Path,
-) -> Result<(Arc<std::fs::File>, Arc<Mutex<ResumeState>>, Arc<ProgressBar>, Arc<ChunkHasher>, u64)>
-{
+) -> Result<PreparedTransfer> {
     let resume = Arc::new(Mutex::new(ResumeState::load_or_new(
         output_dir,
         &manifest.transfer_id,
@@ -475,7 +521,7 @@ fn prepare_transfer(
 
     let hasher = Arc::new(ChunkHasher::new(manifest.total_chunks));
 
-    Ok((out_file, resume, pb, hasher, bytes_already_received))
+    Ok(PreparedTransfer { out_file, resume, pb, hasher, bytes_already_received, have_chunks })
 }
 
 async fn drain_tasks(tasks: &mut JoinSet<Result<()>>) -> Option<anyhow::Error> {
@@ -511,7 +557,14 @@ where
     let mut bytes_written = initial_bytes;
     let mut last_reported = initial_bytes;
     let report_interval = Duration::from_millis(100);
-    let mut next_report = tokio::time::Instant::now() + report_interval;
+
+    // interval_at avoids timer drift: each tick fires at a fixed cadence
+    // relative to the start time rather than relative to the previous tick.
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + report_interval,
+        report_interval,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -521,7 +574,7 @@ where
                     None => break, // all workers finished, channel closed
                 }
             }
-            _ = tokio::time::sleep_until(next_report) => {
+            _ = interval.tick() => {
                 if bytes_written != last_reported {
                     framing::send_message(
                         &mut ctrl_send,
@@ -529,7 +582,6 @@ where
                     ).await?;
                     last_reported = bytes_written;
                 }
-                next_report = tokio::time::Instant::now() + report_interval;
             }
         }
     }
@@ -539,7 +591,8 @@ where
         framing::send_message(
             &mut ctrl_send,
             &ReceiverMessage::Progress { bytes_written },
-        ).await?;
+        )
+        .await?;
     }
 
     Ok(ctrl_send)
@@ -609,8 +662,10 @@ where
             }
         }
 
-        let chunk: ChunkData = match framing::recv_data_message(&mut stream).await
-            .with_context(|| format!("recv chunk#{chunk_count}"))? {
+        let chunk: ChunkData = match framing::recv_data_message(&mut stream)
+            .await
+            .with_context(|| format!("recv chunk#{chunk_count}"))?
+        {
             Some(c) => c,
             None => break,
         };
@@ -716,7 +771,10 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
     if m.total_chunks != expected {
         bail!(
             "manifest: total_chunks {} inconsistent with file_size {}/chunk_size {} (expected {})",
-            m.total_chunks, m.file_size, m.chunk_size, expected
+            m.total_chunks,
+            m.file_size,
+            m.chunk_size,
+            expected
         );
     }
     if m.num_streams == 0 || m.num_streams > MAX_STREAMS {

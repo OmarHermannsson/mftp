@@ -211,8 +211,10 @@ if [ ! -x "$f" ]; then
   mkdir -p "$(dirname "$f")"
   cat > "$f"
   chmod +x "$f"
+  printf '[mftp] binary installed (%s)\n' "$(du -sh "$f" 2>/dev/null | cut -f1 || echo '?')" >&2
 else
   cat > /dev/null
+  printf '[mftp] using cached binary\n' >&2
 fi
 exec "$f" server --output-dir {quoted_dir}"#
     );
@@ -233,15 +235,6 @@ exec "$f" server --output-dir {quoted_dir}"#
     let mut stdin = child.stdin.take().expect("stdin is piped");
     stdin.write_all(&binary).await.context("writing binary to ssh stdin")?;
     drop(stdin);
-
-    eprintln!(
-        "[mftp] binary delivered ({})",
-        if binary.len() >= 1024 * 1024 {
-            format!("{:.1} MiB", binary.len() as f64 / (1024.0 * 1024.0))
-        } else {
-            format!("{} KiB", binary.len() / 1024)
-        }
-    );
 
     Ok(child)
 }

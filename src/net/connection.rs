@@ -1,6 +1,7 @@
 //! QUIC endpoint construction for sender and receiver.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,9 +11,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::debug;
-
-/// UDP socket buffer size: 32 MiB covers ~250 ms RTT at 1 Gbps BDP.
-const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 /// How long a connection may be idle before it is closed.
 /// 10 minutes accommodates hashing very large files on slow disks.
@@ -65,35 +63,15 @@ fn sender_transport() -> Arc<quinn::TransportConfig> {
 /// Returns the endpoint and the hex-encoded SHA-256 fingerprint of the
 /// certificate, which should be printed for the user to share with the sender.
 pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)> {
-    install_crypto_provider();
     let (cert_der, key_bytes) = generate_self_signed_cert()?;
     let key_der = make_private_key(key_bytes)?;
     let fingerprint = cert_fingerprint(&cert_der);
-
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .context("failed to build rustls server config")?;
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
-    ));
-    server_config.transport_config(receiver_transport());
-
-    let socket = make_udp_socket(bind_addr)?;
-    let runtime = quinn::default_runtime().context("no async runtime")?;
-    let endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(server_config),
-        socket,
-        runtime,
-    )?;
-
+    let endpoint = make_server_endpoint_with_cert(bind_addr, cert_der, key_der)?;
     debug!(%fingerprint, "server endpoint bound");
     Ok((endpoint, fingerprint))
 }
 
-// ── Client ────────────────────────────────────────────────────────────────────
+// ── Server (shared cert) ──────────────────────────────────────────────────────
 
 /// Bind a QUIC server endpoint using a pre-generated certificate.
 ///
@@ -132,14 +110,17 @@ pub fn make_server_endpoint_with_cert(
 ///
 /// `trusted_fingerprint`: if `Some`, the peer certificate must match this
 /// hex SHA-256 fingerprint (scripted / non-interactive use).  If `None`,
-/// the first connection is accepted and the fingerprint is printed; the
-/// caller is responsible for prompting the user.
-pub fn make_client_endpoint(trusted_fingerprint: Option<&str>) -> Result<Endpoint> {
+/// TOFU: the fingerprint is checked against `~/.config/mftp/known_hosts` and
+/// the user is prompted on the first connection to a new server.
+pub fn make_client_endpoint(
+    trusted_fingerprint: Option<&str>,
+    server_addr: SocketAddr,
+) -> Result<Endpoint> {
     install_crypto_provider();
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
         match trusted_fingerprint {
             Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-            None => Arc::new(TofuVerifier),
+            None => Arc::new(TofuVerifier::new(server_addr)),
         };
 
     let client_crypto = rustls::ClientConfig::builder()
@@ -174,11 +155,11 @@ fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
         .context("UDP socket creation failed")?;
 
     // Best-effort: some kernels cap at /proc/sys/net/core/rmem_max.
-    if let Err(e) = socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_RCVBUF to {SOCKET_BUFFER_SIZE}: {e}");
+    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
+        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
     }
-    if let Err(e) = socket.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_SNDBUF to {SOCKET_BUFFER_SIZE}: {e}");
+    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
+        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
     }
 
     socket.set_nonblocking(true)?;
@@ -225,12 +206,15 @@ pub fn make_server_tls_config(
 }
 
 /// Build a rustls `ClientConfig` for the TCP+TLS path (no QUIC-specific settings).
-pub fn make_client_tls_config(trusted_fingerprint: Option<&str>) -> Result<rustls::ClientConfig> {
+pub fn make_client_tls_config(
+    trusted_fingerprint: Option<&str>,
+    server_addr: SocketAddr,
+) -> Result<rustls::ClientConfig> {
     install_crypto_provider();
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
         match trusted_fingerprint {
             Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-            None => Arc::new(TofuVerifier),
+            None => Arc::new(TofuVerifier::new(server_addr)),
         };
     Ok(rustls::ClientConfig::builder()
         .dangerous()
@@ -240,10 +224,22 @@ pub fn make_client_tls_config(trusted_fingerprint: Option<&str>) -> Result<rustl
 
 // ── Certificate verifiers ─────────────────────────────────────────────────────
 
-/// Accepts any certificate and prints its fingerprint. Used for the very first
-/// connection when no fingerprint has been pinned yet (interactive TOFU).
+/// TOFU (trust-on-first-use) verifier.
+///
+/// On the first connection to a given `server_addr`, the certificate fingerprint
+/// is stored in `~/.config/mftp/known_hosts` after the user confirms it.
+/// On subsequent connections, the stored fingerprint is compared and any
+/// mismatch is treated as a potential MITM attack.
 #[derive(Debug)]
-struct TofuVerifier;
+struct TofuVerifier {
+    server_addr: SocketAddr,
+}
+
+impl TofuVerifier {
+    fn new(server_addr: SocketAddr) -> Self {
+        Self { server_addr }
+    }
+}
 
 impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     fn verify_server_cert(
@@ -255,20 +251,61 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = cert_fingerprint(end_entity);
-        eprintln!("Server certificate fingerprint (SHA-256):\n  {fp}");
+        match load_known_host(self.server_addr) {
+            Some(known_fp) => {
+                if fp != known_fp {
+                    return Err(rustls::Error::General(format!(
+                        "certificate fingerprint mismatch for {} — possible MITM attack!\n  \
+                         stored:  {known_fp}\n  got:     {fp}\n  \
+                         If the server cert changed intentionally, remove the entry for {} \
+                         from ~/.config/mftp/known_hosts",
+                        self.server_addr, self.server_addr,
+                    )));
+                }
+                // Fingerprint matches stored value — accept silently.
+            }
+            None => {
+                // First connection to this server — prompt the user.
+                eprintln!("Server certificate fingerprint (SHA-256):\n  {fp}");
+                if !prompt_trust() {
+                    return Err(rustls::Error::General(
+                        "certificate rejected — rerun with --trust <fingerprint> \
+                         to skip the interactive prompt"
+                            .into(),
+                    ));
+                }
+                store_known_host(self.server_addr, &fp);
+            }
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -313,15 +350,31 @@ impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintVerifier {
     }
 
     fn verify_tls12_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
-        &self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct,
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -329,4 +382,62 @@ impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+// ── TOFU known-hosts helpers ──────────────────────────────────────────────────
+
+fn known_hosts_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/mftp/known_hosts"))
+}
+
+/// Look up the stored fingerprint for `addr` in `~/.config/mftp/known_hosts`.
+fn load_known_host(addr: SocketAddr) -> Option<String> {
+    let path = known_hosts_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let key = addr.to_string();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, ' ');
+        if parts.next()? == key {
+            return Some(parts.next()?.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// Append an `addr fingerprint` entry to `~/.config/mftp/known_hosts`.
+fn store_known_host(addr: SocketAddr, fp: &str) {
+    let Some(path) = known_hosts_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{addr} {fp}");
+    }
+}
+
+/// Prompt the user to accept a new certificate fingerprint.
+///
+/// Opens `/dev/tty` directly so the prompt works even when stdin is redirected.
+/// Returns `true` if the user types "yes" (case-insensitive).  Returns `true`
+/// without prompting in non-interactive contexts where `/dev/tty` is not
+/// available (e.g. piped stdin or SSH-spawned processes).
+fn prompt_trust() -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        // No controlling terminal — non-interactive context, accept automatically.
+        return true;
+    };
+    let _ = write!(tty, "Trust this certificate? [yes/N]: ");
+    let _ = tty.flush();
+    // Re-open for reading so we don't hold a conflicting borrow.
+    let Ok(tty_r) = std::fs::File::open("/dev/tty") else { return true };
+    let mut answer = String::new();
+    BufReader::new(tty_r).read_line(&mut answer).ok();
+    answer.trim().eq_ignore_ascii_case("yes")
 }

@@ -11,3 +11,6 @@
 
 pub mod connection;
 pub mod tcp;
+
+/// UDP/TCP socket buffer size target: 32 MiB covers ~250 ms RTT at 1 Gbps BDP.
+pub const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024;

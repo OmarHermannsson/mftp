@@ -63,7 +63,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     //   • UDP is blocked or the handshake times out, OR
     //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter —
     //     QUIC overhead outweighs its benefits at short distances).
-    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref())?;
+    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref(), destination)?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
     let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
         let connecting = endpoint
@@ -120,7 +120,7 @@ async fn send_quic_with_conn(
 
     framing::send_message(
         &mut ctrl_send,
-        &NegotiateRequest { cpu_cores: sender_cores, file_size },
+        &NegotiateRequest { cpu_cores: sender_cores },
     )
     .await?;
     let neg_resp: NegotiateResponse =
@@ -192,7 +192,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     let rtt_start = Instant::now();
     framing::send_message(
         &mut ctrl_send,
-        &NegotiateRequest { cpu_cores: sender_cores, file_size },
+        &NegotiateRequest { cpu_cores: sender_cores },
     )
     .await?;
     let neg_resp: NegotiateResponse =
@@ -250,6 +250,7 @@ async fn tcp_stream_worker(
 
 // ── Shared transfer body ──────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 /// Core transfer logic shared by both the QUIC and TCP paths.
 ///
 /// Called after the control stream is established and the initial
@@ -423,7 +424,7 @@ where
         }
 
         let raw = read_chunk(&file, &chunk)?;
-        let (payload, compressed) = maybe_compress(&raw, compression)?;
+        let (payload, compressed) = maybe_compress(raw, compression)?;
         let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
 
         framing::send_message(
@@ -489,12 +490,12 @@ fn read_chunk(file: &std::fs::File, chunk: &ChunkInfo) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn maybe_compress(data: &[u8], compression: &Compression) -> Result<(Vec<u8>, bool)> {
+fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, bool)> {
     match compression {
-        Compression::None => Ok((data.to_vec(), false)),
-        Compression::Zstd { level } => match compress::compress_chunk(data, *level)? {
+        Compression::None => Ok((data, false)),
+        Compression::Zstd { level } => match compress::compress_chunk(&data, *level)? {
             Some(compressed) => Ok((compressed, true)),
-            None => Ok((data.to_vec(), false)),
+            None => Ok((data, false)),
         },
     }
 }

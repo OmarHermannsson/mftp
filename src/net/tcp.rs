@@ -14,14 +14,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
-
-/// TCP socket buffer size — same target as QUIC path.
-const SOCKET_BUFFER_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
 // ── Listener helpers ──────────────────────────────────────────────────────────
 
@@ -33,11 +30,11 @@ pub async fn bind_tcp(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .context("TCP socket creation failed")?;
     socket.set_reuse_address(true).context("SO_REUSEADDR")?;
-    if let Err(e) = socket.set_recv_buffer_size(SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_RCVBUF to {SOCKET_BUFFER_SIZE}: {e}");
+    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
+        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
     }
-    if let Err(e) = socket.set_send_buffer_size(SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_SNDBUF to {SOCKET_BUFFER_SIZE}: {e}");
+    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
+        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
     }
     socket.set_nonblocking(true).context("set_nonblocking")?;
     socket.bind(&addr.into()).context("TCP bind")?;
@@ -72,7 +69,7 @@ pub async fn connect_tls(
     use crate::net::connection::make_client_tls_config;
 
     let tcp = connect_raw(addr).await?;
-    let config = make_client_tls_config(trusted_fingerprint)?;
+    let config = make_client_tls_config(trusted_fingerprint, addr)?;
     let connector = TlsConnector::from(Arc::new(config));
     // Use the server's IP address as the TLS SNI — our custom verifiers don't
     // validate the name, but TLS requires one.
@@ -86,9 +83,22 @@ pub async fn connect_tls(
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("TCP connect to {addr}"))?;
+    let socket = if addr.is_ipv6() {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
+    .context("TCP socket creation failed")?;
+
+    // Mirror the buffer sizing from the server side (bind_tcp) and the QUIC path.
+    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
+        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+    }
+    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
+        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+    }
+
+    let stream = socket.connect(addr).await.with_context(|| format!("TCP connect to {addr}"))?;
     stream.set_nodelay(true).context("TCP_NODELAY")?;
     Ok(stream)
 }
