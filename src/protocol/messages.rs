@@ -84,8 +84,6 @@ pub enum ReceiverMessage {
     Progress { bytes_written: u64 },
     /// All chunks received and verified; echoes the file hash.
     Complete { file_hash: [u8; 32] },
-    /// Some chunks are missing; sender should retransmit them.
-    Retransmit { chunk_indices: Vec<u64> },
     /// Receiver encountered a fatal error.
     Error { message: String },
 }

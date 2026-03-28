@@ -475,12 +475,6 @@ fn print_completion(
                 elapsed.as_secs_f64(),
             );
         }
-        ReceiverMessage::Retransmit { chunk_indices } => {
-            bail!(
-                "receiver missing {} chunks — retransmit not yet implemented",
-                chunk_indices.len()
-            );
-        }
         ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
         other => bail!("unexpected final message: {other:?}"),
     }

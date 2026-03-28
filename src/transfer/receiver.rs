@@ -557,17 +557,6 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    let missing = { resume.lock().unwrap().missing_chunks() };
-    if !missing.is_empty() {
-        warn!("{} chunks missing, requesting retransmit", missing.len());
-        framing::send_message(
-            ctrl_send,
-            &ReceiverMessage::Retransmit { chunk_indices: missing },
-        )
-        .await?;
-        bail!("transfer incomplete; retransmit requested");
-    }
-
     let file_hash = Arc::try_unwrap(hasher)
         .expect("all stream tasks finished so no other Arc references exist")
         .finish()?;
