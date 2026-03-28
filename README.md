@@ -24,7 +24,7 @@ That's it. No receiver daemon to start first, no firewall rules to configure.
 | **End-to-end integrity** | SHA-256 per chunk (wire payload) + full-file hash verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
-| **TOFU authentication** | Self-signed certs with certificate pinning; `--trust` for scripted use |
+| **TOFU authentication** | Self-signed certs; fingerprints stored in `~/.config/mftp/known_hosts`; `--trust` for scripted use |
 
 ---
 
@@ -85,13 +85,22 @@ mftp send [OPTIONS] <FILE> <DESTINATION>
 ```
 Options:
   --trust <FINGERPRINT>    Pin the receiver's SHA-256 certificate fingerprint.
-                           Omit to use TOFU (fingerprint printed on first connect).
+                           Omit to use TOFU (prompted once; stored in
+                           ~/.config/mftp/known_hosts for subsequent transfers).
                            Ignored in SSH mode — fingerprint is read from the server.
-  --remote-mftp <PATH>     Path to mftp on the remote host, if not in PATH.
+  --remote-mftp <PATH>     Path to a pre-installed mftp on the remote host.
+                           By default mftp copies itself over SSH stdin on first use
+                           and caches it at ~/.cache/mftp-<hash> on the remote.
+  --port <PORT>            Port the remote mftp server should bind on (SSH mode only).
+                           Defaults to a randomly assigned port. Use this when the
+                           transfer port must be in a firewall allow-list.
   -n, --streams <N>        Parallel streams (default: auto from RTT + CPU count).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
       --tcp                Force TCP+TLS; skip the QUIC attempt.
+      --tcp-below-rtt <MS> Switch to TCP+TLS when measured RTT ≤ this value (ms).
+                           Prevents QUIC overhead on LAN/datacenter links [default: 1.0].
+                           Set to 0 to always use QUIC.
   -v, --verbose            Increase log verbosity (-v / -vv / -vvv).
 ```
 
@@ -107,12 +116,13 @@ mftp receive [OPTIONS] [BIND]
 Options:
   -o, --output-dir <DIR>   Directory to write received files into (default: .).
       --tcp                TCP+TLS only; don't open a QUIC endpoint.
+      --tcp-below-rtt <MS> See send --tcp-below-rtt above [default: 1.0].
 ```
 
 ### `mftp --version`
 
 ```
-mftp 0.1.0
+mftp 0.1.10
 ```
 
 ---
@@ -140,7 +150,9 @@ Both transports use TLS 1.3 with a freshly generated self-signed certificate. QU
 When you write `mftp send file.bin user@host:/path`, the sender:
 
 1. SSHes to `user@host` and runs `mftp server --output-dir /path`
-2. The remote server binds on a random port and prints one JSON line to stdout:
+   - If mftp is not installed on the remote, the local binary is piped over SSH stdin and cached at `~/.cache/mftp-<hash>` — subsequent transfers with the same binary version skip the copy.
+   - Use `--port <N>` to have the remote server bind on a specific port instead of a random one (useful when the transfer port must be in a firewall allow-list).
+2. The remote server binds on the chosen (or random) port and prints one JSON line to stdout:
    ```json
    {"port":54321,"fingerprint":"a3f9..."}
    ```
@@ -189,7 +201,7 @@ All messages are length-prefixed bincode frames (`[u32 LE length][payload]`):
 
 ```
 Control stream (1 per connection):
-  Sender → NegotiateRequest   { cpu_cores, file_size }
+  Sender → NegotiateRequest   { cpu_cores }
   Receiver → NegotiateResponse { cpu_cores }
   Sender → TransferManifest   { transfer_id, file_name, file_size, chunk_size,
                                  total_chunks, num_streams, compression, fec }
@@ -235,8 +247,9 @@ mftp uses self-signed TLS certificates with a TOFU (Trust On First Use) model, s
 
 - The receiver generates a fresh key pair on every start
 - It prints the SHA-256 fingerprint of its certificate
-- The sender prints the peer fingerprint and prompts for confirmation on first connect
-- Pass `--trust <fingerprint>` to skip the prompt in scripts or CI
+- On first connect to a new server the sender prompts for confirmation and stores the fingerprint in `~/.config/mftp/known_hosts`, keyed by `ip:port`
+- On subsequent transfers to the same server the stored fingerprint is verified silently; a mismatch is rejected as a potential MITM
+- Pass `--trust <fingerprint>` to skip the interactive prompt in scripts or CI
 
 For SSH-assisted transfers the fingerprint is obtained automatically over the existing SSH channel — no manual verification step required.
 
