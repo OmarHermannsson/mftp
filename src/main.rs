@@ -56,6 +56,11 @@ enum Command {
         /// prior installation is required.
         #[arg(long)]
         remote_mftp: Option<String>,
+        /// Port for the remote mftp server to listen on (SSH mode only).
+        /// Defaults to a randomly assigned port. Useful when the data-transfer
+        /// port must be fixed in advance (e.g. firewall allow-list).
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Receive files (run as server)
     Receive {
@@ -72,6 +77,9 @@ enum Command {
         /// Directory to write received files into
         #[arg(short, long, default_value = ".")]
         output_dir: std::path::PathBuf,
+        /// Port to listen on (default: random)
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -90,7 +98,7 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Command::Send { file, destination, trust, remote_mftp } => {
+        Command::Send { file, destination, trust, remote_mftp, port } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
             let config = sender::SendConfig {
                 streams: cli.streams,
@@ -102,7 +110,7 @@ async fn main() -> Result<()> {
                 tcp_rtt_threshold,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
-                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp).await
+                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port).await
             } else {
                 let addr = destination
                     .parse()
@@ -120,8 +128,8 @@ async fn main() -> Result<()> {
                 receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
             }
         }
-        Command::Server { output_dir } => {
-            receiver::serve_one_stdio(output_dir).await
+        Command::Server { output_dir, port } => {
+            receiver::serve_one_stdio(output_dir, port).await
         }
     }
 }

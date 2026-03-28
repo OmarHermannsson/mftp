@@ -101,10 +101,11 @@ pub async fn send_via_ssh(
     dest: SshDest,
     config: SendConfig,
     remote_mftp: Option<String>,
+    remote_port: Option<u16>,
 ) -> Result<()> {
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin)?,
-        None => pipe_self_to_remote(&dest).await?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
+        None => pipe_self_to_remote(&dest, remote_port).await?,
     };
 
     // Wrap immediately so the process is killed on any early return.
@@ -166,14 +167,21 @@ pub async fn send_via_ssh(
 // ── Binary delivery ───────────────────────────────────────────────────────────
 
 /// Spawn SSH to run a pre-installed binary on the remote.
-fn spawn_remote_binary(dest: &SshDest, bin: &str) -> Result<tokio::process::Child> {
-    tokio::process::Command::new("ssh")
-        .arg(&dest.user_host)
+fn spawn_remote_binary(
+    dest: &SshDest,
+    bin: &str,
+    remote_port: Option<u16>,
+) -> Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg(&dest.user_host)
         .arg(bin)
         .arg("server")
         .arg("--output-dir")
-        .arg(&dest.remote_path)
-        .stdin(Stdio::null())
+        .arg(&dest.remote_path);
+    if let Some(p) = remote_port {
+        cmd.arg("--port").arg(p.to_string());
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -185,7 +193,7 @@ fn spawn_remote_binary(dest: &SshDest, bin: &str) -> Result<tokio::process::Chil
 /// The remote shell script caches the binary at `~/.cache/mftp-<hash16>` so
 /// that a second call with an identical binary skips the copy and just runs
 /// the cached file.
-async fn pipe_self_to_remote(dest: &SshDest) -> Result<tokio::process::Child> {
+async fn pipe_self_to_remote(dest: &SshDest, remote_port: Option<u16>) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
         .await
@@ -198,6 +206,10 @@ async fn pipe_self_to_remote(dest: &SshDest) -> Result<tokio::process::Child> {
     };
 
     let quoted_dir = shell_quote(&dest.remote_path);
+    let port_arg = match remote_port {
+        Some(p) => format!(" --port {p}"),
+        None => String::new(),
+    };
 
     // Remote script:
     //   • Derive a stable cache path from the binary's content hash.
@@ -216,7 +228,7 @@ else
   cat > /dev/null
   printf '[mftp] using cached binary\n' >&2
 fi
-exec "$f" server --output-dir {quoted_dir}"#
+exec "$f" server --output-dir {quoted_dir}{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")

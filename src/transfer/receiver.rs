@@ -223,12 +223,13 @@ pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
     server.serve().await
 }
 
-/// Bind on a random port, write a JSON handshake to stdout for the SSH
-/// launcher to read, accept exactly one transfer (QUIC or TCP+TLS), then exit.
+/// Bind on a given port (or a random one when `port` is `None`), write a JSON
+/// handshake to stdout for the SSH launcher to read, accept exactly one
+/// transfer (QUIC or TCP+TLS), then exit.
 ///
 /// Both transports are offered on the same port number so the sender's
 /// auto-fallback (QUIC → TCP+TLS) works without any extra configuration.
-pub async fn serve_one_stdio(output_dir: PathBuf) -> Result<()> {
+pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<()> {
     use std::net::SocketAddr;
 
     let (cert, key_bytes) = generate_self_signed_cert()?;
@@ -237,10 +238,12 @@ pub async fn serve_one_stdio(output_dir: PathBuf) -> Result<()> {
     let quic_key = make_private_key(key_bytes.clone())?;
     let tcp_key = make_private_key(key_bytes)?;
 
-    // Bind QUIC on a random UDP port, then reuse that port number for TCP.
+    let bind_port = port.unwrap_or(0);
+
+    // Bind QUIC on the requested port (0 = random), then reuse that port for TCP.
     // UDP and TCP port spaces are independent, so this always works.
     let quic_server = Server::bind_with_cert(
-        "0.0.0.0:0".parse::<SocketAddr>()?,
+        format!("0.0.0.0:{bind_port}").parse::<SocketAddr>()?,
         output_dir.clone(),
         cert.clone(),
         quic_key,
