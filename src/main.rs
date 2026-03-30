@@ -27,9 +27,10 @@ struct Cli {
     tcp: bool,
 
     /// Switch to TCP+TLS when measured RTT is at or below this value (milliseconds).
-    /// Prevents QUIC overhead from hurting throughput on LAN / same-datacenter links.
+    /// Prevents BBR congestion control from underperforming on very-low-latency links
+    /// where kernel TCP's CUBIC outperforms QUIC BBR.
     /// Set to 0 to always use QUIC regardless of RTT.
-    #[arg(long, global = true, default_value = "1.0", value_name = "MS")]
+    #[arg(long, global = true, default_value = "5.0", value_name = "MS")]
     tcp_below_rtt: f64,
 
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)

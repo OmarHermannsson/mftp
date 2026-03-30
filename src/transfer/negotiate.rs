@@ -48,21 +48,22 @@ pub fn compute_params(
     let rtt_ms = rtt.as_millis() as u64;
 
     // ── Chunk size ────────────────────────────────────────────────────────────
-    // Chunk size is tuned to the observed RTT.  Benchmarks show that below
-    // ~100 ms the 4 MiB size is optimal: large enough to amortise per-chunk
-    // overhead, small enough to fit comfortably within the QUIC receive window
-    // so writes never stall.  Above 100 ms the network latency dominates and
-    // slightly smaller chunks give marginally better throughput (fewer stalls
-    // when the congestion window is still growing after a loss event).
+    // Chunk size is tuned to the observed RTT.  With BBR congestion control and
+    // 32 MiB stream receive windows, flow control no longer stalls large writes,
+    // so larger chunks amortise per-chunk overhead (framing, SHA-256, bincode)
+    // across more payload bytes.
+    //
+    // Benchmarks (BBR, 32 MiB windows, 1 GiB random file):
+    //   50 ms RTT : 4 MiB = 94 MiB/s,  2 MiB (old) = 55 MiB/s  → +70 %
+    //   150 ms RTT: 4 MiB = 75 MiB/s,  all sizes roughly equal  (~80 MiB/s)
+    //   400 ms RTT: 4 MiB = 47 MiB/s,  1 MiB (old) = 42 MiB/s  → +12 %
     let chunk_size = override_chunk_size.unwrap_or({
         if rtt_ms < 10 {
             8 * 1024 * 1024 // 8 MiB — LAN / loopback
-        } else if rtt_ms < 100 {
-            4 * 1024 * 1024 // 4 MiB — same-region cloud (was < 50, benchmarks show 4 MiB optimal up to ~100 ms)
         } else if rtt_ms < 200 {
-            2 * 1024 * 1024 // 2 MiB — intercontinental
+            4 * 1024 * 1024 // 4 MiB — regional cloud through intercontinental
         } else {
-            1024 * 1024 // 1 MiB — satellite / very high latency
+            2 * 1024 * 1024 // 2 MiB — satellite / very high latency (was 1 MiB)
         }
     });
 
@@ -119,7 +120,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(p.chunk_size, 1 * 1024 * 1024);
+        assert_eq!(p.chunk_size, 2 * 1024 * 1024); // ≥ 200 ms → 2 MiB
         // rtt_streams = 120, cpu_cap = 16 → clamped to 16
         assert_eq!(p.streams, 16);
     }
@@ -134,7 +135,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(p.chunk_size, 2 * 1024 * 1024);
+        assert_eq!(p.chunk_size, 4 * 1024 * 1024); // < 200 ms → 4 MiB
         // rtt_streams = 20, cpu_cap = 16 → 16
         assert_eq!(p.streams, 16);
     }
