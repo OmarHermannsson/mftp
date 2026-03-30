@@ -289,11 +289,13 @@ async fn send_via_tunnel(
         .spawn()
         .context("failed to spawn SSH tunnel")?;
 
-    // Poll until the tunnel is accepting connections (up to 5 s).
-    let tunnel_addr: SocketAddr = format!("127.0.0.1:{local_port}").parse().unwrap();
-    wait_for_port(tunnel_addr, Duration::from_secs(5))
+    // Wait until SSH has bound the local port (up to 5 s), without connecting
+    // through the tunnel — connecting would reach the receiver and consume its
+    // single control-stream accept slot before the real transfer connects.
+    wait_for_ssh_listener(local_port, Duration::from_secs(5))
         .await
         .context("SSH tunnel did not become ready")?;
+    let tunnel_addr: SocketAddr = format!("127.0.0.1:{local_port}").parse().unwrap();
 
     let tunnel_cfg = SendConfig {
         trusted_fingerprint: Some(fingerprint.to_owned()),
@@ -316,17 +318,26 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("no addresses found for {host}"))
 }
 
-/// Repeatedly attempt a TCP connect until it succeeds or `timeout` elapses.
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<()> {
+/// Wait until SSH has bound the local tunnel port, without connecting through it.
+///
+/// Connecting through the tunnel would go all the way to the receiver, which
+/// would accept it as the real control stream, start TLS, and then crash when
+/// the test connection drops — consuming the receiver's single accept slot.
+///
+/// Instead we try to *bind* the port: if binding fails (EADDRINUSE), SSH owns
+/// it and the tunnel is ready.  This never touches the receiver.
+async fn wait_for_ssh_listener(port: u16, timeout: Duration) -> Result<()> {
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
+        match tokio::net::TcpListener::bind(addr).await {
+            Err(_) => return Ok(()), // port in use → SSH has bound it
+            Ok(_) => {}              // port still free → SSH not ready yet
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for port {} to become available", addr.port());
+            bail!("SSH tunnel listener on port {port} not ready within {timeout:.1?}");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
