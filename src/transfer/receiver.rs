@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sha2::{Digest, Sha256};
@@ -266,6 +266,13 @@ pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<(
     // sender with the "switching to tcp" sentinel (RTT-based LAN detection),
     // fall through to accept the follow-up TCP+TLS connection instead of
     // exiting — the TCP listener is still bound and waiting.
+    //
+    // No overall timeout here: in SSH mode the server is launched by the
+    // sender and inherits the SSH session.  If the sender is killed, the SSH
+    // connection closes and the remote sshd sends SIGHUP to this process,
+    // causing it to exit.  The DATA_STREAM_ACCEPT_TIMEOUT inside run_receive
+    // handles the case where the sender dies after connecting the control
+    // stream but before all data streams are established.
     tokio::select! {
         res = quic_server.accept_one() => {
             match res {
@@ -377,7 +384,7 @@ where
     CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
     CR: tokio::io::AsyncRead + Unpin,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>>,
+    Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     let receiver_cores =
@@ -407,9 +414,28 @@ where
     // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
 
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    // Accept all N data streams concurrently.
+    //
+    // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
+    // on an existing connection).  For TCP+TLS it is critical: each stream
+    // requires an independent TCP 3-way handshake + TLS 1.3 exchange, which
+    // takes roughly 1-2 RTTs.  Accepting them sequentially would serialize all
+    // N TLS handshakes; accepting them concurrently lets all N proceed in
+    // parallel, cutting setup time from N×RTT down to ~1×RTT regardless of N.
+    let mut accept_tasks: JoinSet<Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> =
+        JoinSet::new();
     for _ in 0..manifest.num_streams {
-        let stream = accept_stream().await?;
+        let fut = accept_stream();
+        accept_tasks.spawn(async move {
+            tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut)
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("timed out waiting for data stream — sender disconnected")))
+        });
+    }
+
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    while let Some(accept_res) = accept_tasks.join_next().await {
+        let stream = accept_res.context("accept task panicked")??;
         let out_file = pt.out_file.clone();
         let resume = pt.resume.clone();
         let manifest = manifest.clone();
@@ -743,6 +769,14 @@ where
 
     Ok(())
 }
+
+// ── Timeouts ──────────────────────────────────────────────────────────────────
+
+/// How long `run_receive` waits for each individual data stream to be
+/// accepted.  The sender opens all data streams right after the receiver
+/// replies with `ReceiverMessage::Ready`, so 30 s is very generous; it
+/// only fires when the sender has already died mid-setup.
+const DATA_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Manifest validation ───────────────────────────────────────────────────────
 

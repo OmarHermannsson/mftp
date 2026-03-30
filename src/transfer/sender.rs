@@ -399,10 +399,25 @@ where
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
+/// A chunk fully prepared for transmission: payload bytes, wire hash, and
+/// compression flag.
+struct PreparedChunk {
+    index: u64,
+    payload: Vec<u8>,
+    chunk_hash: [u8; 32],
+    compressed: bool,
+}
+
 /// Send all queued chunks (skipping already-received ones) to any [`AsyncWrite`].
 ///
 /// Used by both the QUIC and TCP stream workers so the chunk-sending logic
 /// lives in exactly one place.
+///
+/// The pipeline keeps one chunk being prepared on a blocking thread while the
+/// previous chunk is being sent over the wire.  This overlaps CPU work
+/// (pread + compression probe + SHA-256) with network I/O so neither stalls
+/// the other.  It also moves the blocking syscalls off the tokio executor,
+/// keeping the event loop free for QUIC ACK processing and stream management.
 async fn send_chunks<W>(
     writer: &mut W,
     queue: Arc<ChunkQueue>,
@@ -414,29 +429,77 @@ async fn send_chunks<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    // Each worker opens its own file handle — avoids cross-task locking on seeks.
-    let file = std::fs::File::open(file_path)
-        .with_context(|| format!("open {}", file_path.display()))?;
+    // Shared file handle — each stream worker opens its own, so no cross-task
+    // locking.  Arc lets us move it into spawn_blocking without cloning.
+    let file = Arc::new(
+        std::fs::File::open(file_path)
+            .with_context(|| format!("open {}", file_path.display()))?,
+    );
 
-    while let Some(chunk) = queue.next_chunk() {
-        if skip.contains(&chunk.index) {
-            continue;
+    // Pipeline: the `pending` slot holds a prepare task for the *next* chunk
+    // while we're sending the *current* one.
+    let mut pending: Option<tokio::task::JoinHandle<Result<PreparedChunk>>> = None;
+
+    // Advance the queue, skipping already-received chunks, and return the
+    // next chunk that actually needs to be sent.
+    let next_sendable = |queue: &ChunkQueue, skip: &HashSet<u64>| -> Option<ChunkInfo> {
+        loop {
+            match queue.next_chunk() {
+                Some(c) if skip.contains(&c.index) => continue,
+                other => return other,
+            }
         }
+    };
 
-        let raw = read_chunk(&file, &chunk)?;
-        let (payload, compressed) = maybe_compress(raw, compression)?;
-        let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+    // Kick off preparation of the very first chunk.
+    if let Some(chunk) = next_sendable(&queue, &skip) {
+        let file = Arc::clone(&file);
+        let compression = compression.clone();
+        pending = Some(tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression)));
+    }
+
+    while let Some(prepare_task) = pending.take() {
+        // Collect the prepared chunk (may already be done; .await yields
+        // control to let the executor process ACKs if it isn't).
+        let prepared = prepare_task.await.context("prepare task panicked")??;
+
+        // While we're serializing and sending over the network, kick off
+        // preparation of the next chunk in a blocking thread.
+        if let Some(chunk) = next_sendable(&queue, &skip) {
+            let file = Arc::clone(&file);
+            let compression = compression.clone();
+            pending = Some(tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression)));
+        }
 
         framing::send_message(
             writer,
-            &ChunkData { transfer_id, chunk_index: chunk.index, chunk_hash, compressed, payload },
+            &ChunkData {
+                transfer_id,
+                chunk_index: prepared.index,
+                chunk_hash: prepared.chunk_hash,
+                compressed: prepared.compressed,
+                payload: prepared.payload,
+            },
         )
         .await?;
 
-        debug!(chunk = chunk.index, "sent");
+        debug!(chunk = prepared.index, "sent");
     }
 
     Ok(())
+}
+
+/// Read one chunk from disk, compress if beneficial, and compute the wire hash.
+/// Designed to run in [`tokio::task::spawn_blocking`].
+fn prepare_chunk(
+    chunk: ChunkInfo,
+    file: Arc<std::fs::File>,
+    compression: &Compression,
+) -> Result<PreparedChunk> {
+    let raw = read_chunk(&file, &chunk)?;
+    let (payload, compressed) = maybe_compress(raw, compression)?;
+    let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+    Ok(PreparedChunk { index: chunk.index, payload, chunk_hash, compressed })
 }
 
 fn make_progress_bar(file_name: &str, file_size: u64) -> Arc<ProgressBar> {
