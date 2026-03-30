@@ -10,8 +10,11 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of parallel streams (default: auto-negotiated from RTT + CPU cores)
-    #[arg(short = 'n', long, global = true)]
+    /// Number of parallel streams.
+    /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
+    /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
+    /// scales linearly — raise to 12 if the remote sshd allows it).
+    #[arg(short = 'n', long, global = true, value_name = "N")]
     streams: Option<usize>,
 
     /// Chunk size in bytes (default: auto-negotiated from RTT)
@@ -40,26 +43,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a file to a remote mftp receiver
+    /// Send a file to a remote host
     Send {
         /// File to send
         file: std::path::PathBuf,
-        /// Destination: `host:port` for a running receiver, or
-        /// `[user@]host:/path` to launch the receiver automatically via SSH
+        /// Where to send the file.
+        ///
+        /// `host:port`          — connect to an already-running `mftp receive`.
+        ///
+        /// `[user@]host:/path`  — SSH mode: mftp launches a one-shot receiver
+        /// on the remote automatically. No prior setup needed. Falls back
+        /// through three transports in order: QUIC → TCP+TLS → SFTP.
+        /// SFTP requires only SSH port 22 and uses the remote sshd directly
+        /// (no mftp process on the remote needed for that leg).
         destination: String,
         /// Pin the receiver's certificate fingerprint (hex SHA-256).
         /// Omit to use TOFU: fingerprint is printed and accepted on first connect.
-        /// Ignored when connecting via SSH (fingerprint is obtained from the server).
+        /// Ignored in SSH mode — fingerprint is obtained automatically.
         #[arg(long)]
         trust: Option<String>,
-        /// Use this pre-installed binary on the remote instead of copying the
-        /// local binary.  By default mftp pipes itself to the remote so no
-        /// prior installation is required.
+        /// Path to a pre-installed mftp binary on the remote (SSH mode only).
+        /// By default mftp pipes itself over SSH stdin and caches it at
+        /// ~/.cache/mftp-<hash> on the remote; subsequent transfers with the
+        /// same binary version skip the copy.
         #[arg(long)]
         remote_mftp: Option<String>,
         /// Port for the remote mftp server to listen on (SSH mode only).
         /// Defaults to a randomly assigned port. Useful when the data-transfer
-        /// port must be fixed in advance (e.g. firewall allow-list).
+        /// port must be in a firewall allow-list.
         #[arg(long)]
         port: Option<u16>,
     },

@@ -8,7 +8,7 @@ mftp is built for the scenarios where `scp` crawls: satellite uplinks, intercont
 mftp send dataset.tar.gz user@remote-host:/data/
 ```
 
-That's it. No receiver daemon to start first, no firewall rules to configure.
+That's it. No receiver daemon to start first, no firewall rules to configure — not even an open port beyond SSH.
 
 ---
 
@@ -20,7 +20,7 @@ That's it. No receiver daemon to start first, no firewall rules to configure.
 | **BBR congestion control** | Measures bandwidth and RTT directly; avoids CUBIC's sawtooth pattern on lossy/high-latency links |
 | **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 5 ms) where kernel TCP beats QUIC |
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
-| **SSH tunnel fallback** | If the transfer port is firewalled, reroutes through the SSH connection |
+| **SFTP fallback** | If the transfer port is firewalled, falls back to N parallel SFTP connections through SSH port 22 — no open ports required beyond SSH |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
 | **End-to-end integrity** | SHA-256 per chunk (wire payload) + full-file hash verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
@@ -53,7 +53,7 @@ cargo build --release
 mftp send bigfile.tar.gz user@remote-host:/data/landing/
 ```
 
-mftp connects via your existing SSH credentials. The receiver is started automatically and exits when the transfer completes.
+mftp connects via your existing SSH credentials. The receiver is started automatically and exits when the transfer completes. If the transfer port is blocked by a firewall, mftp falls back to SFTP through port 22 without any intervention.
 
 ### Send a file (manual receiver)
 
@@ -90,12 +90,15 @@ Options:
                            ~/.config/mftp/known_hosts for subsequent transfers).
                            Ignored in SSH mode — fingerprint is read from the server.
   --remote-mftp <PATH>     Path to a pre-installed mftp on the remote host.
-                           By default mftp copies itself over SSH stdin on first use
+                           By default mftp pipes itself over SSH stdin on first use
                            and caches it at ~/.cache/mftp-<hash> on the remote.
   --port <PORT>            Port the remote mftp server should bind on (SSH mode only).
                            Defaults to a randomly assigned port. Use this when the
                            transfer port must be in a firewall allow-list.
-  -n, --streams <N>        Parallel streams (default: auto from RTT + CPU count).
+  -n, --streams <N>        Parallel streams.
+                           Direct mode: default auto-negotiated from RTT + CPU cores.
+                           SFTP fallback: default 8 (each stream = one SSH connection;
+                           raise to 12 if the remote sshd allows it).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
       --tcp                Force TCP+TLS; skip the QUIC attempt.
@@ -123,7 +126,7 @@ Options:
 ### `mftp --version`
 
 ```
-mftp 0.1.16
+mftp 0.1.22
 ```
 
 ---
@@ -132,19 +135,19 @@ mftp 0.1.16
 
 ### Transport
 
-mftp defaults to QUIC (via [quinn](https://github.com/quinn-rs/quinn)) with BBR congestion control, and falls back to TCP+TLS automatically:
+mftp defaults to QUIC (via [quinn](https://github.com/quinn-rs/quinn)) with BBR congestion control. In SSH mode it tries three transports in order, falling back automatically:
 
 ```
 Sender                                    Receiver
   │                                           │
-  ├─── QUIC connect (5 s timeout) ──────────►│
+  ├─── QUIC connect (5 s timeout) ──────────►│  mftp receiver (launched via SSH)
   │    (if UDP is blocked or times out)       │
-  ├─── TCP+TLS connect ─────────────────────►│
+  ├─── TCP+TLS connect (5 s timeout) ───────►│  mftp receiver (same process)
   │    (if TCP port also unreachable)         │
-  └─── SSH -L tunnel → TCP+TLS ────────────►│
+  └─── SFTP (N parallel SSH connections) ───►│  sshd sftp-server (port 22 only)
 ```
 
-Both transports use TLS 1.3 with a freshly generated self-signed certificate. QUIC and TCP+TLS share the same certificate (and therefore the same fingerprint), so the receiver only needs to advertise one.
+The QUIC and TCP+TLS paths use TLS 1.3 with a freshly generated self-signed certificate shared between both transports (same fingerprint). The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
 
 ### SSH-assisted launch
 
@@ -158,9 +161,25 @@ When you write `mftp send file.bin user@host:/path`, the sender:
    {"port":54321,"fingerprint":"a3f9..."}
    ```
 3. The sender reads the handshake, then attempts a direct connection to `host:54321`
-4. If the direct connection fails (firewall blocks the port), the sender opens an SSH `-L` port-forward and retries over loopback — transparently, without user interaction
+4. If the direct connection fails (firewall blocks the port), the sender falls back to **parallel SFTP** — N independent SSH/SFTP connections each writing a non-overlapping segment of the file directly to the remote. No mftp process is needed on the remote for this leg; it talks to the sshd sftp-server subsystem.
 
-The remote `mftp server` exits as soon as the transfer completes.
+The remote `mftp server` exits as soon as the transfer completes (or is killed when SFTP takes over).
+
+### SFTP fallback
+
+The SFTP fallback uses libssh2 to open N independent SSH connections to port 22, each with its own SFTP channel. The file is divided into N equal segments; each connection writes its segment with positional I/O (`seek` + `write`) in parallel.
+
+Throughput scales linearly with stream count because each connection is fully independent (separate congestion window, separate SSH channel):
+
+| Streams | Throughput (LAN, 500 MiB) |
+|---------|--------------------------|
+| 4       | ~12 MiB/s |
+| 8       | ~22 MiB/s (default) |
+| 12      | ~32 MiB/s |
+
+The ceiling per stream (~3 MiB/s) comes from libssh2's synchronous SFTP write acknowledgment. Raising `--streams` to 12 is safe on most servers; beyond that, OpenSSH's `MaxStartups` setting (default `10:30:100`) may start rate-limiting concurrent auth attempts.
+
+The SFTP path uses a single encryption layer (SSH), whereas the tunnel approach used SSH + TLS. Authentication uses the SSH agent if running, otherwise the default key files (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`). The remote host key is verified against `~/.ssh/known_hosts`.
 
 ### Parallel streams and RTT negotiation
 
@@ -229,6 +248,7 @@ This means a tarball of mixed content (source code + pre-built binaries) will co
 
 - **Per-chunk**: SHA-256 of the wire payload (post-compression). The receiver rejects any chunk whose hash doesn't match before writing it to disk.
 - **Full-file**: SHA-256 of the original file bytes, computed by the sender. After all chunks are written and decompressed, the receiver computes the same hash from its received data and compares. A mismatch fails the transfer.
+- **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver.
 
 ### Resume
 
@@ -239,7 +259,7 @@ Each transfer has a UUID that the sender embeds in every `ChunkData` frame. On t
 3. In the `ReceiverMessage::Ready` response it lists those chunks
 4. The sender skips them and only retransmits what's missing
 
-The resume file is deleted on successful completion.
+The resume file is deleted on successful completion. Resume is not available on the SFTP fallback path.
 
 ### Security
 
@@ -252,6 +272,8 @@ mftp uses self-signed TLS certificates with a TOFU (Trust On First Use) model, s
 - Pass `--trust <fingerprint>` to skip the interactive prompt in scripts or CI
 
 For SSH-assisted transfers the fingerprint is obtained automatically over the existing SSH channel — no manual verification step required.
+
+The SFTP fallback path relies on SSH host key verification against `~/.ssh/known_hosts` (the same file used by the `ssh` command).
 
 Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. This covers the bandwidth-delay product at 1 Gbps × 250 ms RTT.
 
@@ -278,6 +300,7 @@ LAN performance uses the auto TCP+TLS path (same-speed as scp). At 50 ms and bey
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
 - **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms (QUIC's BBR start-up is costly at near-zero latency; kernel TCP wins there). No flags needed — just run the same command.
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips the compression probe. No `--no-compress` needed.
+- **SFTP fallback throughput**: if the direct transfer ports are always blocked and you rely on the SFTP path, raise `--streams` from the default of 8 to 12 for ~32 MiB/s. Check that the remote sshd's `MaxStartups` is set to at least `12:30:100`.
 - **OS socket buffer limit**: On Linux, the kernel may cap socket buffers below 32 MiB. Set `net.core.rmem_max` and `net.core.wmem_max` to `33554432` on both hosts for maximum throughput.
 
   ```sh
@@ -292,7 +315,7 @@ LAN performance uses the auto TCP+TLS path (same-speed as scp). At 50 ms and bey
 cargo build --release
 ```
 
-Requires Rust 1.75+ (for `div_ceil` stabilization).
+Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed (it is pulled in by git and curl); on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu).
 
 ```sh
 # Check only (fast)
