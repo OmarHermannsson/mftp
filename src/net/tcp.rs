@@ -10,12 +10,21 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+/// How long to wait for a TCP handshake before giving up.
+///
+/// Matches the QUIC connect timeout so that a firewall silently dropping UDP
+/// *and* TCP packets fails fast enough for the SSH tunnel fallback to kick in
+/// within a few seconds rather than waiting for the OS TCP retransmit timeout
+/// (~2 minutes on Linux).
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
@@ -98,7 +107,10 @@ async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
         tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
     }
 
-    let stream = socket.connect(addr).await.with_context(|| format!("TCP connect to {addr}"))?;
+    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.connect(addr))
+        .await
+        .with_context(|| format!("TCP connect to {addr} timed out after {TCP_CONNECT_TIMEOUT:.1?}"))?
+        .with_context(|| format!("TCP connect to {addr}"))?;
     stream.set_nodelay(true).context("TCP_NODELAY")?;
     Ok(stream)
 }
