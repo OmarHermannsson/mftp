@@ -51,7 +51,10 @@ header() { echo "" | tee -a "$LOG"; echo "═══ $* ═══" | tee -a "$LOG
 # ── TC helpers ────────────────────────────────────────────────────────────────
 
 tc_clear() {
-    ssh "$REMOTE" "sudo tc qdisc del dev $IFACE root 2>/dev/null; true"
+    # Delete root qdisc; suppress "qdisc not found" error on clean machines.
+    ssh "$REMOTE" "sudo tc qdisc del dev $IFACE root 2>/dev/null || true"
+    # Small pause so the kernel processes the deletion before the next add.
+    sleep 0.5
 }
 
 tc_set() {
@@ -59,6 +62,8 @@ tc_set() {
     tc_clear
     if [[ -n "${1:-}" ]]; then
         ssh "$REMOTE" "sudo tc qdisc add dev $IFACE root netem $1"
+        # Wait for netem to take effect before starting the transfer.
+        sleep 1
     fi
 }
 
@@ -280,6 +285,9 @@ log "mftp benchmark suite — results in $RESULTS_DIR"
 log "Local cores: $(nproc), Remote cores: $(ssh $REMOTE nproc)"
 log "File size: $((FILE_SIZE / 1024 / 1024)) MiB"
 log "mftp version: $($MFTP --version)"
+
+# Clear any stale TC rules left by a previous (possibly interrupted) run.
+tc_clear
 
 trap 'tc_clear; log "TC rules cleared (trap)"' EXIT
 

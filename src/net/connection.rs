@@ -41,15 +41,39 @@ fn install_crypto_provider() {
 
 // ── Transport config ──────────────────────────────────────────────────────────
 
-fn receiver_transport() -> Arc<quinn::TransportConfig> {
+// Set QUIC flow control windows to match the OS socket buffer size.
+// Quinn's defaults are sized for 100 ms RTT @ 100 Mbps (≈ 1.25 MiB per stream),
+// which throttles throughput at high latency:
+//
+//   150 ms: 1.25 MiB / 0.15 s = 8.3 MiB/s per stream × 8 = 67 MiB/s max
+//   400 ms: 1.25 MiB / 0.40 s = 3.1 MiB/s per stream × 8 = 25 MiB/s max
+//
+// By setting per-stream and connection windows to 32 MiB (matching SO_RCVBUF),
+// we ensure QUIC flow control is never the bottleneck up to the socket-level limit.
+const STREAM_RECEIVE_WINDOW: u32 = super::SOCKET_BUFFER_SIZE as u32; // 32 MiB
+const SEND_WINDOW: u64 = (super::SOCKET_BUFFER_SIZE * 2) as u64;     // 64 MiB
+
+fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(quinn::VarInt::from_u32(MAX_IDLE_TIMEOUT_MS).into()));
-    Arc::new(t)
+    // BBR congestion control: measures bandwidth and RTT directly rather than
+    // inferring congestion from packet loss (CUBIC default).  This avoids the
+    // sawtooth throughput pattern that CUBIC exhibits at high latency and makes
+    // better use of the pipe on satellite / intercontinental links.
+    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Flow control windows to match socket buffer so QUIC never self-throttles.
+    t.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+    t.receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+    t.send_window(SEND_WINDOW);
+    t
+}
+
+fn receiver_transport() -> Arc<quinn::TransportConfig> {
+    Arc::new(transport_base())
 }
 
 fn sender_transport() -> Arc<quinn::TransportConfig> {
-    let mut t = quinn::TransportConfig::default();
-    t.max_idle_timeout(Some(quinn::VarInt::from_u32(MAX_IDLE_TIMEOUT_MS).into()));
+    let mut t = transport_base();
     // Send PING frames so the receiver's idle timer doesn't expire while it is
     // hashing the received file.
     t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
