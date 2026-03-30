@@ -58,6 +58,7 @@ async fn roundtrip(
             trusted_fingerprint: Some(fingerprint),
             use_tcp: false,
             tcp_rtt_threshold: std::time::Duration::ZERO,
+            data_addrs: None,
         },
     )
     .await?;
@@ -149,6 +150,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             trusted_fingerprint: Some(fingerprint),
             use_tcp: false,
             tcp_rtt_threshold: std::time::Duration::ZERO,
+            data_addrs: None,
         },
     )
     .await?;
@@ -211,6 +213,7 @@ async fn roundtrip_tcp(
             trusted_fingerprint: None,
             use_tcp: true,
             tcp_rtt_threshold: std::time::Duration::ZERO,
+            data_addrs: None,
         },
     )
     .await;

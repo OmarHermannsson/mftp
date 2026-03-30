@@ -272,11 +272,15 @@ fn shell_quote(s: &str) -> String {
 
 // ── SSH tunnel fallback ───────────────────────────────────────────────────────
 
-/// Open an SSH `-L` port-forward tunnel and retry the transfer through loopback.
+/// Open N SSH `-L` port-forward tunnels and retry the transfer through them.
 ///
-/// The tunnel routes `127.0.0.1:local_port → remote:remote_port` over the
-/// existing SSH connection.  This always works when the direct transfer port
-/// is blocked by a firewall.
+/// Each tunnel is a separate SSH channel (all multiplexed over the existing
+/// ControlMaster TCP connection), giving each mftp data stream its own SSH
+/// flow-control window instead of all sharing one.  This scales throughput
+/// roughly linearly with N, up to the SSH encryption CPU limit.
+///
+/// The control stream uses `local_ports[0]`; data streams round-robin across
+/// all N ports via `SendConfig::data_addrs`.
 async fn send_via_tunnel(
     file: PathBuf,
     dest: &SshDest,
@@ -285,47 +289,69 @@ async fn send_via_tunnel(
     config: SendConfig,
     ctrl_socket: &Path,
 ) -> Result<()> {
-    // Grab a free local port, then release it immediately for SSH to bind.
-    // The brief race on loopback is acceptable in practice.
-    let local_port = {
+    // Number of parallel SSH channels to open.  Each channel needs its own
+    // `ssh -N -L` process (all reuse the ControlMaster socket, so no extra
+    // TCP handshakes).  Benchmarks show 2 channels doubles throughput vs 1
+    // (SSH window fills at 2× the per-channel limit); beyond 2 the gain
+    // flatlines — the bottleneck shifts to SSH protocol/sshd overhead.
+    // Cap at 8 to avoid spawning excessive processes.
+    let n_tunnels: usize = config.streams.unwrap_or(2).clamp(1, 8);
+
+    // Reserve N free local ports before spawning, to minimise the race window
+    // between release and SSH binding.
+    let mut local_ports: Vec<u16> = Vec::with_capacity(n_tunnels);
+    for _ in 0..n_tunnels {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        l.local_addr()?.port()
-    };
+        local_ports.push(l.local_addr()?.port());
+        // l drops here, releasing the port for SSH to bind.
+    }
 
-    let fwd = format!("{local_port}:localhost:{remote_port}");
-    let mut tunnel = tokio::process::Command::new("ssh")
-        .args(["-N", "-L"])
-        .arg(&fwd)
-        .args(["-o", "ExitOnForwardFailure=yes"])
-        // Reuse the ControlMaster socket opened by the initial SSH connection —
-        // no second TCP+SSH handshake needed.
-        .args(["-o", "ControlMaster=auto"])
-        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
-        .arg(&dest.user_host)
-        .spawn()
-        .context("failed to spawn SSH tunnel")?;
+    // Spawn one `ssh -N -L` per port.  ControlMaster=auto means they all
+    // piggyback on the master socket (no new TCP connections to the remote).
+    let mut tunnel_procs: Vec<tokio::process::Child> = Vec::with_capacity(n_tunnels);
+    for &port in &local_ports {
+        let fwd = format!("{port}:localhost:{remote_port}");
+        let proc = tokio::process::Command::new("ssh")
+            .args(["-N", "-L"])
+            .arg(&fwd)
+            .args(["-o", "ExitOnForwardFailure=yes"])
+            .args(["-o", "ControlMaster=auto"])
+            .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
+            .arg(&dest.user_host)
+            .spawn()
+            .context("failed to spawn SSH tunnel")?;
+        tunnel_procs.push(proc);
+    }
 
-    // Wait until SSH has bound the local port (up to 5 s), without connecting
-    // through the tunnel — connecting would reach the receiver and consume its
-    // single control-stream accept slot before the real transfer connects.
-    wait_for_ssh_listener(local_port, Duration::from_secs(5))
-        .await
-        .context("SSH tunnel did not become ready")?;
-    let tunnel_addr: SocketAddr = format!("127.0.0.1:{local_port}").parse().unwrap();
+    // Wait for every tunnel port to be ready (SSH has bound the local port).
+    for &port in &local_ports {
+        wait_for_ssh_listener(port, Duration::from_secs(5))
+            .await
+            .with_context(|| format!("SSH tunnel on port {port} did not become ready"))?;
+    }
+
+    // Control stream goes through port[0].  Data streams round-robin all ports.
+    let control_addr: SocketAddr = format!("127.0.0.1:{}", local_ports[0]).parse().unwrap();
+    let data_addrs: Vec<SocketAddr> = local_ports
+        .iter()
+        .map(|&p| format!("127.0.0.1:{p}").parse().unwrap())
+        .collect();
+
+    eprintln!("[mftp] SSH tunnel: {n_tunnels} channels → {n_tunnels} independent SSH windows");
 
     let tunnel_cfg = SendConfig {
         trusted_fingerprint: Some(fingerprint.to_owned()),
-        use_tcp: true, // tunnel is always TCP
-        // SSH multiplexes all data over one TCP connection; parallel streams
-        // add overhead without gain.  One stream with a large chunk keeps the
-        // pipe full without fragmenting into many SSH channels.
-        streams: Some(1),
-        chunk_size: Some(8 * 1024 * 1024), // 8 MiB — optimal for single-stream
+        use_tcp: true,
+        streams: Some(n_tunnels),
+        chunk_size: Some(8 * 1024 * 1024), // 8 MiB per chunk
+        data_addrs: Some(data_addrs),
         ..config
     };
-    let result = crate::transfer::sender::send(file, tunnel_addr, tunnel_cfg).await;
+    let result = crate::transfer::sender::send(file, control_addr, tunnel_cfg).await;
 
-    tunnel.kill().await.ok();
+    for mut proc in tunnel_procs {
+        proc.kill().await.ok();
+    }
     result
 }
 

@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
                 trusted_fingerprint: trust,
                 use_tcp: cli.tcp,
                 tcp_rtt_threshold,
+                data_addrs: None,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
                 mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port).await
