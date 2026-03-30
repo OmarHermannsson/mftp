@@ -17,7 +17,8 @@ That's it. No receiver daemon to start first, no firewall rules to configure.
 | | |
 |---|---|
 | **QUIC transport** | Parallel streams over a single connection; no TCP head-of-line blocking |
-| **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS |
+| **BBR congestion control** | Measures bandwidth and RTT directly; avoids CUBIC's sawtooth pattern on lossy/high-latency links |
+| **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 5 ms) where kernel TCP beats QUIC |
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
 | **SSH tunnel fallback** | If the transfer port is firewalled, reroutes through the SSH connection |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
@@ -99,8 +100,8 @@ Options:
       --no-compress        Disable adaptive zstd compression.
       --tcp                Force TCP+TLS; skip the QUIC attempt.
       --tcp-below-rtt <MS> Switch to TCP+TLS when measured RTT ≤ this value (ms).
-                           Prevents QUIC overhead on LAN/datacenter links [default: 1.0].
-                           Set to 0 to always use QUIC.
+                           Auto-switches on LAN/datacenter where kernel TCP beats
+                           QUIC BBR [default: 5.0]. Set to 0 to always use QUIC.
   -v, --verbose            Increase log verbosity (-v / -vv / -vvv).
 ```
 
@@ -116,13 +117,13 @@ mftp receive [OPTIONS] [BIND]
 Options:
   -o, --output-dir <DIR>   Directory to write received files into (default: .).
       --tcp                TCP+TLS only; don't open a QUIC endpoint.
-      --tcp-below-rtt <MS> See send --tcp-below-rtt above [default: 1.0].
+      --tcp-below-rtt <MS> See send --tcp-below-rtt above [default: 5.0].
 ```
 
 ### `mftp --version`
 
 ```
-mftp 0.1.10
+mftp 0.1.16
 ```
 
 ---
@@ -131,7 +132,7 @@ mftp 0.1.10
 
 ### Transport
 
-mftp defaults to QUIC (via [quinn](https://github.com/quinn-rs/quinn)) and falls back to TCP+TLS automatically:
+mftp defaults to QUIC (via [quinn](https://github.com/quinn-rs/quinn)) with BBR congestion control, and falls back to TCP+TLS automatically:
 
 ```
 Sender                                    Receiver
@@ -168,11 +169,10 @@ After the QUIC handshake, sender and receiver exchange CPU core counts. The send
 | RTT | Default chunk size |
 |-----|-------------------|
 | < 10 ms (LAN) | 8 MiB |
-| 10 – 50 ms (regional) | 4 MiB |
-| 50 – 150 ms (intercontinental) | 2 MiB |
-| ≥ 150 ms (satellite) | 1 MiB |
+| 10 – 200 ms (regional/intercontinental) | 4 MiB |
+| ≥ 200 ms (satellite) | 2 MiB |
 
-Stream count is `max(⌈RTT_ms / 5⌉, min_cores)`, capped at `2 × min(sender_cores, receiver_cores)`. On a satellite link with 600 ms RTT and an 8-core machine on each end, mftp opens 8 streams of 1 MiB chunks — keeping the pipe full while staying within CPU budget.
+Stream count is `max(⌈RTT_ms / 5⌉, min_cores)`, capped at `2 × min(sender_cores, receiver_cores)`. On a satellite link with 600 ms RTT and an 8-core machine on each end, mftp opens 8 streams of 2 MiB chunks — keeping the pipe full while staying within CPU budget.
 
 Both values can be overridden with `--streams` and `--chunk-size`.
 
@@ -257,10 +257,26 @@ Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. This 
 
 ---
 
+## Performance
+
+Benchmarked against `scp` on a 10 GbE link, 1 GiB random (incompressible) file:
+
+| Link | scp | mftp (auto) | speedup |
+|------|-----|-------------|---------|
+| LAN (< 5 ms) | ~440 MiB/s | ~440 MiB/s | 1× |
+| 50 ms RTT | 36 MiB/s | **71 MiB/s** | **2× faster** |
+| 150 ms RTT | 12 MiB/s | **82 MiB/s** | **7× faster** |
+| 400 ms RTT | 4.6 MiB/s | **43 MiB/s** | **9× faster** |
+| 600 ms + 1% loss | 2.6 MiB/s | **29 MiB/s** | **11× faster** |
+
+LAN performance uses the auto TCP+TLS path (same-speed as scp). At 50 ms and beyond, QUIC BBR with parallel streams dominates.
+
+---
+
 ## Performance tips
 
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
-- **LAN transfers**: QUIC over loopback has measurable overhead vs. plain TCP. Use `--tcp` for same-datacenter or LAN transfers.
+- **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms (QUIC's BBR start-up is costly at near-zero latency; kernel TCP wins there). No flags needed — just run the same command.
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips the compression probe. No `--no-compress` needed.
 - **OS socket buffer limit**: On Linux, the kernel may cap socket buffers below 32 MiB. Set `net.core.rmem_max` and `net.core.wmem_max` to `33554432` on both hosts for maximum throughput.
 
