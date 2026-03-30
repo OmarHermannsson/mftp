@@ -5,7 +5,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -46,12 +46,6 @@ pub struct SendConfig {
     /// than it saves, so TCP+TLS matches or beats it at short distances.
     /// Defaults to 1 ms; set to zero to disable the check.
     pub tcp_rtt_threshold: Duration,
-    /// Per-stream TCP addresses for data connections.  When set, each data
-    /// stream worker round-robins through this list instead of all connecting
-    /// to the same `destination`.  Used by the SSH tunnel fallback to spread
-    /// data streams across N independent SSH channels (one per local port).
-    /// `None` means all streams share the same address.
-    pub data_addrs: Option<Vec<SocketAddr>>,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
@@ -208,13 +202,6 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
 
     let trusted_fp = config.trusted_fingerprint.clone();
     let file_for_workers = file.clone();
-    // Build the pool of addresses for data stream workers.  When data_addrs is
-    // set (SSH tunnel fallback with N tunnels) each stream connects to a
-    // different local port; otherwise all streams share the same destination.
-    let data_addrs: Arc<Vec<SocketAddr>> = Arc::new(
-        config.data_addrs.clone().unwrap_or_else(|| vec![destination]),
-    );
-    let addr_idx = Arc::new(AtomicUsize::new(0));
 
     run_transfer(
         &file,
@@ -228,11 +215,8 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         move |queue, have, transfer_id, compression| {
             let fp = trusted_fp.clone();
             let path = file_for_workers.clone();
-            let addrs = data_addrs.clone();
-            let idx = addr_idx.fetch_add(1, Ordering::Relaxed) % addrs.len();
-            let addr = addrs[idx];
             async move {
-                let stream = connect_tls(addr, fp.as_deref())
+                let stream = connect_tls(destination, fp.as_deref())
                     .await
                     .context("open TCP data stream")?;
                 tcp_stream_worker(stream, queue, have, path, transfer_id, compression).await

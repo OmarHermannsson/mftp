@@ -2,8 +2,9 @@
 //! read the port/fingerprint handshake, then connect directly.
 //!
 //! If the direct connection fails (e.g. a firewall blocks the transfer port),
-//! the sender falls back to routing data through an SSH port-forward tunnel,
-//! which is available whenever SSH itself is available.
+//! the sender falls back to parallel SFTP — N independent SSH/SFTP connections
+//! writing non-overlapping file segments directly via the remote sshd, with
+//! no mftp receiver process and a single SSH encryption layer.
 //!
 //! # Binary delivery
 //!
@@ -15,9 +16,8 @@
 //! the copy cost.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -29,10 +29,13 @@ use crate::transfer::sender::SendConfig;
 // ── Destination parsing ───────────────────────────────────────────────────────
 
 /// An SSH-style destination parsed from `[user@]host:/remote/path`.
+#[derive(Clone)]
 pub struct SshDest {
     /// Passed directly to `ssh(1)`: `"user@host"` or `"host"`.
     pub user_host: String,
-    /// Hostname component, used for DNS resolution of the direct connection.
+    /// Username for ssh2 authentication (split from `user_host`).
+    pub user: String,
+    /// Hostname component, used for DNS resolution and ssh2 TCP connect.
     pub host: String,
     /// Remote filesystem path for the output directory.
     pub remote_path: String,
@@ -53,13 +56,14 @@ pub fn parse_ssh_dest(dest: &str) -> Option<SshDest> {
         return None;
     }
 
-    let (user_host, host) = if let Some(at) = before.find('@') {
-        (before.to_owned(), before[at + 1..].to_owned())
+    let (user_host, user, host) = if let Some(at) = before.find('@') {
+        (before.to_owned(), before[..at].to_owned(), before[at + 1..].to_owned())
     } else {
-        (before.to_owned(), before.to_owned())
+        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+        (before.to_owned(), user, before.to_owned())
     };
 
-    Some(SshDest { user_host, host, remote_path: after.to_owned() })
+    Some(SshDest { user_host, user, host, remote_path: after.to_owned() })
 }
 
 // ── SSH launch + transfer ─────────────────────────────────────────────────────
@@ -72,9 +76,8 @@ struct ServerHandshake {
 
 /// RAII guard that kills a child process when dropped.
 ///
-/// Used to ensure the remote `mftp server` (and the SSH multiplexer) are
-/// always reaped, even when the transfer fails and the function returns early
-/// via `?`.
+/// Used to ensure the remote `mftp server` is always reaped, even when the
+/// transfer fails and the function returns early via `?`.
 struct KillOnDrop(tokio::process::Child);
 
 impl Drop for KillOnDrop {
@@ -95,7 +98,8 @@ impl Drop for KillOnDrop {
 /// In both cases:
 /// 1. A JSON handshake `{"port":N,"fingerprint":"…"}` is read from stdout.
 /// 2. A direct connection is attempted (QUIC first, auto-falls-back to TCP+TLS).
-/// 3. On failure, the transfer is retried via an SSH port-forward tunnel.
+/// 3. On failure, the transfer is retried via parallel SFTP (N independent
+///    SSH/SFTP connections writing directly to the remote file).
 pub async fn send_via_ssh(
     file: PathBuf,
     dest: SshDest,
@@ -103,15 +107,9 @@ pub async fn send_via_ssh(
     remote_mftp: Option<String>,
     remote_port: Option<u16>,
 ) -> Result<()> {
-    // A ControlMaster socket lets the tunnel reuse this SSH connection instead
-    // of establishing a second one.  Keyed on PID so parallel transfers don't
-    // collide.
-    let ctrl_socket = std::env::temp_dir()
-        .join(format!("mftp-ssh-{}.sock", std::process::id()));
-
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port, &ctrl_socket)?,
-        None => pipe_self_to_remote(&dest, remote_port, &ctrl_socket).await?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
+        None => pipe_self_to_remote(&dest, remote_port).await?,
     };
 
     // Wrap immediately so the process is killed on any early return.
@@ -159,9 +157,17 @@ pub async fn send_via_ssh(
 
     if let Err(e) = direct_result {
         eprintln!("[mftp] direct connection to {direct_addr} failed ({e:#})");
-        eprintln!("[mftp] retrying via SSH port-forward tunnel…");
-        // ? propagation here is safe: KillOnDrop ensures ssh is killed on exit.
-        send_via_tunnel(file, &dest, hs.port, &hs.fingerprint, config, &ctrl_socket).await?;
+        eprintln!("[mftp] retrying via SFTP (parallel SSH streams, single encryption layer)…");
+        // Kill the mftp server — SFTP bypasses it entirely and talks to sshd
+        // directly.  KillOnDrop also fires on drop, but being explicit here
+        // lets the remote process exit before SFTP opens its connections.
+        drop(ssh);
+        // 8 parallel SFTP streams ≈ 22 MiB/s; scales linearly up to ~12
+        // before sshd MaxStartups (default 10:30:100) starts rejecting
+        // concurrent auth attempts.  User can override with --streams.
+        let n = config.streams.unwrap_or(8);
+        crate::sftp::send_via_sftp(file, dest, n).await?;
+        return Ok(());
     }
 
     // Transfer complete — give the remote server a moment to exit cleanly.
@@ -177,12 +183,9 @@ fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
     remote_port: Option<u16>,
-    ctrl_socket: &Path,
 ) -> Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("ssh");
-    cmd.args(["-o", "ControlMaster=yes"])
-        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
-        .arg(&dest.user_host)
+    cmd.arg(&dest.user_host)
         .arg(bin)
         .arg("server")
         .arg("--output-dir")
@@ -202,7 +205,10 @@ fn spawn_remote_binary(
 /// The remote shell script caches the binary at `~/.cache/mftp-<hash16>` so
 /// that a second call with an identical binary skips the copy and just runs
 /// the cached file.
-async fn pipe_self_to_remote(dest: &SshDest, remote_port: Option<u16>, ctrl_socket: &Path) -> Result<tokio::process::Child> {
+async fn pipe_self_to_remote(
+    dest: &SshDest,
+    remote_port: Option<u16>,
+) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
         .await
@@ -241,8 +247,6 @@ exec "$f" server --output-dir {quoted_dir}{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")
-        .args(["-o", "ControlMaster=yes"])
-        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
         .arg(&dest.user_host)
         .arg("sh")
         .arg("-c")
@@ -270,91 +274,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-// ── SSH tunnel fallback ───────────────────────────────────────────────────────
-
-/// Open N SSH `-L` port-forward tunnels and retry the transfer through them.
-///
-/// Each tunnel is a separate SSH channel (all multiplexed over the existing
-/// ControlMaster TCP connection), giving each mftp data stream its own SSH
-/// flow-control window instead of all sharing one.  This scales throughput
-/// roughly linearly with N, up to the SSH encryption CPU limit.
-///
-/// The control stream uses `local_ports[0]`; data streams round-robin across
-/// all N ports via `SendConfig::data_addrs`.
-async fn send_via_tunnel(
-    file: PathBuf,
-    dest: &SshDest,
-    remote_port: u16,
-    fingerprint: &str,
-    config: SendConfig,
-    ctrl_socket: &Path,
-) -> Result<()> {
-    // Number of parallel SSH channels to open.  Each channel needs its own
-    // `ssh -N -L` process (all reuse the ControlMaster socket, so no extra
-    // TCP handshakes).  Benchmarks show 2 channels doubles throughput vs 1
-    // (SSH window fills at 2× the per-channel limit); beyond 2 the gain
-    // flatlines — the bottleneck shifts to SSH protocol/sshd overhead.
-    // Cap at 8 to avoid spawning excessive processes.
-    let n_tunnels: usize = config.streams.unwrap_or(2).clamp(1, 8);
-
-    // Reserve N free local ports before spawning, to minimise the race window
-    // between release and SSH binding.
-    let mut local_ports: Vec<u16> = Vec::with_capacity(n_tunnels);
-    for _ in 0..n_tunnels {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        local_ports.push(l.local_addr()?.port());
-        // l drops here, releasing the port for SSH to bind.
-    }
-
-    // Spawn one `ssh -N -L` per port.  ControlMaster=auto means they all
-    // piggyback on the master socket (no new TCP connections to the remote).
-    let mut tunnel_procs: Vec<tokio::process::Child> = Vec::with_capacity(n_tunnels);
-    for &port in &local_ports {
-        let fwd = format!("{port}:localhost:{remote_port}");
-        let proc = tokio::process::Command::new("ssh")
-            .args(["-N", "-L"])
-            .arg(&fwd)
-            .args(["-o", "ExitOnForwardFailure=yes"])
-            .args(["-o", "ControlMaster=auto"])
-            .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
-            .arg(&dest.user_host)
-            .spawn()
-            .context("failed to spawn SSH tunnel")?;
-        tunnel_procs.push(proc);
-    }
-
-    // Wait for every tunnel port to be ready (SSH has bound the local port).
-    for &port in &local_ports {
-        wait_for_ssh_listener(port, Duration::from_secs(5))
-            .await
-            .with_context(|| format!("SSH tunnel on port {port} did not become ready"))?;
-    }
-
-    // Control stream goes through port[0].  Data streams round-robin all ports.
-    let control_addr: SocketAddr = format!("127.0.0.1:{}", local_ports[0]).parse().unwrap();
-    let data_addrs: Vec<SocketAddr> = local_ports
-        .iter()
-        .map(|&p| format!("127.0.0.1:{p}").parse().unwrap())
-        .collect();
-
-    eprintln!("[mftp] SSH tunnel: {n_tunnels} channels → {n_tunnels} independent SSH windows");
-
-    let tunnel_cfg = SendConfig {
-        trusted_fingerprint: Some(fingerprint.to_owned()),
-        use_tcp: true,
-        streams: Some(n_tunnels),
-        chunk_size: Some(8 * 1024 * 1024), // 8 MiB per chunk
-        data_addrs: Some(data_addrs),
-        ..config
-    };
-    let result = crate::transfer::sender::send(file, control_addr, tunnel_cfg).await;
-
-    for mut proc in tunnel_procs {
-        proc.kill().await.ok();
-    }
-    result
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
@@ -363,29 +282,6 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
         .with_context(|| format!("DNS lookup failed for {host}"))?
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses found for {host}"))
-}
-
-/// Wait until SSH has bound the local tunnel port, without connecting through it.
-///
-/// Connecting through the tunnel would go all the way to the receiver, which
-/// would accept it as the real control stream, start TLS, and then crash when
-/// the test connection drops — consuming the receiver's single accept slot.
-///
-/// Instead we try to *bind* the port: if binding fails (EADDRINUSE), SSH owns
-/// it and the tunnel is ready.  This never touches the receiver.
-async fn wait_for_ssh_listener(port: u16, timeout: Duration) -> Result<()> {
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match tokio::net::TcpListener::bind(addr).await {
-            Err(_) => return Ok(()), // port in use → SSH has bound it
-            Ok(_) => {}              // port still free → SSH not ready yet
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("SSH tunnel listener on port {port} not ready within {timeout:.1?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
