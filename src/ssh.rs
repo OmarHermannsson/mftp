@@ -15,7 +15,7 @@
 //! the copy cost.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -103,9 +103,15 @@ pub async fn send_via_ssh(
     remote_mftp: Option<String>,
     remote_port: Option<u16>,
 ) -> Result<()> {
+    // A ControlMaster socket lets the tunnel reuse this SSH connection instead
+    // of establishing a second one.  Keyed on PID so parallel transfers don't
+    // collide.
+    let ctrl_socket = std::env::temp_dir()
+        .join(format!("mftp-ssh-{}.sock", std::process::id()));
+
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
-        None => pipe_self_to_remote(&dest, remote_port).await?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port, &ctrl_socket)?,
+        None => pipe_self_to_remote(&dest, remote_port, &ctrl_socket).await?,
     };
 
     // Wrap immediately so the process is killed on any early return.
@@ -155,7 +161,7 @@ pub async fn send_via_ssh(
         eprintln!("[mftp] direct connection to {direct_addr} failed ({e:#})");
         eprintln!("[mftp] retrying via SSH port-forward tunnel…");
         // ? propagation here is safe: KillOnDrop ensures ssh is killed on exit.
-        send_via_tunnel(file, &dest, hs.port, &hs.fingerprint, config).await?;
+        send_via_tunnel(file, &dest, hs.port, &hs.fingerprint, config, &ctrl_socket).await?;
     }
 
     // Transfer complete — give the remote server a moment to exit cleanly.
@@ -171,9 +177,12 @@ fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
     remote_port: Option<u16>,
+    ctrl_socket: &Path,
 ) -> Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new("ssh");
-    cmd.arg(&dest.user_host)
+    cmd.args(["-o", "ControlMaster=yes"])
+        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
+        .arg(&dest.user_host)
         .arg(bin)
         .arg("server")
         .arg("--output-dir")
@@ -193,7 +202,7 @@ fn spawn_remote_binary(
 /// The remote shell script caches the binary at `~/.cache/mftp-<hash16>` so
 /// that a second call with an identical binary skips the copy and just runs
 /// the cached file.
-async fn pipe_self_to_remote(dest: &SshDest, remote_port: Option<u16>) -> Result<tokio::process::Child> {
+async fn pipe_self_to_remote(dest: &SshDest, remote_port: Option<u16>, ctrl_socket: &Path) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
         .await
@@ -232,6 +241,8 @@ exec "$f" server --output-dir {quoted_dir}{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")
+        .args(["-o", "ControlMaster=yes"])
+        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
         .arg(&dest.user_host)
         .arg("sh")
         .arg("-c")
@@ -272,6 +283,7 @@ async fn send_via_tunnel(
     remote_port: u16,
     fingerprint: &str,
     config: SendConfig,
+    ctrl_socket: &Path,
 ) -> Result<()> {
     // Grab a free local port, then release it immediately for SSH to bind.
     // The brief race on loopback is acceptable in practice.
@@ -285,6 +297,10 @@ async fn send_via_tunnel(
         .args(["-N", "-L"])
         .arg(&fwd)
         .args(["-o", "ExitOnForwardFailure=yes"])
+        // Reuse the ControlMaster socket opened by the initial SSH connection —
+        // no second TCP+SSH handshake needed.
+        .args(["-o", "ControlMaster=auto"])
+        .args(["-o", &format!("ControlPath={}", ctrl_socket.display())])
         .arg(&dest.user_host)
         .spawn()
         .context("failed to spawn SSH tunnel")?;
@@ -300,6 +316,11 @@ async fn send_via_tunnel(
     let tunnel_cfg = SendConfig {
         trusted_fingerprint: Some(fingerprint.to_owned()),
         use_tcp: true, // tunnel is always TCP
+        // SSH multiplexes all data over one TCP connection; parallel streams
+        // add overhead without gain.  One stream with a large chunk keeps the
+        // pipe full without fragmenting into many SSH channels.
+        streams: Some(1),
+        chunk_size: Some(8 * 1024 * 1024), // 8 MiB — optimal for single-stream
         ..config
     };
     let result = crate::transfer::sender::send(file, tunnel_addr, tunnel_cfg).await;
