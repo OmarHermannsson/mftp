@@ -213,10 +213,11 @@ fn spawn_remote_binary(
         shell_quote(&dest.remote_path),
         port_arg,
     );
+    // Pass the command as a single argument so SSH sends it verbatim to the
+    // remote login shell.  Using `sh -c <script>` here would make `server`
+    // and `--output-dir` become $0/$1 (ignored) instead of mftp arguments.
     tokio::process::Command::new("ssh")
         .arg(&dest.user_host)
-        .arg("sh")
-        .arg("-c")
         .arg(&remote_cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
