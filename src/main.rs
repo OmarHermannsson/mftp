@@ -52,13 +52,16 @@ enum Command {
         /// `host:port`          — connect to an already-running `mftp receive`.
         ///
         /// `[user@]host:/path`  — SSH mode: mftp launches a one-shot receiver
-        /// on the remote automatically. No prior setup needed. Falls back
-        /// through three transports in order: QUIC → TCP+TLS → SFTP.
-        /// SFTP requires only SSH port 22 and uses the remote sshd directly
-        /// (no mftp process on the remote needed for that leg).
+        /// on the remote automatically. Falls back through three transports:
+        /// QUIC (UDP, needs open port) → TCP+TLS (TCP, needs open port) →
+        /// SFTP (port 22 only, ~22 MiB/s cap). Use --port to specify a
+        /// firewall-allowed port; without it a random port is used and QUIC/
+        /// TCP+TLS will likely fall back to SFTP.
         destination: String,
         /// Pin the receiver's certificate fingerprint (hex SHA-256).
-        /// Omit to use TOFU: fingerprint is printed and accepted on first connect.
+        /// Omit to use TOFU: fingerprint is printed and you are prompted once per
+        /// session (requires a TTY; non-interactive use without --trust is rejected).
+        /// Fingerprints are not stored between sessions — pass --trust in scripts.
         /// Ignored in SSH mode — fingerprint is obtained automatically.
         #[arg(long)]
         trust: Option<String>,

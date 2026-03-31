@@ -8,7 +8,7 @@ mftp is built for the scenarios where `scp` crawls: satellite uplinks, intercont
 mftp send dataset.tar.gz user@remote-host:/data/
 ```
 
-That's it. No receiver daemon to start first, no firewall rules to configure — not even an open port beyond SSH.
+In SSH mode, mftp launches the receiver automatically over your existing SSH session. The primary transfer uses QUIC or TCP+TLS (both require an open port on the receiver); if those ports are blocked, mftp falls back to parallel SFTP through port 22 with no extra configuration.
 
 ---
 
@@ -20,12 +20,12 @@ That's it. No receiver daemon to start first, no firewall rules to configure —
 | **BBR congestion control** | Measures bandwidth and RTT directly; avoids CUBIC's sawtooth pattern on lossy/high-latency links |
 | **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 5 ms) where kernel TCP beats QUIC |
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
-| **SFTP fallback** | If the transfer port is firewalled, falls back to N parallel SFTP connections through SSH port 22 — no open ports required beyond SSH |
+| **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
 | **End-to-end integrity** | SHA-256 per chunk (wire payload) + full-file hash verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
-| **TOFU authentication** | Self-signed certs; fingerprints stored in `~/.config/mftp/known_hosts`; `--trust` for scripted use |
+| **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
 
 ---
 
@@ -46,21 +46,21 @@ cargo build --release
 # binary is at target/release/mftp
 ```
 
-### Send a file (SSH mode — no receiver setup needed)
+### Send a file (SSH mode)
 
 ```sh
 # mftp SSHes to the remote, starts the receiver, transfers, and cleans up
 mftp send bigfile.tar.gz user@remote-host:/data/landing/
 ```
 
-mftp connects via your existing SSH credentials. The receiver is started automatically and exits when the transfer completes. If the transfer port is blocked by a firewall, mftp falls back to SFTP through port 22 without any intervention.
+mftp connects via your existing SSH credentials. The receiver is started automatically and exits when the transfer completes. It tries QUIC first, then TCP+TLS, then SFTP — falling back automatically if the direct transfer ports are blocked.
 
 ### Send a file (manual receiver)
 
 On the receiver:
 ```sh
 mftp receive --output-dir /data/landing
-# Prints: Listening on 0.0.0.0:7777
+# Prints: Listening on 0.0.0.0:7777 (QUIC + TCP+TLS, auto-fallback)
 # Prints: Certificate fingerprint: a3f9...
 ```
 
@@ -68,6 +68,8 @@ On the sender:
 ```sh
 mftp send bigfile.tar.gz remote-host:7777 --trust a3f9...
 ```
+
+The receiver port (7777 by default) must be reachable: UDP for QUIC, TCP for TCP+TLS, or both. There is no SFTP fallback in direct `host:port` mode.
 
 ---
 
@@ -80,14 +82,15 @@ mftp send [OPTIONS] <FILE> <DESTINATION>
 ```
 
 `DESTINATION` is either:
-- `host:port` — connect to an already-running `mftp receive`
-- `[user@]host:/remote/path` — launch the receiver via SSH (recommended)
+- `host:port` — connect to an already-running `mftp receive`. The port must be reachable (UDP for QUIC, TCP for TCP+TLS).
+- `[user@]host:/remote/path` — launch the receiver via SSH (recommended). Falls back through QUIC → TCP+TLS → SFTP automatically.
 
 ```
 Options:
   --trust <FINGERPRINT>    Pin the receiver's SHA-256 certificate fingerprint.
-                           Omit to use TOFU (prompted once; stored in
-                           ~/.config/mftp/known_hosts for subsequent transfers).
+                           Omit to use TOFU (fingerprint is printed and you are
+                           prompted to accept it once per session; it is not
+                           automatically stored between sessions).
                            Ignored in SSH mode — fingerprint is read from the server.
   --remote-mftp <PATH>     Path to a pre-installed mftp on the remote host.
                            By default mftp pipes itself over SSH stdin on first use
@@ -114,19 +117,18 @@ Options:
 mftp receive [OPTIONS] [BIND]
 ```
 
-`BIND` defaults to `0.0.0.0:7777`. Both QUIC (UDP) and TCP+TLS listen on the same port, so the sender's auto-fallback works with no extra configuration on the receiver side.
+`BIND` defaults to `0.0.0.0:7777`. Both QUIC (UDP) and TCP+TLS listen on the same port, so the sender's auto-fallback works with no extra configuration on the receiver side. **The bind port must be reachable from the sender.**
 
 ```
 Options:
   -o, --output-dir <DIR>   Directory to write received files into (default: .).
       --tcp                TCP+TLS only; don't open a QUIC endpoint.
-      --tcp-below-rtt <MS> See send --tcp-below-rtt above [default: 5.0].
 ```
 
 ### `mftp --version`
 
 ```
-mftp 0.1.22
+mftp 0.1.27
 ```
 
 ---
@@ -141,10 +143,11 @@ mftp defaults to QUIC (via [quinn](https://github.com/quinn-rs/quinn)) with BBR 
 Sender                                    Receiver
   │                                           │
   ├─── QUIC connect (5 s timeout) ──────────►│  mftp receiver (launched via SSH)
-  │    (if UDP is blocked or times out)       │
-  ├─── TCP+TLS connect (5 s timeout) ───────►│  mftp receiver (same process)
-  │    (if TCP port also unreachable)         │
+  │    (if UDP blocked or times out)          │  requires: data port open (UDP)
+  ├─── TCP+TLS connect ──────────────────────►│  mftp receiver (same process)
+  │    (if TCP port also unreachable)         │  requires: data port open (TCP)
   └─── SFTP (N parallel SSH connections) ───►│  sshd sftp-server (port 22 only)
+                                             │  requires: SSH port 22 only
 ```
 
 The QUIC and TCP+TLS paths use TLS 1.3 with a freshly generated self-signed certificate shared between both transports (same fingerprint). The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
@@ -155,7 +158,7 @@ When you write `mftp send file.bin user@host:/path`, the sender:
 
 1. SSHes to `user@host` and runs `mftp server --output-dir /path`
    - If mftp is not installed on the remote, the local binary is piped over SSH stdin and cached at `~/.cache/mftp-<hash>` — subsequent transfers with the same binary version skip the copy.
-   - Use `--port <N>` to have the remote server bind on a specific port instead of a random one (useful when the transfer port must be in a firewall allow-list).
+   - Use `--port <N>` to have the remote server bind on a specific port instead of a random one (required when the transfer port must be in a firewall allow-list; without `--port`, the random port will almost certainly be blocked).
 2. The remote server binds on the chosen (or random) port and prints one JSON line to stdout:
    ```json
    {"port":54321,"fingerprint":"a3f9..."}
@@ -177,7 +180,7 @@ Throughput scales linearly with stream count because each connection is fully in
 | 8       | ~22 MiB/s (default) |
 | 12      | ~32 MiB/s |
 
-The ceiling per stream (~3 MiB/s) comes from libssh2's synchronous SFTP write acknowledgment. Raising `--streams` to 12 is safe on most servers; beyond that, OpenSSH's `MaxStartups` setting (default `10:30:100`) may start rate-limiting concurrent auth attempts.
+The ceiling per stream (~3 MiB/s) comes from libssh2's synchronous SFTP write acknowledgment — it is a fundamental limitation of the SSH SFTP protocol. Raising `--streams` to 12 is safe on most servers; beyond that, OpenSSH's `MaxStartups` setting (default `10:30:100`) may start rate-limiting concurrent auth attempts.
 
 The SFTP path uses a single encryption layer (SSH), whereas the tunnel approach used SSH + TLS. Authentication uses the SSH agent if running, otherwise the default key files (`~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`). The remote host key is verified against `~/.ssh/known_hosts`.
 
@@ -191,7 +194,7 @@ After the QUIC handshake, sender and receiver exchange CPU core counts. The send
 | 10 – 200 ms (regional/intercontinental) | 4 MiB |
 | ≥ 200 ms (satellite) | 2 MiB |
 
-Stream count is `max(⌈RTT_ms / 5⌉, min_cores)`, capped at `2 × min(sender_cores, receiver_cores)`. On a satellite link with 600 ms RTT and an 8-core machine on each end, mftp opens 8 streams of 2 MiB chunks — keeping the pipe full while staying within CPU budget.
+Stream count is `max(⌈RTT_ms / 5⌉, min_cores)`, capped at `2 × min(sender_cores, receiver_cores)`. On a satellite link with 600 ms RTT and an 8-core machine on each end, mftp opens 16 streams of 2 MiB chunks — keeping the pipe full while staying within CPU budget.
 
 Both values can be overridden with `--streams` and `--chunk-size`.
 
@@ -203,7 +206,7 @@ File on disk
         └─► N parallel tasks, one per QUIC/TCP stream:
               ├─ read chunk from file (pread)
               ├─ detect already-compressed format (magic bytes)
-              ├─ zstd compress if ≥5% gain
+              ├─ zstd compress full chunk; discard if < 5% gain
               ├─ SHA-256 hash of wire payload
               └─ send ChunkData frame
 
@@ -224,7 +227,7 @@ Control stream (1 per connection):
   Receiver → NegotiateResponse { cpu_cores }
   Sender → TransferManifest   { transfer_id, file_name, file_size, chunk_size,
                                  total_chunks, num_streams, compression, fec }
-  Receiver → ReceiverMessage::Ready { have_chunks }   ← resume list
+  Receiver → ReceiverMessage::Ready { received_bits, total_chunks }  ← resume bitvector
   ...data streams transfer...
   Sender → SenderMessage::Complete  { file_hash }
   Receiver → ReceiverMessage::Complete { file_hash }
@@ -235,29 +238,31 @@ Data streams (N per connection, one ChunkData per chunk):
 
 ### Compression
 
-mftp compresses each chunk independently, so the decision can be made chunk-by-chunk:
+mftp compresses each chunk independently with zstd:
 
 1. **Magic-byte check** — if the first 4 bytes match a known compressed format (gzip, zstd, bzip2, zip, 7-zip, xz, jpeg, png, mp4, mkv/webm…), compression is skipped entirely.
-2. **Sample probe** — the first 4 KiB of the chunk is compressed with zstd to estimate the ratio.
-3. **Threshold** — if the estimated compressed size is not at least 5% smaller, the chunk is sent raw.
+2. **Full-chunk compression** — the chunk is compressed and the result compared to the original size.
+3. **Threshold** — if compression does not achieve at least a 5% reduction, the compressed bytes are discarded and the chunk is sent raw.
 4. **Per-chunk flag** — `ChunkData.compressed` tells the receiver whether to decompress.
 
-This means a tarball of mixed content (source code + pre-built binaries) will compress the text files and pass the binaries through unmodified, all in one transfer.
+Note that this always pays the compression CPU cost before deciding whether to use the result. For files that are already compressed (not caught by the magic-byte table), this is wasted work. `--no-compress` avoids it entirely.
 
 ### Integrity
 
 - **Per-chunk**: SHA-256 of the wire payload (post-compression). The receiver rejects any chunk whose hash doesn't match before writing it to disk.
-- **Full-file**: SHA-256 of the original file bytes, computed by the sender. After all chunks are written and decompressed, the receiver computes the same hash from its received data and compares. A mismatch fails the transfer.
-- **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver.
+- **Full-file**: SHA-256 of the original file bytes, computed by the sender in a background thread. After all chunks are written and decompressed, the receiver computes the same hash from its received data and compares. A mismatch fails the transfer.
+- **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver process.
 
 ### Resume
 
-Each transfer has a UUID that the sender embeds in every `ChunkData` frame. On the receiver side, a bit-vector tracking which chunks have been received is flushed to `<output_dir>/<transfer_id>.mftp-resume` after each chunk. If the transfer is interrupted:
+Each transfer has a UUID that the sender embeds in every `ChunkData` frame. On the receiver side, a bit-vector tracking which chunks have been received is flushed to `<output_dir>/<transfer_id>.mftp-resume` in batches (every 64 chunks) to limit fsync overhead. If the transfer is interrupted, at most 64 chunks may need re-downloading on resume.
+
+If the transfer is interrupted:
 
 1. Restart `mftp receive` (or re-run the same `mftp send` command in SSH mode)
 2. The receiver finds the resume file, reads which chunks it already has
-3. In the `ReceiverMessage::Ready` response it lists those chunks
-4. The sender skips them and only retransmits what's missing
+3. In the `ReceiverMessage::Ready` response it sends the received-chunk bitvector
+4. The sender skips already-received chunks and only retransmits what's missing
 
 The resume file is deleted on successful completion. Resume is not available on the SFTP fallback path.
 
@@ -267,15 +272,14 @@ mftp uses self-signed TLS certificates with a TOFU (Trust On First Use) model, s
 
 - The receiver generates a fresh key pair on every start
 - It prints the SHA-256 fingerprint of its certificate
-- On first connect to a new server the sender prompts for confirmation and stores the fingerprint in `~/.config/mftp/known_hosts`, keyed by `ip:port`
-- On subsequent transfers to the same server the stored fingerprint is verified silently; a mismatch is rejected as a potential MITM
-- Pass `--trust <fingerprint>` to skip the interactive prompt in scripts or CI
+- On first connect to a new server the sender prompts for confirmation (requires a TTY; non-interactive invocations without `--trust` are rejected)
+- Pass `--trust <fingerprint>` to pin a fingerprint for scripted or non-interactive use; the fingerprint is not stored between sessions automatically
 
 For SSH-assisted transfers the fingerprint is obtained automatically over the existing SSH channel — no manual verification step required.
 
-The SFTP fallback path relies on SSH host key verification against `~/.ssh/known_hosts` (the same file used by the `ssh` command).
+The SFTP fallback path relies on SSH host key verification against `~/.ssh/known_hosts` (the same file used by the `ssh` command). Run `ssh <host>` once if the host is not yet in your known_hosts.
 
-Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. This covers the bandwidth-delay product at 1 Gbps × 250 ms RTT.
+Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. QUIC flow control windows are 32 MiB per stream and 256 MiB at the connection level.
 
 ---
 
@@ -291,17 +295,29 @@ Benchmarked against `scp` on a 10 GbE link, 1 GiB random (incompressible) file:
 | 400 ms RTT | 4.6 MiB/s | **43 MiB/s** | **9× faster** |
 | 600 ms + 1% loss | 2.6 MiB/s | **29 MiB/s** | **11× faster** |
 
-LAN performance uses the auto TCP+TLS path (same-speed as scp). At 50 ms and beyond, QUIC BBR with parallel streams dominates.
+LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and beyond, QUIC BBR with parallel streams dominates.
+
+---
+
+## Known limitations
+
+- **Firewall**: the QUIC and TCP+TLS paths both require an open port on the receiver. In SSH mode a random port is used by default — likely to be blocked. Use `--port <N>` with a known-open port, or rely on the automatic SFTP fallback (port 22 only, but capped at ~22–32 MiB/s).
+- **TOFU fingerprint persistence**: `--trust` fingerprints are not stored between sessions. You must pass `--trust` on every non-interactive invocation, or accept the prompt each time.
+- **SFTP throughput ceiling**: ~3 MiB/s per stream due to synchronous SSH SFTP write acknowledgments (a protocol limitation, not an implementation one).
+- **Windows**: not supported. Linux and macOS only.
+- **FEC**: the Reed-Solomon FEC framework is in place but not yet exposed as a CLI flag.
+- **Single file**: recursive directory transfer is not yet supported.
 
 ---
 
 ## Performance tips
 
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
-- **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms (QUIC's BBR start-up is costly at near-zero latency; kernel TCP wins there). No flags needed — just run the same command.
-- **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips the compression probe. No `--no-compress` needed.
-- **SFTP fallback throughput**: if the direct transfer ports are always blocked and you rely on the SFTP path, raise `--streams` from the default of 8 to 12 for ~32 MiB/s. Check that the remote sshd's `MaxStartups` is set to at least `12:30:100`.
-- **OS socket buffer limit**: On Linux, the kernel may cap socket buffers below 32 MiB. Set `net.core.rmem_max` and `net.core.wmem_max` to `33554432` on both hosts for maximum throughput.
+- **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms. No flags needed — just run the same command.
+- **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips compression. No `--no-compress` needed.
+- **Open port required**: in SSH mode, use `--port <N>` with a firewall-allowed port to avoid the automatic fallback to SFTP. The SFTP path is reliable but slower.
+- **SFTP fallback throughput**: if the direct transfer ports are always blocked, raise `--streams` from the default of 8 to 12 for ~32 MiB/s. Check that the remote sshd's `MaxStartups` is set to at least `12:30:100`.
+- **OS socket buffer limit**: on Linux, the kernel may cap socket buffers below 32 MiB. Set `net.core.rmem_max` and `net.core.wmem_max` to `33554432` on both hosts for maximum throughput.
 
   ```sh
   sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432
@@ -315,7 +331,7 @@ LAN performance uses the auto TCP+TLS path (same-speed as scp). At 50 ms and bey
 cargo build --release
 ```
 
-Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed (it is pulled in by git and curl); on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu).
+Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu).
 
 ```sh
 # Check only (fast)
@@ -334,7 +350,7 @@ cargo clippy -- -D warnings
 
 - **Reed-Solomon FEC** — parity shards for lossy links (e.g. satellite with burst loss); framework is in place
 - **Directory transfer** — recursive send with a single command
-- **Progress over SSH** — rich progress reporting in SSH mode (currently handled by the sender side only)
+- **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
 - **Windows support** — currently Linux/macOS only
 
 ---
