@@ -685,19 +685,19 @@ async fn recv_stream_worker<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    // Scale in-flight cap with available cores: each stream gets a share of the
-    // blocking threadpool for SHA-256 + decompress + pwrite.  Floor at 4 so the
-    // pipeline is always at least 4-deep; ceiling at 16 to bound memory usage.
-    let max_in_flight = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(4)
-        .min(16);
+    // Keep at most this many chunk-processing tasks in flight per stream worker.
+    // Processing (SHA-256 + optional decompress + pwrite) is typically 10-30×
+    // faster than receiving at the network rate per stream, so a pipeline depth
+    // of 4 is more than sufficient to overlap compute with the next network read
+    // without buffering excessive chunk data in memory.  A larger value creates
+    // memory pressure (N streams × depth × chunk_size) and disk-I/O contention
+    // with no throughput benefit.
+    const MAX_IN_FLIGHT: usize = 4;
     let mut processing: JoinSet<Result<()>> = JoinSet::new();
     let mut chunk_count = 0u64;
 
     loop {
-        if processing.len() >= max_in_flight {
+        if processing.len() >= MAX_IN_FLIGHT {
             match processing.join_next().await {
                 Some(Ok(Ok(()))) => {}
                 Some(Ok(Err(e))) => return Err(e),
