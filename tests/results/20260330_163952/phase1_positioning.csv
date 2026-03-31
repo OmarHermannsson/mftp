@@ -1,0 +1,19 @@
+label,mbs,tc_rule
+scp          LAN (0ms),128.7,
+mftp (auto)  LAN (0ms),33,
+mftp --tcp   LAN (0ms),35,
+scp          10ms,72.3,delay 10ms
+mftp (auto)  10ms,38,delay 10ms
+mftp --tcp   10ms,80,delay 10ms
+scp          50ms,35.8,delay 50ms
+mftp (auto)  50ms,68,delay 50ms
+mftp --tcp   50ms,37,delay 50ms
+scp          150ms,12.1,delay 150ms
+mftp (auto)  150ms,67,delay 150ms
+mftp --tcp   150ms,13,delay 150ms
+scp          400ms,5.9,delay 400ms
+mftp (auto)  400ms,614,delay 400ms
+mftp --tcp   400ms,139,delay 400ms
+scp          600ms+1%loss,2.6,delay 600ms loss 1%
+mftp (auto)  600ms+1%loss,604,delay 600ms loss 1%
+mftp --tcp   600ms+1%loss,186,delay 600ms loss 1%

@@ -1,0 +1,13 @@
+[15:44:29] mftp benchmark suite — results in tests/results/20260330_154429
+[15:44:30] Local cores: 4, Remote cores: 8
+[15:44:30] File size: 1024 MiB
+[15:44:30] mftp version: mftp 0.1.13
+
+═══ PHASE 5 — Compression impact ═══
+[15:44:30] RTT: 150ms
+mftp compress=auto  file=random                                 49 MiB/s
+mftp compress=off   file=random                                 48 MiB/s
+mftp compress=auto  file=text                                  730 MiB/s
+mftp compress=off   file=text                                   49 MiB/s
+[15:45:55] Done. Results in tests/results/20260330_154429/
+[15:45:56] TC rules cleared (trap)

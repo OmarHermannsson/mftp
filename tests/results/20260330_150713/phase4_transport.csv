@@ -1,0 +1,13 @@
+label,mbs,transport,rtt_ms
+mftp QUIC    RTT=LAN,49,,quic,LAN
+mftp TCP+TLS RTT=LAN,90,,tcp,LAN
+mftp QUIC    RTT=10ms,29,,quic,10ms
+mftp TCP+TLS RTT=10ms,52,,tcp,10ms
+mftp QUIC    RTT=50ms,24,,quic,50ms
+mftp TCP+TLS RTT=50ms,24,,tcp,50ms
+mftp QUIC    RTT=150ms,27,,quic,150ms
+mftp TCP+TLS RTT=150ms,12,,tcp,150ms
+mftp QUIC    RTT=400ms,10,,quic,400ms
+mftp TCP+TLS RTT=400ms,20,,tcp,400ms
+mftp QUIC    RTT=600ms+1%,14,,quic,600ms+1%
+mftp TCP+TLS RTT=600ms+1%,5,,tcp,600ms+1%

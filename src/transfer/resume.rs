@@ -143,6 +143,11 @@ impl ResumeState {
         (0..self.total_chunks).filter(|&i| self.is_received(i)).collect()
     }
 
+    /// Return a clone of the raw packed bitvector for use in the wire protocol.
+    pub fn received_bitvec(&self) -> Vec<u64> {
+        self.received.clone()
+    }
+
     /// Persist the current state to disk atomically (write-then-rename).
     ///
     /// Called after every `mark_received` so a crash loses at most the

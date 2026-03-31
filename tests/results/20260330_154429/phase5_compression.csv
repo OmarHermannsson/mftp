@@ -1,0 +1,5 @@
+label,mbs,file_type,compress,rtt_ms
+mftp compress=auto  file=random,49,random,on,150ms
+mftp compress=off   file=random,48,random,off,150ms
+mftp compress=auto  file=text,730,text,on,150ms
+mftp compress=off   file=text,49,text,off,150ms

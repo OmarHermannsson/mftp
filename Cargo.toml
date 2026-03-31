@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.23"
+version = "0.1.25"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -64,6 +64,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # SSH / SFTP (for the SFTP fallback transport)
 ssh2 = "0.9"
 base64 = "0.22"
+# HMAC-SHA1 for hashed known_hosts verification
+hmac = "0.12"
+sha1 = "0.10"
 
 # Misc
 bytes = "1"

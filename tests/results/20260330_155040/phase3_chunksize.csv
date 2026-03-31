@@ -1,0 +1,19 @@
+label,mbs,chunk_bytes,rtt_ms
+mftp auto         RTT=50ms,55,auto,50ms
+mftp chunk=512K    RTT=50ms,61,524288,50ms
+mftp chunk=1024K    RTT=50ms,53,1048576,50ms
+mftp chunk=2048K    RTT=50ms,52,2097152,50ms
+mftp chunk=4096K    RTT=50ms,63,4194304,50ms
+mftp chunk=8192K    RTT=50ms,55,8388608,50ms
+mftp auto         RTT=150ms,48,auto,150ms
+mftp chunk=512K    RTT=150ms,56,524288,150ms
+mftp chunk=1024K    RTT=150ms,49,1048576,150ms
+mftp chunk=2048K    RTT=150ms,37,2097152,150ms
+mftp chunk=4096K    RTT=150ms,44,4194304,150ms
+mftp chunk=8192K    RTT=150ms,42,8388608,150ms
+mftp auto         RTT=400ms,21,auto,400ms
+mftp chunk=512K    RTT=400ms,21,524288,400ms
+mftp chunk=1024K    RTT=400ms,21,1048576,400ms
+mftp chunk=2048K    RTT=400ms,21,2097152,400ms
+mftp chunk=4096K    RTT=400ms,19,4194304,400ms
+mftp chunk=8192K    RTT=400ms,19,8388608,400ms

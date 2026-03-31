@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use indicatif::{ProgressBar, ProgressStyle};
 use ssh2::{MethodType, OpenFlags, OpenType, Session};
 
@@ -229,8 +231,13 @@ fn ssh_connect(dest: &SshDest) -> Result<Session> {
 /// issues) and directly compares the raw wire-format key bytes from the
 /// session against the base64-decoded entries in the known_hosts file.
 ///
+/// Handles both plain entries (`host key-type base64-key`) and OpenSSH hashed
+/// entries (`|1|<base64-salt>|<base64-hmac-sha1>  key-type  base64-key`), so
+/// this works on Ubuntu/Debian systems where `HashKnownHosts yes` is the
+/// default `ssh_config` setting.
+///
 /// Rejects connections if the key is unknown (run `ssh <host>` once) or
-/// has changed (possible MITM).
+/// has changed (possible MITM), and refuses to proceed if known_hosts is absent.
 fn verify_host_key(sess: &Session, host: &str) -> Result<()> {
     let (sess_key, _) = sess
         .host_key()
@@ -240,8 +247,10 @@ fn verify_host_key(sess: &Session, host: &str) -> Result<()> {
     let kh_path = Path::new(&home).join(".ssh").join("known_hosts");
 
     if !kh_path.exists() {
-        tracing::warn!("~/.ssh/known_hosts not found; skipping host key verification");
-        return Ok(());
+        bail!(
+            "~/.ssh/known_hosts not found — run `ssh {host}` once to accept \
+             the host key before using the SFTP fallback path"
+        );
     }
 
     let content = std::fs::read_to_string(&kh_path).context("read ~/.ssh/known_hosts")?;
@@ -256,13 +265,21 @@ fn verify_host_key(sess: &Session, host: &str) -> Result<()> {
         if parts.len() < 3 {
             continue;
         }
-        // Field 0 is a comma-separated list of host patterns.
-        if !parts[0].split(',').any(|h| h == host) {
+
+        let host_field = parts[0];
+        let matches = if host_field.starts_with('|') {
+            // Hashed entry: |1|<base64-salt>|<base64-HMAC-SHA1> (OpenSSH HashKnownHosts)
+            host_field_matches_hashed(host, host_field)
+        } else {
+            // Plain entry: comma-separated hostname/IP list
+            host_field.split(',').any(|h| h == host)
+        };
+        if !matches {
             continue;
         }
         host_found = true;
 
-        // Decode the stored key (standard base64, with or without padding).
+        // parts[2] is the base64-encoded wire-format public key.
         let stored = STANDARD
             .decode(parts[2])
             .or_else(|_| STANDARD_NO_PAD.decode(parts[2]))
@@ -284,6 +301,34 @@ fn verify_host_key(sess: &Session, host: &str) -> Result<()> {
              run `ssh {host}` once to add it"
         )
     }
+}
+
+/// Returns `true` if a hashed known_hosts entry (`|1|<salt>|<hash>`) matches
+/// the given hostname using HMAC-SHA1, the scheme used by OpenSSH
+/// `HashKnownHosts yes` (the default on Ubuntu/Debian).
+fn host_field_matches_hashed(hostname: &str, field: &str) -> bool {
+    // Expected format when split on '|': ["", "1", salt_b64, hmac_b64]
+    let parts: Vec<&str> = field.splitn(4, '|').collect();
+    if parts.len() != 4 || parts[0] != "" || parts[1] != "1" {
+        return false;
+    }
+    let salt = match STANDARD
+        .decode(parts[2])
+        .or_else(|_| STANDARD_NO_PAD.decode(parts[2]))
+    {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let expected = match STANDARD
+        .decode(parts[3])
+        .or_else(|_| STANDARD_NO_PAD.decode(parts[3]))
+    {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(&salt) else { return false };
+    mac.update(hostname.as_bytes());
+    mac.finalize().into_bytes().as_slice() == expected.as_slice()
 }
 
 /// Authenticate `user` via SSH agent, then default key files.

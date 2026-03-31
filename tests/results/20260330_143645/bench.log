@@ -1,0 +1,32 @@
+[14:36:45] mftp benchmark suite — results in tests/results/20260330_143645
+[14:36:45] Local cores: 4, Remote cores: 8
+[14:36:45] File size: 1024 MiB
+[14:36:45] mftp version: mftp 0.1.13
+
+═══ PHASE 2 — Stream count sweep ═══
+[14:36:46] RTT: 50ms
+mftp auto         RTT=50ms                                      55 MiB/s
+mftp -n 1         RTT=50ms                                      22 MiB/s
+mftp -n 2         RTT=50ms                                      11 MiB/s
+mftp -n 4         RTT=50ms                                      58 MiB/s
+mftp -n 8         RTT=50ms                                      37 MiB/s
+mftp -n 16         RTT=50ms                                     42 MiB/s
+mftp -n 32         RTT=50ms                                     50 MiB/s
+[14:41:11] RTT: 150ms
+mftp auto         RTT=150ms                                     48 MiB/s
+mftp -n 1         RTT=150ms                                      8 MiB/s
+mftp -n 2         RTT=150ms                                     15 MiB/s
+mftp -n 4         RTT=150ms                                     29 MiB/s
+mftp -n 8         RTT=150ms                                     48 MiB/s
+mftp -n 16         RTT=150ms                                    43 MiB/s
+mftp -n 32         RTT=150ms                                    46 MiB/s
+[14:47:11] RTT: 400ms
+mftp auto         RTT=400ms                                     21 MiB/s
+mftp -n 1         RTT=400ms                                      3 MiB/s
+mftp -n 2         RTT=400ms                                      6 MiB/s
+mftp -n 4         RTT=400ms                                     11 MiB/s
+mftp -n 8         RTT=400ms                                     21 MiB/s
+mftp -n 16         RTT=400ms                                    22 MiB/s
+mftp -n 32         RTT=400ms                                    22 MiB/s
+[15:02:11] Done. Results in tests/results/20260330_143645/
+[15:02:12] TC rules cleared (trap)

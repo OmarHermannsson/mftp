@@ -406,7 +406,10 @@ where
     let pt = prepare_transfer(&manifest, &output_dir)?;
     framing::send_message(
         &mut ctrl_send,
-        &ReceiverMessage::Ready { have_chunks: pt.have_chunks },
+        &ReceiverMessage::Ready {
+            received_bits: pt.received_bits,
+            total_chunks: manifest.total_chunks,
+        },
     )
     .await?;
     pt.pb.set_position(pt.bytes_already_received);
@@ -484,15 +487,15 @@ where
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 /// Prepared state for a transfer: open output file, resume state, progress bar,
-/// and the list of chunks already on disk (for the Ready message).
+/// and the resume bitvector to include in the Ready message.
 struct PreparedTransfer {
     out_file: Arc<std::fs::File>,
     resume: Arc<Mutex<ResumeState>>,
     pb: Arc<ProgressBar>,
     hasher: Arc<ChunkHasher>,
     bytes_already_received: u64,
-    /// Chunk indices already written to disk; sent in ReceiverMessage::Ready.
-    have_chunks: Vec<u64>,
+    /// Packed bitvector of already-received chunks; sent in ReceiverMessage::Ready.
+    received_bits: Vec<u64>,
 }
 
 fn prepare_transfer(
@@ -504,14 +507,19 @@ fn prepare_transfer(
         &manifest.transfer_id,
         manifest.total_chunks,
     )));
-    let have_chunks = resume.lock().unwrap().received_chunks();
-    let bytes_already_received: u64 = have_chunks
-        .iter()
-        .map(|&i| {
-            let offset = i * manifest.chunk_size as u64;
-            ((manifest.file_size - offset) as usize).min(manifest.chunk_size) as u64
-        })
-        .sum();
+    let (received_bits, bytes_already_received) = {
+        let state = resume.lock().unwrap();
+        let bits = state.received_bitvec();
+        let bytes: u64 = state
+            .received_chunks()
+            .iter()
+            .map(|&i| {
+                let offset = i * manifest.chunk_size as u64;
+                ((manifest.file_size - offset) as usize).min(manifest.chunk_size) as u64
+            })
+            .sum();
+        (bits, bytes)
+    };
 
     let out_path = output_dir.join(&manifest.file_name);
     let out_file = Arc::new({
@@ -550,7 +558,7 @@ fn prepare_transfer(
 
     let hasher = Arc::new(ChunkHasher::new(manifest.total_chunks));
 
-    Ok(PreparedTransfer { out_file, resume, pb, hasher, bytes_already_received, have_chunks })
+    Ok(PreparedTransfer { out_file, resume, pb, hasher, bytes_already_received, received_bits })
 }
 
 async fn drain_tasks(tasks: &mut JoinSet<Result<()>>) -> Option<anyhow::Error> {
@@ -743,7 +751,7 @@ where
                     .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
             }
 
-            hasher.feed(chunk_index, &data);
+            hasher.feed(chunk_index, &data)?;
             let n = data.len() as u64;
             pb.inc(n);
             // Non-blocking: progress updates are best-effort; never slow the data path.
@@ -788,6 +796,9 @@ const MAX_STREAMS: usize = 1024;
 fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<()> {
     if m.file_name.is_empty() {
         bail!("manifest: file_name is empty");
+    }
+    if m.file_name.contains('\0') {
+        bail!("manifest: file_name contains null byte");
     }
     if m.file_name.contains('/') || m.file_name.contains('\\') {
         bail!("manifest: file_name contains path separator: {:?}", m.file_name);

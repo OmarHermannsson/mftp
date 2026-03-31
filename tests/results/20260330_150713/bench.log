@@ -1,0 +1,62 @@
+[15:07:13] mftp benchmark suite — results in tests/results/20260330_150713
+[15:07:13] mftp benchmark suite — results in tests/results/20260330_150713
+[15:07:13] mftp benchmark suite — results in tests/results/20260330_150713
+[15:07:14] Local cores: 4, Remote cores: 8
+[15:07:14] File size: 1024 MiB
+[15:07:14] mftp version: mftp 0.1.13
+
+═══ PHASE 4 — Transport comparison: QUIC vs TCP+TLS ═══
+[15:07:14] Local cores: 4, Remote cores: 8
+[15:07:14] Local cores: 4, Remote cores: 8
+[15:07:14] File size: 1024 MiB
+[15:07:14] File size: 1024 MiB
+[15:07:14] mftp version: mftp 0.1.13
+
+[15:07:14] mftp version: mftp 0.1.13
+═══ PHASE 5 — Compression impact ═══
+
+═══ PHASE 3 — Chunk size sweep ═══
+[15:07:14] RTT: LAN
+[15:07:14] RTT: 50ms
+[15:07:15] TC rules cleared (trap)
+mftp auto         RTT=50ms                                     233 MiB/s
+mftp QUIC    RTT=LAN                                            49 MiB/s
+mftp TCP+TLS RTT=LAN                                            90 MiB/s
+[15:07:49] RTT: 10ms
+mftp chunk=512K    RTT=50ms                                     33 MiB/s
+mftp QUIC    RTT=10ms                                           29 MiB/s
+mftp chunk=1024K    RTT=50ms                                    30 MiB/s
+mftp TCP+TLS RTT=10ms                                           52 MiB/s
+[15:08:47] RTT: 50ms
+mftp chunk=2048K    RTT=50ms                                    17 MiB/s
+mftp QUIC    RTT=50ms                                           24 MiB/s
+mftp chunk=4096K    RTT=50ms                                    24 MiB/s
+mftp TCP+TLS RTT=50ms                                           24 MiB/s
+[15:10:21] RTT: 150ms
+mftp QUIC    RTT=150ms                                          27 MiB/s
+mftp chunk=8192K    RTT=50ms                                    18 MiB/s
+[15:11:14] RTT: 150ms
+mftp auto         RTT=150ms                                     39 MiB/s
+mftp chunk=512K    RTT=150ms                                    42 MiB/s
+mftp TCP+TLS RTT=150ms                                          12 MiB/s
+[15:12:37] RTT: 400ms
+mftp chunk=1024K    RTT=150ms                                   15 MiB/s
+mftp chunk=2048K    RTT=150ms                                   17 MiB/s
+mftp QUIC    RTT=400ms                                          10 MiB/s
+mftp TCP+TLS RTT=400ms                                          20 MiB/s
+[15:15:27] RTT: 600ms+1%
+mftp chunk=4096K    RTT=150ms                                   16 MiB/s
+mftp QUIC    RTT=600ms+1%                                       14 MiB/s
+mftp chunk=8192K    RTT=150ms                                   13 MiB/s
+[15:17:24] RTT: 400ms
+mftp auto         RTT=400ms                                     20 MiB/s
+mftp chunk=512K    RTT=400ms                                    20 MiB/s
+mftp chunk=1024K    RTT=400ms                                   20 MiB/s
+mftp TCP+TLS RTT=600ms+1%                                        5 MiB/s
+[15:20:54] Done. Results in tests/results/20260330_150713/
+[15:20:54] TC rules cleared (trap)
+mftp chunk=2048K    RTT=400ms                                   41 MiB/s
+mftp chunk=4096K    RTT=400ms                                   34 MiB/s
+mftp chunk=8192K    RTT=400ms                                   38 MiB/s
+[15:22:15] Done. Results in tests/results/20260330_150713/
+[15:22:16] TC rules cleared (trap)

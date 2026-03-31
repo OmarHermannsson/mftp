@@ -196,6 +196,7 @@ async fn roundtrip_tcp(
 ) -> anyhow::Result<()> {
     let server = TcpServer::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned()).await?;
     let addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
 
     // Spawn the server so sender and receiver run on separate tasks.
     let recv_task = tokio::spawn(async move { server.accept_one().await });
@@ -208,7 +209,7 @@ async fn roundtrip_tcp(
             chunk_size: Some(chunk_size),
             compress,
             compress_level: 3,
-            trusted_fingerprint: None,
+            trusted_fingerprint: Some(fingerprint),
             use_tcp: true,
             tcp_rtt_threshold: std::time::Duration::ZERO,
         },
@@ -237,6 +238,7 @@ async fn test_tls_two_streams_raw() -> anyhow::Result<()> {
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     let (cert, key_bytes) = generate_self_signed_cert()?;
+    let fingerprint = mftp::net::connection::cert_fingerprint(&cert);
     let server_config = make_server_tls_config(cert, make_private_key(key_bytes)?)?;
     let acceptor = Arc::new(TlsAcceptor::from(Arc::new(server_config)));
     let (listener, addr) = bind_tcp("127.0.0.1:0".parse()?).await?;
@@ -261,7 +263,7 @@ async fn test_tls_two_streams_raw() -> anyhow::Result<()> {
     // Client: open 2 TLS connections and write DATA_SIZE bytes each
     for i in 0..2 {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
-        let config = make_client_tls_config(None, addr)?;
+        let config = make_client_tls_config(Some(&fingerprint), addr)?;
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = ServerName::IpAddress(addr.ip().into());
         let mut tls = connector.connect(server_name, tcp).await?;

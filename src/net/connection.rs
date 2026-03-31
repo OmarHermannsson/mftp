@@ -292,11 +292,11 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
                 // First connection to this server — prompt the user.
                 eprintln!("Server certificate fingerprint (SHA-256):\n  {fp}");
                 if !prompt_trust() {
-                    return Err(rustls::Error::General(
-                        "certificate rejected — rerun with --trust <fingerprint> \
-                         to skip the interactive prompt"
-                            .into(),
-                    ));
+                    return Err(rustls::Error::General(format!(
+                        "certificate not trusted\n  \
+                         To pin this fingerprint for non-interactive use, add --trust {fp}\n  \
+                         To accept interactively, run from a terminal without stdin redirected"
+                    )));
                 }
                 store_known_host(self.server_addr, &fp);
             }
@@ -448,19 +448,19 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
 /// Prompt the user to accept a new certificate fingerprint.
 ///
 /// Opens `/dev/tty` directly so the prompt works even when stdin is redirected.
-/// Returns `true` if the user types "yes" (case-insensitive).  Returns `true`
-/// without prompting in non-interactive contexts where `/dev/tty` is not
-/// available (e.g. piped stdin or SSH-spawned processes).
+/// Returns `true` if the user types "yes" (case-insensitive).  Returns `false`
+/// in non-interactive contexts where `/dev/tty` is not available — callers
+/// must refuse the connection and tell the user to pass `--trust <fingerprint>`.
 fn prompt_trust() -> bool {
     use std::io::{BufRead, BufReader, Write};
     let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-        // No controlling terminal — non-interactive context, accept automatically.
-        return true;
+        // No controlling terminal — cannot prompt.  Caller emits error with --trust hint.
+        return false;
     };
     let _ = write!(tty, "Trust this certificate? [yes/N]: ");
     let _ = tty.flush();
     // Re-open for reading so we don't hold a conflicting borrow.
-    let Ok(tty_r) = std::fs::File::open("/dev/tty") else { return true };
+    let Ok(tty_r) = std::fs::File::open("/dev/tty") else { return false };
     let mut answer = String::new();
     BufReader::new(tty_r).read_line(&mut answer).ok();
     answer.trim().eq_ignore_ascii_case("yes")

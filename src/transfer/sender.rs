@@ -330,10 +330,16 @@ where
     };
     framing::send_message(ctrl_send, &manifest).await?;
 
-    // Receive Ready — receiver lists chunks already on disk (for resume).
-    let ready: ReceiverMessage = framing::recv_message_required(&mut ctrl_recv).await?;
+    // Receive Ready — receiver sends a packed bitvector of already-on-disk chunks.
+    // Uses the data-frame limit (128 MiB) because the bitvector can be large for
+    // big files even in its compact form (e.g. 16 TiB / 4 MiB = ~500 KB bitvec).
+    let ready: ReceiverMessage = framing::recv_data_message(&mut ctrl_recv)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
     let have: HashSet<u64> = match ready {
-        ReceiverMessage::Ready { have_chunks } => have_chunks.into_iter().collect(),
+        ReceiverMessage::Ready { received_bits, total_chunks } => {
+            bits_to_chunk_set(&received_bits, total_chunks)
+        }
         ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
         other => bail!("unexpected message from receiver: {other:?}"),
     };
@@ -544,6 +550,23 @@ fn print_completion(
         other => bail!("unexpected final message: {other:?}"),
     }
     Ok(())
+}
+
+/// Reconstruct a `HashSet` of chunk indices from a packed bitvector.
+fn bits_to_chunk_set(bits: &[u64], total_chunks: u64) -> HashSet<u64> {
+    bits.iter()
+        .enumerate()
+        .flat_map(|(wi, &word)| {
+            (0u64..64).filter_map(move |bit| {
+                if word & (1 << bit) != 0 {
+                    let idx = wi as u64 * 64 + bit;
+                    if idx < total_chunks { Some(idx) } else { None }
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
 }
 
 fn read_chunk(file: &std::fs::File, chunk: &ChunkInfo) -> Result<Vec<u8>> {

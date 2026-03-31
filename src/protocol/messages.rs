@@ -74,8 +74,12 @@ pub enum SenderMessage {
 /// Sent by the receiver on the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReceiverMessage {
-    /// Receiver is ready; lists chunk indices already on disk (resume).
-    Ready { have_chunks: Vec<u64> },
+    /// Receiver is ready; packed bitvector of already-received chunks (resume).
+    ///
+    /// `received_bits[i]` has bit `j` set iff chunk `i*64+j` was already written to
+    /// disk.  This is 64× smaller than a list of chunk indices and stays well within
+    /// the wire frame limit for any file that mftp can transfer.
+    Ready { received_bits: Vec<u64>, total_chunks: u64 },
     /// Periodic progress update: total bytes written to disk so far.
     /// Sent at most every 100 ms during the data-transfer phase so the
     /// sender can display an accurate progress bar.

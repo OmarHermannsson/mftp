@@ -179,21 +179,31 @@ pub async fn send_via_ssh(
 // ── Binary delivery ───────────────────────────────────────────────────────────
 
 /// Spawn SSH to run a pre-installed binary on the remote.
+///
+/// OpenSSH joins all non-hostname arguments with spaces into a single shell
+/// command on the remote, so we must shell-quote `bin` and `remote_path` to
+/// handle spaces and other metacharacters correctly.
 fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
     remote_port: Option<u16>,
 ) -> Result<tokio::process::Child> {
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.arg(&dest.user_host)
-        .arg(bin)
-        .arg("server")
-        .arg("--output-dir")
-        .arg(&dest.remote_path);
-    if let Some(p) = remote_port {
-        cmd.arg("--port").arg(p.to_string());
-    }
-    cmd.stdin(Stdio::null())
+    let port_arg = match remote_port {
+        Some(p) => format!(" --port {p}"),
+        None => String::new(),
+    };
+    let remote_cmd = format!(
+        "{} server --output-dir {}{}",
+        shell_quote(bin),
+        shell_quote(&dest.remote_path),
+        port_arg,
+    );
+    tokio::process::Command::new("ssh")
+        .arg(&dest.user_host)
+        .arg("sh")
+        .arg("-c")
+        .arg(&remote_cmd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

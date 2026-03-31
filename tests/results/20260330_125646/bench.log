@@ -1,0 +1,29 @@
+[12:56:46] mftp benchmark suite — results in tests/results/20260330_125646
+[12:56:46] Local cores: 4, Remote cores: 8
+[12:56:46] File size: 1024 MiB
+[12:56:46] mftp version: mftp 0.1.13
+
+═══ PHASE 1 — Positioning: mftp vs scp across latency ═══
+[12:56:47] Scenario: LAN (0ms)
+scp          LAN (0ms)                                       426.1 MiB/s
+mftp (auto)  LAN (0ms)                                         272 MiB/s
+mftp --tcp   LAN (0ms)                                         114 MiB/s
+[12:57:03] Scenario: 10ms
+scp          10ms                                            158.0 MiB/s
+mftp (auto)  10ms                                               64 MiB/s
+mftp --tcp   10ms                                               78 MiB/s
+[12:57:42] Scenario: 50ms
+scp          50ms                                             35.8 MiB/s
+mftp (auto)  50ms                                               56 MiB/s
+mftp --tcp   50ms                                               38 MiB/s
+[12:59:01] Scenario: 150ms
+scp          150ms                                            12.2 MiB/s
+mftp (auto)  150ms                                              45 MiB/s
+mftp --tcp   150ms                                               0 MiB/s
+[13:01:33] Scenario: 400ms
+scp          400ms                                             4.6 MiB/s
+mftp (auto)  400ms                                               0 MiB/s
+mftp --tcp   400ms                                               0 MiB/s
+[13:06:56] Scenario: 600ms+1%loss
+scp          600ms+1%loss                                      2.7 MiB/s
+[13:26:37] TC rules cleared (trap)

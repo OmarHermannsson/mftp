@@ -1,0 +1,29 @@
+[15:50:40] mftp benchmark suite — results in tests/results/20260330_155040
+[15:50:41] Local cores: 4, Remote cores: 8
+[15:50:41] File size: 1024 MiB
+[15:50:41] mftp version: mftp 0.1.13
+
+═══ PHASE 3 — Chunk size sweep ═══
+[15:50:43] RTT: 50ms
+mftp auto         RTT=50ms                                      55 MiB/s
+mftp chunk=512K    RTT=50ms                                     61 MiB/s
+mftp chunk=1024K    RTT=50ms                                    53 MiB/s
+mftp chunk=2048K    RTT=50ms                                    52 MiB/s
+mftp chunk=4096K    RTT=50ms                                    63 MiB/s
+mftp chunk=8192K    RTT=50ms                                    55 MiB/s
+[15:52:46] RTT: 150ms
+mftp auto         RTT=150ms                                     48 MiB/s
+mftp chunk=512K    RTT=150ms                                    56 MiB/s
+mftp chunk=1024K    RTT=150ms                                   49 MiB/s
+mftp chunk=2048K    RTT=150ms                                   37 MiB/s
+mftp chunk=4096K    RTT=150ms                                   44 MiB/s
+mftp chunk=8192K    RTT=150ms                                   42 MiB/s
+[15:55:33] RTT: 400ms
+mftp auto         RTT=400ms                                     21 MiB/s
+mftp chunk=512K    RTT=400ms                                    21 MiB/s
+mftp chunk=1024K    RTT=400ms                                   21 MiB/s
+mftp chunk=2048K    RTT=400ms                                   21 MiB/s
+mftp chunk=4096K    RTT=400ms                                   19 MiB/s
+mftp chunk=8192K    RTT=400ms                                   19 MiB/s
+[16:01:53] Done. Results in tests/results/20260330_155040/
+[16:01:53] TC rules cleared (trap)

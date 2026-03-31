@@ -1,0 +1,26 @@
+[16:15:57] mftp benchmark suite — results in tests/results/20260330_161557
+[16:15:57] Local cores: 4, Remote cores: 8
+[16:15:57] File size: 1024 MiB
+[16:15:57] mftp version: mftp 0.1.14
+
+═══ PHASE 4 — Transport comparison: QUIC vs TCP+TLS ═══
+[16:15:59] RTT: LAN
+mftp QUIC    RTT=LAN                                           114 MiB/s
+mftp TCP+TLS RTT=LAN                                           122 MiB/s
+[16:16:19] RTT: 10ms
+mftp QUIC    RTT=10ms                                           77 MiB/s
+mftp TCP+TLS RTT=10ms                                           77 MiB/s
+[16:16:49] RTT: 50ms
+mftp QUIC    RTT=50ms                                           95 MiB/s
+mftp TCP+TLS RTT=50ms                                           38 MiB/s
+[16:17:33] RTT: 150ms
+mftp QUIC    RTT=150ms                                          82 MiB/s
+mftp TCP+TLS RTT=150ms                                          13 MiB/s
+[16:19:19] RTT: 400ms
+mftp QUIC    RTT=400ms                                          43 MiB/s
+mftp TCP+TLS RTT=400ms                                           5 MiB/s
+[16:23:50] RTT: 600ms+1%
+mftp QUIC    RTT=600ms+1%                                       28 MiB/s
+mftp TCP+TLS RTT=600ms+1%                                        3 MiB/s
+[16:30:34] Done. Results in tests/results/20260330_161557/
+[16:30:35] TC rules cleared (trap)

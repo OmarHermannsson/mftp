@@ -1,0 +1,22 @@
+label,mbs,streams,rtt_ms
+mftp auto         RTT=50ms,55,,auto,50ms
+mftp -n 1         RTT=50ms,22,,1,50ms
+mftp -n 2         RTT=50ms,11,,2,50ms
+mftp -n 4         RTT=50ms,58,,4,50ms
+mftp -n 8         RTT=50ms,37,,8,50ms
+mftp -n 16         RTT=50ms,42,,16,50ms
+mftp -n 32         RTT=50ms,50,,32,50ms
+mftp auto         RTT=150ms,48,,auto,150ms
+mftp -n 1         RTT=150ms,8,,1,150ms
+mftp -n 2         RTT=150ms,15,,2,150ms
+mftp -n 4         RTT=150ms,29,,4,150ms
+mftp -n 8         RTT=150ms,48,,8,150ms
+mftp -n 16         RTT=150ms,43,,16,150ms
+mftp -n 32         RTT=150ms,46,,32,150ms
+mftp auto         RTT=400ms,21,,auto,400ms
+mftp -n 1         RTT=400ms,3,,1,400ms
+mftp -n 2         RTT=400ms,6,,2,400ms
+mftp -n 4         RTT=400ms,11,,4,400ms
+mftp -n 8         RTT=400ms,21,,8,400ms
+mftp -n 16         RTT=400ms,22,,16,400ms
+mftp -n 32         RTT=400ms,22,,32,400ms
