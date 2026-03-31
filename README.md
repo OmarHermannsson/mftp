@@ -100,14 +100,20 @@ Options:
                            transfer port must be in a firewall allow-list.
   -n, --streams <N>        Parallel streams.
                            Direct mode: default auto-negotiated from RTT + CPU cores.
-                           SFTP fallback: default 8 (each stream = one SSH connection;
+                           SFTP: default 8 (each stream = one SSH connection;
                            raise to 12 if the remote sshd allows it).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
-      --tcp                Force TCP+TLS; skip the QUIC attempt.
-      --tcp-below-rtt <MS> Switch to TCP+TLS when measured RTT ≤ this value (ms).
-                           Auto-switches on LAN/datacenter where kernel TCP beats
-                           QUIC BBR [default: 5.0]. Set to 0 to always use QUIC.
+      --transport <TRANSPORT>
+                           Force a specific transport path:
+                           quic — QUIC only; fails immediately if UDP is blocked
+                                  (no TCP+TLS or SFTP fallback).
+                           tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
+                           sftp — parallel SFTP through port 22 (SSH mode only;
+                                  ~22 MiB/s cap; skips remote server launch).
+                           Omit for auto: QUIC → TCP+TLS → SFTP (SSH mode only).
+      --tcp-below-rtt <MS> In auto mode, switch to TCP+TLS when measured RTT ≤ this
+                           value. Ignored when --transport is set [default: 5.0].
   -v, --verbose            Increase log verbosity (-v / -vv / -vvv).
 ```
 

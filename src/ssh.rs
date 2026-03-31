@@ -24,7 +24,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::transfer::sender::SendConfig;
+use crate::transfer::sender::{ForcedTransport, SendConfig};
 
 // ── Destination parsing ───────────────────────────────────────────────────────
 
@@ -107,6 +107,13 @@ pub async fn send_via_ssh(
     remote_mftp: Option<String>,
     remote_port: Option<u16>,
 ) -> Result<()> {
+    // Fast path: SFTP forced — skip remote server launch entirely and go
+    // straight to parallel SFTP over port 22.
+    if config.forced_transport == Some(ForcedTransport::Sftp) {
+        let n = config.streams.unwrap_or(8);
+        return crate::sftp::send_via_sftp(file, dest, n).await;
+    }
+
     let child = match remote_mftp {
         Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
         None => pipe_self_to_remote(&dest, remote_port).await?,
@@ -156,6 +163,14 @@ pub async fn send_via_ssh(
     let direct_result = crate::transfer::sender::send(file.clone(), direct_addr, direct_cfg).await;
 
     if let Err(e) = direct_result {
+        // A forced transport means the user explicitly chose QUIC or TCP+TLS —
+        // do not silently fall back to SFTP.
+        if config.forced_transport.is_some() {
+            return Err(e.context(format!(
+                "direct connection to {direct_addr} failed; \
+                 SFTP fallback suppressed by --transport"
+            )));
+        }
         eprintln!("[mftp] direct connection to {direct_addr} failed ({e:#})");
         eprintln!("[mftp] retrying via SFTP (parallel SSH streams, single encryption layer)…");
         // Kill the mftp server — SFTP bypasses it entirely and talks to sshd

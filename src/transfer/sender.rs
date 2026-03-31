@@ -28,6 +28,22 @@ use crate::protocol::{
 use crate::transfer::chunk::{ChunkInfo, ChunkQueue};
 use crate::transfer::negotiate::compute_params;
 
+/// Which transport path to use for the transfer.
+///
+/// Used in [`SendConfig::forced_transport`]; `None` means auto (QUIC → TCP+TLS →
+/// SFTP in SSH mode).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ForcedTransport {
+    /// QUIC with BBR congestion control.  No TCP+TLS or SFTP fallback — the
+    /// transfer fails immediately if QUIC is unreachable.
+    Quic,
+    /// TCP+TLS.  Skip the QUIC probe entirely.  No SFTP fallback.
+    Tcp,
+    /// Parallel SFTP through SSH port 22.  SSH mode only; not valid for
+    /// direct `host:port` destinations.
+    Sftp,
+}
+
 #[derive(Clone)]
 pub struct SendConfig {
     /// Override parallel stream count. `None` = auto-negotiate from RTT + CPU.
@@ -38,13 +54,10 @@ pub struct SendConfig {
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
     pub trusted_fingerprint: Option<String>,
-    /// Force TCP+TLS instead of QUIC. Normally not needed — the sender tries
-    /// QUIC first and auto-falls-back to TCP+TLS if UDP is blocked or RTT is low.
-    pub use_tcp: bool,
-    /// Switch to TCP+TLS when measured RTT is at or below this threshold.
-    /// On LAN / same-datacenter links QUIC's per-packet overhead costs more
-    /// than it saves, so TCP+TLS matches or beats it at short distances.
-    /// Defaults to 1 ms; set to zero to disable the check.
+    /// Force a specific transport path; `None` = auto (QUIC → TCP+TLS → SFTP).
+    pub forced_transport: Option<ForcedTransport>,
+    /// In auto mode, switch to TCP+TLS when measured RTT is at or below this
+    /// threshold.  Ignored when `forced_transport` is set.
     pub tcp_rtt_threshold: Duration,
 }
 
@@ -56,14 +69,20 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(1);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
-    if config.use_tcp {
-        return send_tcp(file, destination, config).await;
+    match &config.forced_transport {
+        Some(ForcedTransport::Tcp) => return send_tcp(file, destination, config).await,
+        Some(ForcedTransport::Sftp) => bail!(
+            "--transport sftp is only available in SSH mode \
+             ([user@]host:/path); it is not valid for a direct host:port destination"
+        ),
+        Some(ForcedTransport::Quic) | None => {}
     }
 
-    // Try QUIC first; fall back to TCP+TLS if:
+    let forced_quic = config.forced_transport == Some(ForcedTransport::Quic);
+
+    // Try QUIC first (or QUIC only if forced); fall back to TCP+TLS in auto mode if:
     //   • UDP is blocked or the handshake times out, OR
-    //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter —
-    //     QUIC overhead outweighs its benefits at short distances).
+    //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter).
     let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref(), destination)?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
     let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
@@ -78,7 +97,8 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         Ok(Ok(conn)) => {
             let rtt = conn.stats().path.rtt;
             let threshold = config.tcp_rtt_threshold;
-            if threshold > Duration::ZERO && rtt <= threshold {
+            // RTT-based TCP switch only applies in auto mode.
+            if !forced_quic && threshold > Duration::ZERO && rtt <= threshold {
                 eprintln!(
                     "[mftp] RTT {:.2} ms (≤ {:.2} ms threshold) — switching to TCP+TLS for LAN throughput…",
                     rtt.as_secs_f64() * 1000.0,
@@ -91,10 +111,17 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
                 send_quic_with_conn(file, config, conn).await
             }
         }
+        Ok(Err(e)) if forced_quic => Err(e.context(
+            "QUIC connection failed (--transport quic; no TCP+TLS fallback)"
+        )),
         Ok(Err(e)) => {
             eprintln!("[mftp] QUIC connect failed ({e:#}), retrying over TCP+TLS…");
             send_tcp(file, destination, config).await
         }
+        Err(_) if forced_quic => bail!(
+            "QUIC connect timed out after {QUIC_CONNECT_TIMEOUT:.1?} — \
+             UDP may be blocked (--transport quic; no TCP+TLS fallback)"
+        ),
         Err(_timeout) => {
             eprintln!("[mftp] QUIC connect timed out (UDP may be blocked), retrying over TCP+TLS…");
             send_tcp(file, destination, config).await

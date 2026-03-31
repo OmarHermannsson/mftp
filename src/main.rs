@@ -3,6 +3,20 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use mftp::transfer::{receiver, sender};
+use mftp::transfer::sender::ForcedTransport;
+
+/// Transport path for `--transport`.
+#[derive(clap::ValueEnum, Clone)]
+enum Transport {
+    /// QUIC with BBR congestion control (default when omitted in auto mode).
+    /// Fails immediately if QUIC is unreachable — no TCP+TLS or SFTP fallback.
+    Quic,
+    /// TCP+TLS. Skip the QUIC probe. No SFTP fallback.
+    Tcp,
+    /// Parallel SFTP through SSH port 22 (SSH mode only, ~22 MiB/s cap).
+    /// Skips the remote mftp server launch entirely.
+    Sftp,
+}
 
 #[derive(Parser)]
 #[command(name = "mftp", about = "High-throughput file transfer over high-latency links", version)]
@@ -25,14 +39,26 @@ struct Cli {
     #[arg(long, global = true)]
     no_compress: bool,
 
-    /// Use TCP+TLS instead of QUIC (useful when UDP is blocked)
-    #[arg(long, global = true)]
+    /// Force a specific transport path.
+    ///
+    /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
+    ///
+    /// tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
+    ///
+    /// sftp — parallel SFTP through SSH port 22 (SSH mode only; ~22 MiB/s cap).
+    ///        Skips the remote mftp server launch — port 22 is all that's needed.
+    ///
+    /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
+    #[arg(long, global = true, value_name = "TRANSPORT")]
+    transport: Option<Transport>,
+
+    /// Force TCP+TLS transport (alias for --transport tcp)
+    #[arg(long, global = true, hide = true)]
     tcp: bool,
 
-    /// Switch to TCP+TLS when measured RTT is at or below this value (milliseconds).
-    /// Prevents BBR congestion control from underperforming on very-low-latency links
-    /// where kernel TCP's CUBIC outperforms QUIC BBR.
-    /// Set to 0 to always use QUIC regardless of RTT.
+    /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
+    /// Prevents BBR from underperforming on very-low-latency links where kernel TCP wins.
+    /// Ignored when --transport is set. Set to 0 to disable.
     #[arg(long, global = true, default_value = "5.0", value_name = "MS")]
     tcp_below_rtt: f64,
 
@@ -115,13 +141,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Send { file, destination, trust, remote_mftp, port } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
+            let forced_transport = match (cli.transport, cli.tcp) {
+                (Some(Transport::Quic), _) => Some(ForcedTransport::Quic),
+                (Some(Transport::Tcp), _) | (None, true) => Some(ForcedTransport::Tcp),
+                (Some(Transport::Sftp), _) => Some(ForcedTransport::Sftp),
+                (None, false) => None,
+            };
             let config = sender::SendConfig {
                 streams: cli.streams,
                 chunk_size: cli.chunk_size,
                 compress: !cli.no_compress,
                 compress_level: 3,
                 trusted_fingerprint: trust,
-                use_tcp: cli.tcp,
+                forced_transport,
                 tcp_rtt_threshold,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {

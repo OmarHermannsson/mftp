@@ -9,7 +9,7 @@ use std::path::Path;
 
 use mftp::transfer::{
     receiver::{Server, TcpServer},
-    sender::{self, SendConfig},
+    sender::{self, ForcedTransport, SendConfig},
 };
 use tempfile::TempDir;
 
@@ -56,7 +56,7 @@ async fn roundtrip(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
-            use_tcp: false,
+            forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
         },
     )
@@ -147,7 +147,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             compress: true,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
-            use_tcp: false,
+            forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
         },
     )
@@ -210,7 +210,7 @@ async fn roundtrip_tcp(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
-            use_tcp: true,
+            forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
         },
     )
