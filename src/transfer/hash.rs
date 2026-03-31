@@ -16,7 +16,7 @@
 //! let hash: [u8; 32] = Arc::try_unwrap(hasher).unwrap().finish()?;
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
@@ -42,7 +42,7 @@ struct Inner {
     next: u64,
     total: u64,
     /// Chunks that arrived before their turn.
-    pending: BTreeMap<u64, Vec<u8>>,
+    pending: HashMap<u64, Vec<u8>>,
 }
 
 impl ChunkHasher {
@@ -52,7 +52,7 @@ impl ChunkHasher {
                 hasher: Sha256::new(),
                 next: 0,
                 total: total_chunks,
-                pending: BTreeMap::new(),
+                pending: HashMap::new(),
             }),
         }
     }

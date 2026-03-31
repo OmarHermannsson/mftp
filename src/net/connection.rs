@@ -48,10 +48,15 @@ fn install_crypto_provider() {
 //   150 ms: 1.25 MiB / 0.15 s = 8.3 MiB/s per stream × 8 = 67 MiB/s max
 //   400 ms: 1.25 MiB / 0.40 s = 3.1 MiB/s per stream × 8 = 25 MiB/s max
 //
-// By setting per-stream and connection windows to 32 MiB (matching SO_RCVBUF),
-// we ensure QUIC flow control is never the bottleneck up to the socket-level limit.
-const STREAM_RECEIVE_WINDOW: u32 = super::SOCKET_BUFFER_SIZE as u32; // 32 MiB
-const SEND_WINDOW: u64 = (super::SOCKET_BUFFER_SIZE * 2) as u64;     // 64 MiB
+// Per-stream window is 32 MiB (matching SO_RCVBUF) so each stream is never
+// flow-control limited.  The connection-level window must be larger: it caps
+// the *total* in-flight bytes across all streams.  Setting it equal to the
+// per-stream window (the prior bug) meant at most one stream could have a
+// full window at a time, capping aggregate throughput to ~320 MiB/s at 100ms
+// even with 16 streams.  256 MiB covers 8 streams × 32 MiB each.
+const STREAM_RECEIVE_WINDOW: u32 = super::SOCKET_BUFFER_SIZE as u32; // 32 MiB per stream
+const CONNECTION_RECEIVE_WINDOW: u32 = 8 * super::SOCKET_BUFFER_SIZE as u32; // 256 MiB total
+const SEND_WINDOW: u64 = 8 * super::SOCKET_BUFFER_SIZE as u64;               // 256 MiB
 
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
@@ -61,9 +66,9 @@ fn transport_base() -> quinn::TransportConfig {
     // sawtooth throughput pattern that CUBIC exhibits at high latency and makes
     // better use of the pipe on satellite / intercontinental links.
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
-    // Flow control windows to match socket buffer so QUIC never self-throttles.
+    // Per-stream and connection-level flow control windows.
     t.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
-    t.receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+    t.receive_window(quinn::VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
     t.send_window(SEND_WINDOW);
     t
 }

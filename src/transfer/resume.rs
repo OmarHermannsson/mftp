@@ -17,6 +17,12 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// Number of chunks to accumulate before flushing the resume file to disk.
+///
+/// Batching reduces fsync frequency (and mutex hold time under fsync) by this
+/// factor.  On crash the receiver re-downloads at most this many extra chunks.
+pub const RESUME_SAVE_BATCH: u64 = 64;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +42,34 @@ pub struct ResumeState {
     /// Bit-vector: bit i is set iff chunk i has been received and verified.
     received: Vec<u64>,
     total_chunks: u64,
+    /// Chunks marked since last save; used for batching.
+    dirty: u64,
+}
+
+/// A point-in-time snapshot of the resume state ready for out-of-lock I/O.
+///
+/// Obtain via [`ResumeState::snapshot`], then call [`ResumeSnapshot::write_to_disk`]
+/// *outside* any mutex so the slow fsync does not block other stream workers.
+pub struct ResumeSnapshot {
+    path: PathBuf,
+    /// RESUME_MAGIC prepended, then bincode payload — ready to write verbatim.
+    payload: Vec<u8>,
+}
+
+impl ResumeSnapshot {
+    /// Atomically persist the snapshot: write to `<path>.tmp`, fsync, rename.
+    pub fn write_to_disk(&self) -> Result<()> {
+        let tmp = self.path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(&self.payload).context("write resume snapshot")?;
+            f.sync_data().context("fsync resume snapshot")?;
+        }
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename resume file to {}", self.path.display()))?;
+        Ok(())
+    }
 }
 
 impl ResumeState {
@@ -46,6 +80,7 @@ impl ResumeState {
             transfer_id: *transfer_id,
             received: vec![0u64; total_chunks.div_ceil(64) as usize],
             total_chunks,
+            dirty: 0,
         }
     }
 
@@ -106,7 +141,7 @@ impl ResumeState {
             );
         }
 
-        Ok(Self { path, transfer_id: *transfer_id, received: data.received, total_chunks })
+        Ok(Self { path, transfer_id: *transfer_id, received: data.received, total_chunks, dirty: 0 })
     }
 
     pub fn mark_received(&mut self, chunk_index: u64) {
@@ -148,29 +183,45 @@ impl ResumeState {
         self.received.clone()
     }
 
-    /// Persist the current state to disk atomically (write-then-rename).
+    /// Increment the dirty counter and return the new value.
     ///
-    /// Called after every `mark_received` so a crash loses at most the
-    /// in-progress chunk.  Designed to be called from `spawn_blocking`.
-    pub fn save(&self) -> Result<()> {
+    /// Callers compare the return value against `RESUME_SAVE_BATCH` to decide
+    /// whether to take a snapshot and persist.
+    pub fn incr_dirty(&mut self) -> u64 {
+        self.dirty += 1;
+        self.dirty
+    }
+
+    /// Reset the dirty counter after a successful save.
+    pub fn reset_dirty(&mut self) {
+        self.dirty = 0;
+    }
+
+    /// Serialize the current state into a [`ResumeSnapshot`].
+    ///
+    /// The snapshot contains a point-in-time copy of the bitvector and can be
+    /// written to disk outside the mutex — the slow fsync does not block other
+    /// stream workers while they mark their own chunks.
+    pub fn snapshot(&self) -> Result<ResumeSnapshot> {
         let data = ResumeData {
             transfer_id: self.transfer_id,
             total_chunks: self.total_chunks,
             received: self.received.clone(),
         };
-        let payload = bincode::serialize(&data).context("serialise resume state")?;
+        let bincode_payload = bincode::serialize(&data).context("serialise resume state")?;
+        let mut payload = Vec::with_capacity(RESUME_MAGIC.len() + bincode_payload.len());
+        payload.extend_from_slice(RESUME_MAGIC);
+        payload.extend_from_slice(&bincode_payload);
+        Ok(ResumeSnapshot { path: self.path.clone(), payload })
+    }
 
-        let tmp = self.path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(RESUME_MAGIC).context("write magic")?;
-            f.write_all(&payload).context("write payload")?;
-            f.sync_data().context("fsync")?;
-        }
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename resume file to {}", self.path.display()))?;
-        Ok(())
+    /// Persist the current state to disk atomically (write-then-rename).
+    ///
+    /// Prefer the `snapshot()` + `write_to_disk()` pattern in hot paths so
+    /// the fsync runs outside the mutex.  `save()` is retained for call sites
+    /// that already hold no lock or that are not performance-critical.
+    pub fn save(&self) -> Result<()> {
+        self.snapshot()?.write_to_disk()
     }
 
     /// Delete the resume file on successful completion.

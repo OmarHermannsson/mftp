@@ -29,7 +29,7 @@ use crate::protocol::{
     },
 };
 use crate::transfer::hash::ChunkHasher;
-use crate::transfer::resume::ResumeState;
+use crate::transfer::resume::{ResumeState, RESUME_SAVE_BATCH};
 
 pub struct ReceiveConfig {
     pub output_dir: PathBuf,
@@ -685,12 +685,19 @@ async fn recv_stream_worker<R>(
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    const MAX_IN_FLIGHT: usize = 4;
+    // Scale in-flight cap with available cores: each stream gets a share of the
+    // blocking threadpool for SHA-256 + decompress + pwrite.  Floor at 4 so the
+    // pipeline is always at least 4-deep; ceiling at 16 to bound memory usage.
+    let max_in_flight = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(4)
+        .min(16);
     let mut processing: JoinSet<Result<()>> = JoinSet::new();
     let mut chunk_count = 0u64;
 
     loop {
-        if processing.len() >= MAX_IN_FLIGHT {
+        if processing.len() >= max_in_flight {
             match processing.join_next().await {
                 Some(Ok(Ok(()))) => {}
                 Some(Ok(Err(e))) => return Err(e),
@@ -756,10 +763,22 @@ where
             pb.inc(n);
             // Non-blocking: progress updates are best-effort; never slow the data path.
             let _ = progress_tx.try_send(n);
-            {
+
+            // Mark under the lock (fast), then snapshot if the batch threshold
+            // is reached, releasing the lock *before* the slow fsync so other
+            // stream workers are not serialised waiting on disk I/O.
+            let snap = {
                 let mut r = resume.lock().unwrap();
                 r.mark_received(chunk_index);
-                r.save()?;
+                if r.incr_dirty() >= RESUME_SAVE_BATCH {
+                    r.reset_dirty();
+                    Some(r.snapshot()?)
+                } else {
+                    None
+                }
+            };
+            if let Some(snap) = snap {
+                snap.write_to_disk()?;
             }
             debug!(chunk = chunk_index, "received");
             Ok(())
