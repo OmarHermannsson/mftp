@@ -66,7 +66,7 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// RTT at or below which the sender switches to TCP+TLS even after a
 /// successful QUIC handshake.
-pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(1);
+pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(5);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     match &config.forced_transport {
