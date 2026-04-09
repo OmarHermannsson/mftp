@@ -558,11 +558,12 @@ fn feed_chunks(
     Ok(())
 }
 
-/// Receive pre-read raw chunks from the feeder, compress each one, and send
-/// over the given network stream.
+/// Receive pre-read raw chunks from the feeder, compress and hash each one,
+/// and send over the given network stream.
 ///
-/// Each chunk's compress+hash step runs in a blocking thread so CPU work and
-/// network I/O overlap across the N concurrent workers.
+/// The compress+hash step runs in a blocking thread (never the async executor)
+/// and is pipelined 1-ahead of the network send: while chunk N is being sent,
+/// chunk N+1 is already being compressed in a blocking thread.
 async fn send_from_channel<W>(
     writer: &mut W,
     mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
@@ -572,15 +573,36 @@ async fn send_from_channel<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some((chunk_index, raw)) = rx.recv().await {
-        let compression = compression.clone();
-        let (payload, compressed) = tokio::task::spawn_blocking(move || {
-            maybe_compress(raw, &compression)
-        })
-        .await
-        .context("compress task panicked")??;
+    // (chunk_index, payload, wire_hash, compressed)
+    type Ready = (u64, Vec<u8>, [u8; 32], bool);
 
-        let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+    let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, compression: Compression| {
+        tokio::task::spawn_blocking(move || -> Result<Ready> {
+            let (payload, compressed) = maybe_compress(raw, &compression)?;
+            // SHA-256 here in the blocking thread — never blocks the async executor.
+            let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+            Ok((chunk_index, payload, chunk_hash, compressed))
+        })
+    };
+
+    // Pre-start first chunk preparation before entering the send loop.
+    let mut pending: Option<tokio::task::JoinHandle<Result<Ready>>> = None;
+    if let Some((idx, raw)) = rx.recv().await {
+        pending = Some(spawn_prepare(idx, raw, compression.clone()));
+    }
+
+    while let Some(task) = pending.take() {
+        let (chunk_index, payload, chunk_hash, compressed) =
+            task.await.context("compress task panicked")??;
+
+        // Try to start the next preparation immediately so it runs concurrently
+        // with the network send below.  If the channel is empty right now (disk
+        // is the bottleneck), fall back to waiting after the send completes.
+        pending = match rx.try_recv() {
+            Ok((idx, raw)) => Some(spawn_prepare(idx, raw, compression.clone())),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        };
 
         framing::send_chunk_data(
             writer,
@@ -593,8 +615,15 @@ where
             },
         )
         .await?;
-
         debug!(chunk = chunk_index, "sent");
+
+        // If we couldn't start the next prepare before the send (channel was
+        // empty), wait for the next chunk now.
+        if pending.is_none() {
+            if let Some((idx, raw)) = rx.recv().await {
+                pending = Some(spawn_prepare(idx, raw, compression.clone()));
+            }
+        }
     }
 
     Ok(())
