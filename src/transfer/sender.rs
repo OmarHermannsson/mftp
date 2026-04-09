@@ -64,9 +64,10 @@ pub struct SendConfig {
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
 const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// RTT at or below which the sender switches to TCP+TLS even after a
-/// successful QUIC handshake.
-pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(5);
+/// RTT at or below which the sender auto-switches to TCP+TLS even after a
+/// successful QUIC handshake.  Zero = disabled (QUIC+BBR now wins at all RTTs
+/// including LAN; the 5 ms default was set before the LAN regression was fixed).
+pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::ZERO;
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     match &config.forced_transport {
@@ -470,6 +471,18 @@ where
             .with_context(|| format!("open {}", file_path.display()))?,
     );
 
+    // Hint to the kernel that this file will be read sequentially so it
+    // aggressively prefetches pages into the page cache.  This matters most for
+    // spinning-disk sources where pread without read-ahead can degrade to random
+    // I/O speeds; on NVMe it's a no-op in practice.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+    }
+
     // Pipeline: the `pending` slot holds a prepare task for the *next* chunk
     // while we're sending the *current* one.
     let mut pending: Option<tokio::task::JoinHandle<Result<PreparedChunk>>> = None;
@@ -505,7 +518,7 @@ where
             pending = Some(tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression)));
         }
 
-        framing::send_message(
+        framing::send_chunk_data(
             writer,
             &ChunkData {
                 transfer_id,

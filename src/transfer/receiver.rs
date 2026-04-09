@@ -706,7 +706,7 @@ where
             }
         }
 
-        let chunk: ChunkData = match framing::recv_data_message(&mut stream)
+        let chunk: ChunkData = match framing::recv_chunk_data(&mut stream)
             .await
             .with_context(|| format!("recv chunk#{chunk_count}"))?
         {
