@@ -26,6 +26,7 @@ use crate::protocol::{
     },
 };
 use crate::transfer::chunk::{ChunkInfo, ChunkQueue};
+use crate::transfer::hash::ChunkHasher;
 use crate::transfer::negotiate::compute_params;
 
 /// Which transport path to use for the transfer.
@@ -168,7 +169,7 @@ async fn send_quic_with_conn(
         sender_cores,
         neg_resp.cpu_cores,
         &config,
-        move |queue, have, transfer_id, compression| {
+        move |queue, have, transfer_id, compression, hasher| {
             let conn = conn_for_workers.clone();
             let path = file_for_workers.clone();
             async move {
@@ -176,7 +177,7 @@ async fn send_quic_with_conn(
                     .open_uni()
                     .await
                     .context("open QUIC data stream")?;
-                quic_stream_worker(stream, queue, have, path, transfer_id, compression).await
+                quic_stream_worker(stream, queue, have, path, transfer_id, compression, hasher).await
             }
         },
     )
@@ -194,8 +195,9 @@ async fn quic_stream_worker(
     file_path: PathBuf,
     transfer_id: [u8; 16],
     compression: Compression,
+    hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()> {
-    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression).await?;
+    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression, hasher).await?;
     stream.finish()?;
     Ok(())
 }
@@ -240,14 +242,14 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         sender_cores,
         neg_resp.cpu_cores,
         &config,
-        move |queue, have, transfer_id, compression| {
+        move |queue, have, transfer_id, compression, hasher| {
             let fp = trusted_fp.clone();
             let path = file_for_workers.clone();
             async move {
                 let stream = connect_tls(destination, fp.as_deref())
                     .await
                     .context("open TCP data stream")?;
-                tcp_stream_worker(stream, queue, have, path, transfer_id, compression).await
+                tcp_stream_worker(stream, queue, have, path, transfer_id, compression, hasher).await
             }
         },
     )
@@ -262,9 +264,10 @@ async fn tcp_stream_worker(
     file_path: PathBuf,
     transfer_id: [u8; 16],
     compression: Compression,
+    hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression)
+    send_chunks(&mut stream, queue, skip, &file_path, transfer_id, &compression, hasher)
         .await
         .context("send_chunks")?;
     // Send TLS close_notify so the receiver sees a clean EOF.
@@ -302,7 +305,7 @@ async fn run_transfer<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(Arc<ChunkQueue>, Arc<HashSet<u64>>, [u8; 16], Compression) -> Fut,
+    F: Fn(Arc<ChunkQueue>, Arc<HashSet<u64>>, [u8; 16], Compression, Option<Arc<ChunkHasher>>) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let file_name = file
@@ -310,12 +313,6 @@ where
         .context("file has no name")?
         .to_string_lossy()
         .into_owned();
-
-    // Start hashing immediately — runs concurrently with everything below.
-    let hash_task = {
-        let path = file.to_owned();
-        tokio::task::spawn_blocking(move || hash_file_sync(&path))
-    };
 
     let transfer_id: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
 
@@ -375,6 +372,21 @@ where
     let remaining = total_chunks - skip_count;
     info!("{skip_count} chunks already at receiver, {remaining} to send");
 
+    // For a fresh transfer (no resume), hash the file inline as chunks are read —
+    // no second disk pass.  For a resume, we must hash skipped chunks too so we
+    // fall back to a full sequential read running concurrently with the transfer.
+    let file_hasher: Option<Arc<ChunkHasher>> = if have.is_empty() {
+        Some(Arc::new(ChunkHasher::new(total_chunks)))
+    } else {
+        None
+    };
+    let hash_task = if have.is_empty() {
+        None
+    } else {
+        let path = file.to_owned();
+        Some(tokio::task::spawn_blocking(move || hash_file_sync(&path)))
+    };
+
     let pb = make_progress_bar(&file_name, file_size);
     // Seed the bar with bytes the receiver already confirmed (resume).
     let resume_bytes: u64 = have.iter().map(|&i| {
@@ -411,7 +423,8 @@ where
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..actual_streams {
-        tasks.spawn(spawn_worker(queue.clone(), have.clone(), transfer_id, compression.clone()));
+        let hasher = file_hasher.clone();
+        tasks.spawn(spawn_worker(queue.clone(), have.clone(), transfer_id, compression.clone(), hasher));
     }
     while let Some(res) = tasks.join_next().await {
         res??;
@@ -419,8 +432,15 @@ where
 
     pb.set_message("verifying…");
 
-    // Send file hash — await the background task (almost certainly done by now).
-    let file_hash = hash_task.await.context("hash task panicked")??;
+    let file_hash: [u8; 32] = match file_hasher {
+        Some(h) => Arc::try_unwrap(h)
+            .expect("all stream workers have completed; no other Arc<ChunkHasher> references remain")
+            .finish()?,
+        None => hash_task
+            .expect("resume path always spawns hash_task")
+            .await
+            .context("hash task panicked")??,
+    };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // The reader task keeps consuming Progress messages until Complete arrives.
@@ -448,11 +468,11 @@ struct PreparedChunk {
 /// Used by both the QUIC and TCP stream workers so the chunk-sending logic
 /// lives in exactly one place.
 ///
-/// The pipeline keeps one chunk being prepared on a blocking thread while the
-/// previous chunk is being sent over the wire.  This overlaps CPU work
-/// (pread + compression probe + SHA-256) with network I/O so neither stalls
-/// the other.  It also moves the blocking syscalls off the tokio executor,
-/// keeping the event loop free for QUIC ACK processing and stream management.
+/// The pipeline keeps `PIPELINE_DEPTH` chunks being prepared on blocking threads
+/// while earlier chunks are being sent over the wire.  This overlaps CPU/disk work
+/// (pread + compression probe + SHA-256) with network I/O so neither stalls the
+/// other, and ensures the disk I/O queue stays full even if one read takes longer
+/// than average (e.g. a slow NVMe slot on a busy system).
 async fn send_chunks<W>(
     writer: &mut W,
     queue: Arc<ChunkQueue>,
@@ -460,21 +480,26 @@ async fn send_chunks<W>(
     file_path: &Path,
     transfer_id: [u8; 16],
     compression: &Compression,
+    hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    // Shared file handle — each stream worker opens its own, so no cross-task
-    // locking.  Arc lets us move it into spawn_blocking without cloning.
+    // Depth-2 pipeline: always have the next chunk being read from disk while
+    // the current one is being sent.  A single slot (depth 1) means the stream
+    // stalls briefly between chunks when disk latency > network time-per-chunk;
+    // depth 2 covers that gap without buffering excessive data in memory.
+    const PIPELINE_DEPTH: usize = 2;
+
+    // Each stream worker opens its own file handle so there is no cross-task
+    // locking.  Arc lets us move it into spawn_blocking without cloning the File.
     let file = Arc::new(
         std::fs::File::open(file_path)
             .with_context(|| format!("open {}", file_path.display()))?,
     );
 
     // Hint to the kernel that this file will be read sequentially so it
-    // aggressively prefetches pages into the page cache.  This matters most for
-    // spinning-disk sources where pread without read-ahead can degrade to random
-    // I/O speeds; on NVMe it's a no-op in practice.
+    // aggressively prefetches pages into the page cache.
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -482,10 +507,6 @@ where
             libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
         }
     }
-
-    // Pipeline: the `pending` slot holds a prepare task for the *next* chunk
-    // while we're sending the *current* one.
-    let mut pending: Option<tokio::task::JoinHandle<Result<PreparedChunk>>> = None;
 
     // Advance the queue, skipping already-received chunks, and return the
     // next chunk that actually needs to be sent.
@@ -498,24 +519,34 @@ where
         }
     };
 
-    // Kick off preparation of the very first chunk.
-    if let Some(chunk) = next_sendable(&queue, &skip) {
+    // Spawn a blocking prepare task for one chunk.
+    let spawn_prepare = |chunk: ChunkInfo| {
         let file = Arc::clone(&file);
         let compression = compression.clone();
-        pending = Some(tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression)));
+        let h = hasher.clone();
+        tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression, h.as_deref()))
+    };
+
+    let mut pipeline: std::collections::VecDeque<
+        tokio::task::JoinHandle<Result<PreparedChunk>>,
+    > = std::collections::VecDeque::new();
+
+    // Pre-fill the pipeline before the send loop begins.
+    while pipeline.len() < PIPELINE_DEPTH {
+        match next_sendable(&queue, &skip) {
+            Some(chunk) => pipeline.push_back(spawn_prepare(chunk)),
+            None => break,
+        }
     }
 
-    while let Some(prepare_task) = pending.take() {
-        // Collect the prepared chunk (may already be done; .await yields
-        // control to let the executor process ACKs if it isn't).
+    while let Some(prepare_task) = pipeline.pop_front() {
+        // Await the oldest prepared chunk (.await yields control so the executor
+        // can process QUIC ACKs while the disk read is in progress).
         let prepared = prepare_task.await.context("prepare task panicked")??;
 
-        // While we're serializing and sending over the network, kick off
-        // preparation of the next chunk in a blocking thread.
+        // Keep the pipeline full while we send this chunk over the wire.
         if let Some(chunk) = next_sendable(&queue, &skip) {
-            let file = Arc::clone(&file);
-            let compression = compression.clone();
-            pending = Some(tokio::task::spawn_blocking(move || prepare_chunk(chunk, file, &compression)));
+            pipeline.push_back(spawn_prepare(chunk));
         }
 
         framing::send_chunk_data(
@@ -542,8 +573,15 @@ fn prepare_chunk(
     chunk: ChunkInfo,
     file: Arc<std::fs::File>,
     compression: &Compression,
+    hasher: Option<&ChunkHasher>,
 ) -> Result<PreparedChunk> {
     let raw = read_chunk(&file, &chunk)?;
+    // Feed raw (pre-compression) bytes into the full-file hasher while they are
+    // already in memory.  This eliminates the separate hash_file_sync disk pass
+    // that would otherwise compete with the chunk workers for I/O bandwidth.
+    if let Some(h) = hasher {
+        h.feed(chunk.index, &raw)?;
+    }
     let (payload, compressed) = maybe_compress(raw, compression)?;
     let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
     Ok(PreparedChunk { index: chunk.index, payload, chunk_hash, compressed })

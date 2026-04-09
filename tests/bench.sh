@@ -74,11 +74,19 @@ remote_clean() {
     ssh "$REMOTE" "rm -f $REMOTE_DIR/test_*.bin $REMOTE_DIR/*.mftp-resume" 2>/dev/null || true
 }
 
+# Drop the sender's page cache so reads go to disk, not RAM.
+# This makes results reflect real throughput for files larger than RAM.
+# Requires sudo; fails silently if unavailable (results will be cache-warm).
+drop_caches() {
+    sudo sh -c "sync; echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+}
+
 # Run mftp and return throughput in MiB/s (parsed from "X MiB/s end-to-end").
 # Usage: mftp_throughput <file> [extra mftp args...]
 mftp_throughput() {
     local file=$1; shift
     remote_clean
+    drop_caches
     local output
     # --remote-mftp skips binary copy; --trust skips TOFU prompt
     output=$("$MFTP" send "$@" \
@@ -93,6 +101,7 @@ mftp_throughput() {
 scp_throughput() {
     local file=$1
     remote_clean
+    drop_caches
     local start end elapsed mbs
     start=$(date +%s%3N)
     scp -q "$file" "$REMOTE:$REMOTE_DIR/" 2>/dev/null || true
