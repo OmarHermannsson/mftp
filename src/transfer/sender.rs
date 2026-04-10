@@ -375,7 +375,7 @@ where
         None
     } else {
         let path = file.to_owned();
-        Some(tokio::task::spawn_blocking(move || hash_file_sync(&path)))
+        Some(tokio::task::spawn_blocking(move || hash_file_sync(&path, chunk_size)))
     };
 
     let pb = make_progress_bar(&file_name, file_size);
@@ -578,13 +578,14 @@ where
         // Cheap Arc clone — one per chunk, just increments a reference count.
         let hasher = file_hasher.clone();
         tokio::task::spawn_blocking(move || -> Result<Ready> {
-            // Feed the file hasher with raw bytes before compression.
-            // ChunkHasher handles out-of-order chunks internally.
-            if let Some(h) = hasher { h.feed(chunk_index, &raw)?; }
+            // Hash raw bytes once — this single hash serves two purposes:
+            //   1. Wire integrity (chunk_hash field in ChunkData)
+            //   2. File integrity (fed into ChunkHasher for end-to-end verification)
+            // Previously we hashed raw for file integrity AND payload for wire, doing
+            // BLAKE3 twice on the same data for incompressible inputs (~40% CPU waste).
+            let chunk_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
+            if let Some(h) = hasher { h.feed(chunk_index, chunk_hash)?; }
             let (payload, compressed) = maybe_compress(raw, &compression)?;
-            // BLAKE3 in the blocking thread — never stalls the async executor.
-            // BLAKE3 is ~3–8× faster than SHA-256 (much more on hardware without SHA-NI).
-            let chunk_hash: [u8; 32] = *blake3::hash(&payload).as_bytes();
             Ok((chunk_index, payload, chunk_hash, compressed))
         })
     };
@@ -702,17 +703,23 @@ fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, 
     }
 }
 
-pub(crate) fn hash_file_sync(path: &Path) -> Result<[u8; 32]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB read buffer
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
+/// Compute the file hash using the same formula as the fresh-transfer path:
+///   `blake3(blake3(chunk_0) || blake3(chunk_1) || ... || blake3(chunk_N-1))`
+/// where chunks are `chunk_size` bytes (last chunk may be smaller).
+/// Used only on the resume path where some chunks are already at the receiver.
+pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let mut chunk_hashes: Vec<u8> = Vec::with_capacity(total_chunks as usize * 32);
+    let mut buf = vec![0u8; chunk_size];
+    for idx in 0..total_chunks {
+        let offset = idx * chunk_size as u64;
+        let len = (chunk_size as u64).min(file_size - offset) as usize;
+        file.read_exact_at(&mut buf[..len], offset)?;
+        let h = blake3::hash(&buf[..len]);
+        chunk_hashes.extend_from_slice(h.as_bytes());
     }
-    Ok(*hasher.finalize().as_bytes())
+    Ok(*blake3::hash(&chunk_hashes).as_bytes())
 }

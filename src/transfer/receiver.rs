@@ -738,16 +738,18 @@ where
         let progress_tx = progress_tx.clone();
 
         processing.spawn_blocking(move || -> Result<()> {
-            let computed: [u8; 32] = *blake3::hash(&chunk.payload).as_bytes();
-            if computed != chunk.chunk_hash {
-                bail!("chunk {chunk_index} hash mismatch");
-            }
-
+            // Decompress first: chunk_hash is blake3(raw_bytes) on the sender,
+            // so we must verify against the decompressed data, not the wire payload.
             let data = if chunk.compressed {
                 compress::decompress_chunk(&chunk.payload, chunk_size)?
             } else {
                 chunk.payload
             };
+
+            let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
+            if computed != chunk.chunk_hash {
+                bail!("chunk {chunk_index} hash mismatch");
+            }
 
             let offset = chunk_index * chunk_size as u64;
             {
@@ -757,7 +759,9 @@ where
                     .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
             }
 
-            hasher.feed(chunk_index, &data)?;
+            // Feed the already-verified hash (not the raw bytes) — ChunkHasher
+            // collects per-chunk hashes and combines them, no second BLAKE3 pass.
+            hasher.feed(chunk_index, chunk.chunk_hash)?;
             let n = data.len() as u64;
             pb.inc(n);
             // Non-blocking: progress updates are best-effort; never slow the data path.
