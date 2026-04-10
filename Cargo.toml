@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.46"
+version = "0.1.47"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -72,7 +72,6 @@ sha1 = "0.10"
 # Misc
 bytes = "1"
 futures = "0.3"
-uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
 [dev-dependencies]

@@ -491,7 +491,9 @@ struct PreparedTransfer {
     out_file: Arc<std::fs::File>,
     resume: Arc<Mutex<ResumeState>>,
     pb: Arc<ProgressBar>,
-    hasher: Arc<ChunkHasher>,
+    /// `Some` on a fresh transfer (hashes collected inline); `None` on resume
+    /// (the full file is re-hashed from disk in `finish_transfer` instead).
+    hasher: Option<Arc<ChunkHasher>>,
     bytes_already_received: u64,
     /// Packed bitvector of already-received chunks; sent in ReceiverMessage::Ready.
     received_bits: Vec<u64>,
@@ -555,7 +557,14 @@ fn prepare_transfer(
         pb
     });
 
-    let hasher = Arc::new(ChunkHasher::new(manifest.total_chunks));
+    // On a fresh transfer, collect per-chunk hashes inline (no extra disk pass).
+    // On resume, some chunks are already on disk and will never be fed to the
+    // hasher, so we skip inline collection and do a full-file hash at the end.
+    let hasher = if bytes_already_received == 0 {
+        Some(Arc::new(ChunkHasher::new(manifest.total_chunks)))
+    } else {
+        None
+    };
 
     Ok(PreparedTransfer { out_file, resume, pb, hasher, bytes_already_received, received_bits })
 }
@@ -638,7 +647,7 @@ async fn finish_transfer<S, R>(
     ctrl_send: &mut S,
     ctrl_recv: &mut R,
     resume: Arc<Mutex<ResumeState>>,
-    hasher: Arc<ChunkHasher>,
+    hasher: Option<Arc<ChunkHasher>>,
     output_dir: &std::path::Path,
     manifest: &TransferManifest,
 ) -> Result<()>
@@ -646,15 +655,31 @@ where
     S: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncRead + Unpin,
 {
-    let file_hash = Arc::try_unwrap(hasher)
-        .expect("all stream tasks finished so no other Arc references exist")
-        .finish()?;
+    let file_hash: [u8; 32] = match hasher {
+        Some(h) => Arc::try_unwrap(h)
+            .expect("all stream tasks finished so no other Arc references exist")
+            .finish()?,
+        None => {
+            // Resume path: some chunks were already on disk and never fed to a
+            // ChunkHasher, so hash the complete file from disk instead.
+            let path = output_dir.join(&manifest.file_name);
+            let chunk_size = manifest.chunk_size;
+            tokio::task::spawn_blocking(move || {
+                crate::transfer::hash::hash_file_sync(&path, chunk_size)
+            })
+            .await
+            .context("hash task panicked")??
+        }
+    };
 
     let expected_hash = match framing::recv_message_required(ctrl_recv).await? {
         SenderMessage::Complete { file_hash } => file_hash,
     };
 
     if file_hash != expected_hash {
+        // Delete the stale resume file so the next attempt starts fresh
+        // rather than re-using chunk data that may have come from a changed file.
+        let _ = resume.lock().unwrap().delete();
         framing::send_message(
             ctrl_send,
             &ReceiverMessage::Error { message: "file hash mismatch".into() },
@@ -678,7 +703,7 @@ async fn recv_stream_worker<R>(
     resume: Arc<Mutex<ResumeState>>,
     manifest: TransferManifest,
     pb: Arc<ProgressBar>,
-    hasher: Arc<ChunkHasher>,
+    hasher: Option<Arc<ChunkHasher>>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
 ) -> Result<()>
 where
@@ -732,7 +757,7 @@ where
         let chunk_index = chunk.chunk_index;
         let chunk_size = manifest.chunk_size;
         let out_file = Arc::clone(&out_file);
-        let hasher = Arc::clone(&hasher);
+        let hasher = hasher.as_ref().map(Arc::clone);
         let resume = Arc::clone(&resume);
         let pb = Arc::clone(&pb);
         let progress_tx = progress_tx.clone();
@@ -761,7 +786,10 @@ where
 
             // Feed the already-verified hash (not the raw bytes) — ChunkHasher
             // collects per-chunk hashes and combines them, no second BLAKE3 pass.
-            hasher.feed(chunk_index, chunk.chunk_hash)?;
+            // On resume, hasher is None and the full-file hash is done at the end.
+            if let Some(ref h) = hasher {
+                h.feed(chunk_index, chunk.chunk_hash)?;
+            }
             let n = data.len() as u64;
             pb.inc(n);
             // Non-blocking: progress updates are best-effort; never slow the data path.

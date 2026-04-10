@@ -24,6 +24,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
@@ -115,6 +116,28 @@ impl ChunkHasher {
         let buf: Vec<u8> = g.collected.iter().flat_map(|h| h.iter().copied()).collect();
         Ok(*blake3::hash(&buf).as_bytes())
     }
+}
+
+/// Compute the file hash using the same formula as the fresh-transfer path:
+///   `blake3(blake3(chunk_0) || blake3(chunk_1) || ... || blake3(chunk_N-1))`
+/// where chunks are `chunk_size` bytes (last chunk may be smaller).
+/// Used on the resume path where some chunks are already at the receiver,
+/// and by the sender when skipping already-received chunks.
+pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let mut chunk_hashes: Vec<u8> = Vec::with_capacity(total_chunks as usize * 32);
+    let mut buf = vec![0u8; chunk_size];
+    for idx in 0..total_chunks {
+        let offset = idx * chunk_size as u64;
+        let len = (chunk_size as u64).min(file_size - offset) as usize;
+        file.read_exact_at(&mut buf[..len], offset)?;
+        let h = blake3::hash(&buf[..len]);
+        chunk_hashes.extend_from_slice(h.as_bytes());
+    }
+    Ok(*blake3::hash(&chunk_hashes).as_bytes())
 }
 
 #[cfg(test)]

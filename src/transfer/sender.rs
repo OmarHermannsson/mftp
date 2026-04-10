@@ -24,7 +24,7 @@ use crate::protocol::{
         SenderMessage, TransferManifest,
     },
 };
-use crate::transfer::hash::ChunkHasher;
+use crate::transfer::hash::{hash_file_sync, ChunkHasher};
 use crate::transfer::negotiate::compute_params;
 
 /// Which transport path to use for the transfer.
@@ -305,8 +305,6 @@ where
         .to_string_lossy()
         .into_owned();
 
-    let transfer_id: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
-
     let compression = if config.compress {
         Compression::Zstd { level: config.compress_level }
     } else {
@@ -331,6 +329,20 @@ where
     );
 
     let chunk_size = params.chunk_size;
+
+    // Derive a deterministic transfer_id so that re-sending the same file
+    // (same name, size, and chunk_size) resumes an interrupted transfer.
+    // Including chunk_size ensures stale resume state from a prior negotiation
+    // with different parameters is never reused (different chunk boundaries).
+    let transfer_id: [u8; 16] = {
+        let mut h = blake3::Hasher::new();
+        h.update(file_name.as_bytes());
+        h.update(&file_size.to_le_bytes());
+        h.update(&(chunk_size as u64).to_le_bytes());
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        id
+    };
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     let num_streams = params.streams;
 
@@ -524,6 +536,9 @@ fn feed_chunks(
     let mut worker_i = 0usize;
 
     for idx in 0..total_chunks {
+        if skip.contains(&idx) {
+            continue;
+        }
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
 
@@ -531,16 +546,14 @@ fn feed_chunks(
         file.read_exact_at(&mut raw, offset)
             .with_context(|| format!("read chunk {idx}"))?;
 
-        if !skip.contains(&idx) {
-            // blocking_send provides backpressure: if this worker's channel is
-            // full the feeder waits here, naturally throttling disk reads to
-            // the network send rate.
-            if worker_txs[worker_i].blocking_send((idx, raw)).is_err() {
-                // Worker failed; all remaining workers will also fail.
-                break;
-            }
-            worker_i = (worker_i + 1) % n;
+        // blocking_send provides backpressure: if this worker's channel is
+        // full the feeder waits here, naturally throttling disk reads to
+        // the network send rate.
+        if worker_txs[worker_i].blocking_send((idx, raw)).is_err() {
+            // Worker failed; all remaining workers will also fail.
+            break;
         }
+        worker_i = (worker_i + 1) % n;
     }
 
     Ok(())
@@ -703,23 +716,3 @@ fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, 
     }
 }
 
-/// Compute the file hash using the same formula as the fresh-transfer path:
-///   `blake3(blake3(chunk_0) || blake3(chunk_1) || ... || blake3(chunk_N-1))`
-/// where chunks are `chunk_size` bytes (last chunk may be smaller).
-/// Used only on the resume path where some chunks are already at the receiver.
-pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
-    use std::os::unix::fs::FileExt;
-    let file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let total_chunks = file_size.div_ceil(chunk_size as u64);
-    let mut chunk_hashes: Vec<u8> = Vec::with_capacity(total_chunks as usize * 32);
-    let mut buf = vec![0u8; chunk_size];
-    for idx in 0..total_chunks {
-        let offset = idx * chunk_size as u64;
-        let len = (chunk_size as u64).min(file_size - offset) as usize;
-        file.read_exact_at(&mut buf[..len], offset)?;
-        let h = blake3::hash(&buf[..len]);
-        chunk_hashes.extend_from_slice(h.as_bytes());
-    }
-    Ok(*blake3::hash(&chunk_hashes).as_bytes())
-}
