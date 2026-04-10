@@ -57,10 +57,10 @@ struct Cli {
     tcp: bool,
 
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
-    /// Default 0 (disabled): QUIC+BBR outperforms TCP at all tested RTTs after the
-    /// LAN throughput fixes.  Set > 0 (e.g. --tcp-below-rtt 5) to re-enable the switch
-    /// if a specific network shows otherwise.  Ignored when --transport is set.
-    #[arg(long, global = true, default_value = "0", value_name = "MS")]
+    /// Default 5 ms: QUIC+BBR is slower than TCP+CUBIC on LAN due to slow congestion
+    /// window ramp-up.  Set 0 to always use QUIC, or higher to widen the TCP window.
+    /// Ignored when --transport is set.
+    #[arg(long, global = true, default_value = "5", value_name = "MS")]
     tcp_below_rtt: f64,
 
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)

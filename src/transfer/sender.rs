@@ -64,9 +64,9 @@ pub struct SendConfig {
 const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// RTT at or below which the sender auto-switches to TCP+TLS even after a
-/// successful QUIC handshake.  Zero = disabled (QUIC+BBR now wins at all RTTs
-/// including LAN; the 5 ms default was set before the LAN regression was fixed).
-pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::ZERO;
+/// successful QUIC handshake.  QUIC+BBR reaches full congestion window slowly
+/// on LAN, consistently underperforming TCP+CUBIC at sub-5 ms RTT.
+pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(5);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     match &config.forced_transport {
