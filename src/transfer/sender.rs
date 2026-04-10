@@ -166,14 +166,14 @@ async fn send_quic_with_conn(
         sender_cores,
         neg_resp.cpu_cores,
         &config,
-        move |rx, transfer_id, compression| {
+        move |rx, transfer_id, compression, file_hasher| {
             let conn = conn_for_workers.clone();
             async move {
                 let stream = conn
                     .open_uni()
                     .await
                     .context("open QUIC data stream")?;
-                quic_stream_worker(stream, rx, transfer_id, compression).await
+                quic_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
             }
         },
     )
@@ -189,8 +189,9 @@ async fn quic_stream_worker(
     rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: Compression,
+    file_hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()> {
-    send_from_channel(&mut stream, rx, transfer_id, &compression).await?;
+    send_from_channel(&mut stream, rx, transfer_id, &compression, file_hasher).await?;
     stream.finish()?;
     Ok(())
 }
@@ -234,13 +235,13 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         sender_cores,
         neg_resp.cpu_cores,
         &config,
-        move |rx, transfer_id, compression| {
+        move |rx, transfer_id, compression, file_hasher| {
             let fp = trusted_fp.clone();
             async move {
                 let stream = connect_tls(destination, fp.as_deref())
                     .await
                     .context("open TCP data stream")?;
-                tcp_stream_worker(stream, rx, transfer_id, compression).await
+                tcp_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
             }
         },
     )
@@ -253,9 +254,10 @@ async fn tcp_stream_worker(
     rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: Compression,
+    file_hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    send_from_channel(&mut stream, rx, transfer_id, &compression)
+    send_from_channel(&mut stream, rx, transfer_id, &compression, file_hasher)
         .await
         .context("send_from_channel")?;
     // Send TLS close_notify so the receiver sees a clean EOF.
@@ -294,7 +296,7 @@ async fn run_transfer<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>, [u8; 16], Compression) -> Fut,
+    F: Fn(tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>, [u8; 16], Compression, Option<Arc<ChunkHasher>>) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let file_name = file
@@ -422,7 +424,7 @@ where
     // Per-worker capacity: 2 chunks (one being compress+hashed, one queued).
     // With N workers the feeder may block on blocking_send when all channels are
     // full, providing natural backpressure to the disk read loop.
-    const WORKER_CHAN_DEPTH: usize = 2;
+    const WORKER_CHAN_DEPTH: usize = 4;
 
     let actual_streams = num_streams.min(remaining.max(1) as usize);
 
@@ -440,16 +442,18 @@ where
     let feeder = {
         let path = file.to_owned();
         let skip = have.clone();
-        let hasher = file_hasher.clone();
         tokio::task::spawn_blocking(move || {
-            feed_chunks(&path, file_size, chunk_size, &skip, hasher.as_deref(), worker_txs)
+            feed_chunks(&path, file_size, chunk_size, &skip, worker_txs)
         })
     };
 
-    // Spawn N stream workers.
+    // Spawn N stream workers.  Each worker gets an Arc clone of the file hasher
+    // (Some on fresh transfers, None on resumes) so it can hash its own chunks
+    // concurrently with the other workers in spawn_blocking — no feeder serialisation.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     for rx in worker_rxs {
-        tasks.spawn(spawn_worker(rx, transfer_id, compression.clone()));
+        let h = file_hasher.clone();
+        tasks.spawn(spawn_worker(rx, transfer_id, compression.clone(), h));
     }
     while let Some(res) = tasks.join_next().await {
         res??;
@@ -483,8 +487,7 @@ where
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 /// Read the source file sequentially and distribute non-skipped chunks
-/// round-robin to the per-worker channels.  Optionally hash every chunk
-/// (including skipped ones) for inline full-file SHA-256 computation.
+/// round-robin to the per-worker channels.
 ///
 /// Designed to run in [`tokio::task::spawn_blocking`].  Uses a single file
 /// handle with `POSIX_FADV_SEQUENTIAL` so the kernel maintains one large
@@ -501,7 +504,6 @@ fn feed_chunks(
     file_size: u64,
     chunk_size: usize,
     skip: &HashSet<u64>,
-    hasher: Option<&ChunkHasher>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt;
@@ -529,10 +531,6 @@ fn feed_chunks(
         file.read_exact_at(&mut raw, offset)
             .with_context(|| format!("read chunk {idx}"))?;
 
-        if let Some(h) = hasher {
-            h.feed(idx, &raw)?;
-        }
-
         if !skip.contains(&idx) {
             // blocking_send provides backpressure: if this worker's channel is
             // full the feeder waits here, naturally throttling disk reads to
@@ -551,7 +549,7 @@ fn feed_chunks(
 /// Receive pre-read raw chunks from the feeder, compress and hash each one,
 /// and send over the given network stream.
 ///
-/// Compress+SHA-256 runs in a blocking thread so it never stalls the async
+/// Compress+BLAKE3 runs in a blocking thread so it never stalls the async
 /// executor (which would delay QUIC ACK processing and hurt BBR at high RTT).
 ///
 /// Pipeline: after spawning the compress+hash task for chunk N we immediately
@@ -559,11 +557,16 @@ fn feed_chunks(
 /// blocking threads run concurrently.  When we then call `send(N).await`, the
 /// blocking thread for N+1 has already been running for the full send duration,
 /// so `task(N+1).await` usually returns immediately after the send completes.
+///
+/// `file_hasher` is `Some` on fresh transfers; each worker feeds its chunks
+/// into the shared hasher from inside `spawn_blocking`, distributing the
+/// hashing work across N threads instead of serialising it on the feeder.
 async fn send_from_channel<W>(
     writer: &mut W,
     mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: &Compression,
+    file_hasher: Option<Arc<ChunkHasher>>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -572,7 +575,12 @@ where
     type Ready = (u64, Vec<u8>, [u8; 32], bool);
 
     let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, compression: Compression| {
+        // Cheap Arc clone — one per chunk, just increments a reference count.
+        let hasher = file_hasher.clone();
         tokio::task::spawn_blocking(move || -> Result<Ready> {
+            // Feed the file hasher with raw bytes before compression.
+            // ChunkHasher handles out-of-order chunks internally.
+            if let Some(h) = hasher { h.feed(chunk_index, &raw)?; }
             let (payload, compressed) = maybe_compress(raw, &compression)?;
             // BLAKE3 in the blocking thread — never stalls the async executor.
             // BLAKE3 is ~3–8× faster than SHA-256 (much more on hardware without SHA-NI).
