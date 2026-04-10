@@ -22,7 +22,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
 | **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
-| **End-to-end integrity** | SHA-256 per chunk (wire payload) + full-file hash verified on arrival |
+| **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
@@ -32,6 +32,12 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 ## Quick start
 
 ### Install
+
+```sh
+cargo install mftp
+```
+
+Or from git:
 
 ```sh
 cargo install --git https://github.com/OmarHermannsson/mftp
@@ -134,7 +140,7 @@ Options:
 ### `mftp --version`
 
 ```
-mftp 0.1.27
+mftp 0.1.47
 ```
 
 ---
@@ -212,9 +218,9 @@ File on disk
         └─► N parallel tasks, one per QUIC/TCP stream:
               ├─ read chunk from file (pread)
               ├─ detect already-compressed format (magic bytes)
+              ├─ BLAKE3 hash of raw chunk bytes
               ├─ zstd compress full chunk; discard if < 5% gain
-              ├─ SHA-256 hash of wire payload
-              └─ send ChunkData frame
+              └─ send ChunkData frame (hash + compressed-or-raw payload)
 
 Control stream (after all data streams finish):
   Sender ──► SenderMessage::Complete { file_hash }
@@ -255,13 +261,15 @@ Note that this always pays the compression CPU cost before deciding whether to u
 
 ### Integrity
 
-- **Per-chunk**: SHA-256 of the wire payload (post-compression). The receiver rejects any chunk whose hash doesn't match before writing it to disk.
-- **Full-file**: SHA-256 of the original file bytes, computed by the sender in a background thread. After all chunks are written and decompressed, the receiver computes the same hash from its received data and compares. A mismatch fails the transfer.
+- **Per-chunk**: BLAKE3 of the raw (pre-compression) chunk bytes. The sender computes the hash before compressing, embeds it in the `ChunkData` frame, and the receiver decompresses then re-computes and compares before writing to disk.
+- **Full-file**: BLAKE3 of the concatenated per-chunk hashes — `blake3(hash[0] || hash[1] || … || hash[N-1])`. The sender sends this in `SenderMessage::Complete`; the receiver verifies it after all chunks land. A mismatch fails the transfer.
 - **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver process.
 
 ### Resume
 
-Each transfer has a UUID that the sender embeds in every `ChunkData` frame. On the receiver side, a bit-vector tracking which chunks have been received is flushed to `<output_dir>/<transfer_id>.mftp-resume` in batches (every 64 chunks) to limit fsync overhead. If the transfer is interrupted, at most 64 chunks may need re-downloading on resume.
+Each transfer has a deterministic 16-byte ID derived from the file name, file size, and negotiated chunk size (`BLAKE3(name || size || chunk_size)[..16]`). This means re-sending the same file automatically resumes an interrupted transfer — no flags needed. If the negotiation produces different parameters (e.g. different RTT), the ID changes and a fresh transfer starts. The ID is embedded in every `ChunkData` frame.
+
+On the receiver side, a bit-vector tracking which chunks have been received is flushed to `<output_dir>/<transfer_id_hex>.mftp-resume` in batches (every 64 chunks) to limit fsync overhead. If the transfer is interrupted, at most 64 chunks may need re-downloading on resume.
 
 If the transfer is interrupted:
 

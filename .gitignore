@@ -10,3 +10,14 @@
 
 # Environment / secrets
 .env
+
+# perf profiling output
+perf.data
+perf.data.old
+*.data.old
+
+# Benchmark results (local only)
+tests/results/
+
+# Claude Code
+.claudeignore

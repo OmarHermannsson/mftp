@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -9,6 +9,7 @@ homepage = "https://github.com/OmarHermannsson/mftp"
 documentation = "https://github.com/OmarHermannsson/mftp#readme"
 keywords = ["file-transfer", "quic", "network", "ssh", "transfer"]
 categories = ["command-line-utilities", "network-programming"]
+exclude = ["tests/results/", "*.data", "*.data.old", ".claudeignore", "CLAUDE.md"]
 
 [[bin]]
 name = "mftp"
