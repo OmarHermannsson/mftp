@@ -409,16 +409,20 @@ where
     // ── Single-reader feeder + N parallel workers ─────────────────────────────
     //
     // The feeder reads the source file sequentially in one blocking thread,
-    // matching scp's I/O pattern and achieving full sequential disk throughput.
-    // It dispatches raw (pre-compression) chunks to N workers via dedicated
-    // per-worker channels.  Workers compress and send in parallel, keeping all
-    // N network streams busy.  Backpressure flows naturally: slow workers fill
-    // their channels, the dispatcher pauses, the feeder's blocking_send blocks,
-    // and disk reads throttle to the network rate.
+    // matching scp's I/O pattern and achieving full sequential disk bandwidth.
+    // It distributes raw chunks round-robin to N per-worker channels via
+    // blocking_send.  Workers compress+hash and send in parallel.
     //
-    // Per-worker channel capacity: 2 chunks each (one compressing, one waiting).
-    // This gives the same depth-2 pipeline benefit as before without requiring
-    // multiple concurrent pread calls.
+    // There is NO async dispatcher layer.  Having the feeder (a true OS thread
+    // from tokio's blocking pool) write directly into worker channels means each
+    // worker's channel is pre-filled by the time the worker calls try_recv()
+    // in send_from_channel.  An async dispatcher would only run when the event
+    // loop yields, which is too late — the worker has already called try_recv
+    // and found an empty channel, breaking the compress/send pipeline.
+    //
+    // Per-worker capacity: 2 chunks (one being compress+hashed, one queued).
+    // With N workers the feeder may block on blocking_send when all channels are
+    // full, providing natural backpressure to the disk read loop.
     const WORKER_CHAN_DEPTH: usize = 2;
 
     let actual_streams = num_streams.min(remaining.max(1) as usize);
@@ -432,38 +436,16 @@ where
         worker_rxs.push(rx);
     }
 
-    // Feeder → dispatcher channel: wide enough to keep the feeder running
-    // ahead of the dispatcher so a momentary dispatch stall never idles the disk.
-    let (feed_tx, feed_rx) =
-        tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(actual_streams * WORKER_CHAN_DEPTH);
-
-    // Feeder: sequential file read + optional inline hash.  Runs in the
-    // blocking thread pool so it never blocks the async executor.
+    // Feeder: sequential file read + round-robin dispatch to worker channels.
+    // Runs entirely in a blocking thread — no async executor involved.
     let feeder = {
         let path = file.to_owned();
         let skip = have.clone();
         let hasher = file_hasher.clone();
         tokio::task::spawn_blocking(move || {
-            feed_chunks(&path, file_size, chunk_size, &skip, hasher.as_deref(), feed_tx)
+            feed_chunks(&path, file_size, chunk_size, &skip, hasher.as_deref(), worker_txs)
         })
     };
-
-    // Dispatcher: async, routes feed_rx → worker channels round-robin.
-    // Lightweight enough that a dedicated async task is appropriate.
-    let dispatcher = tokio::spawn({
-        let mut feed_rx = feed_rx;
-        async move {
-            let mut i = 0usize;
-            while let Some(item) = feed_rx.recv().await {
-                if worker_txs[i].send(item).await.is_err() {
-                    // A worker failed; feeder will also fail on next blocking_send.
-                    break;
-                }
-                i = (i + 1) % worker_txs.len();
-            }
-            // Dropping worker_txs closes all per-worker channels, signalling workers.
-        }
-    });
 
     // Spawn N stream workers.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
@@ -474,8 +456,7 @@ where
         res??;
     }
 
-    // Workers done; feeder and dispatcher should have finished by now.
-    dispatcher.await.ok();
+    // Workers done; feeder should have finished by now (all channels closed).
     feeder.await.context("feeder task panicked")??;
 
     pb.set_message("verifying…");
@@ -502,21 +483,27 @@ where
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Read the source file sequentially and feed non-skipped chunks to the
-/// dispatcher channel.  Optionally hash every chunk (including skipped ones)
-/// for inline full-file SHA-256 computation.
+/// Read the source file sequentially and distribute non-skipped chunks
+/// round-robin to the per-worker channels.  Optionally hash every chunk
+/// (including skipped ones) for inline full-file SHA-256 computation.
 ///
 /// Designed to run in [`tokio::task::spawn_blocking`].  Uses a single file
-/// handle with `POSIX_FADV_SEQUENTIAL` so the kernel can maintain one large
-/// read-ahead window and deliver data at full sequential disk bandwidth —
+/// handle with `POSIX_FADV_SEQUENTIAL` so the kernel maintains one large
+/// read-ahead window and delivers data at full sequential disk bandwidth —
 /// the same I/O pattern as `scp`.
+///
+/// Sending directly to per-worker channels (rather than through an async
+/// dispatcher) means the channels are pre-filled from an OS thread that runs
+/// truly in parallel with the async executor.  Workers can therefore call
+/// `try_recv` immediately and find a chunk waiting, enabling the
+/// compress/hash pipeline to overlap with network sends.
 fn feed_chunks(
     path: &Path,
     file_size: u64,
     chunk_size: usize,
     skip: &HashSet<u64>,
     hasher: Option<&ChunkHasher>,
-    tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
+    worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
@@ -532,6 +519,8 @@ fn feed_chunks(
     }
 
     let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let n = worker_txs.len();
+    let mut worker_i = 0usize;
 
     for idx in 0..total_chunks {
         let offset = idx * chunk_size as u64;
@@ -546,12 +535,14 @@ fn feed_chunks(
         }
 
         if !skip.contains(&idx) {
-            // blocking_send provides backpressure: if the dispatcher's channel
-            // is full (workers busy), this blocks the disk read naturally.
-            if tx.blocking_send((idx, raw)).is_err() {
-                // Dispatcher dropped (workers failed); stop reading.
+            // blocking_send provides backpressure: if this worker's channel is
+            // full the feeder waits here, naturally throttling disk reads to
+            // the network send rate.
+            if worker_txs[worker_i].blocking_send((idx, raw)).is_err() {
+                // Worker failed; all remaining workers will also fail.
                 break;
             }
+            worker_i = (worker_i + 1) % n;
         }
     }
 
@@ -561,9 +552,14 @@ fn feed_chunks(
 /// Receive pre-read raw chunks from the feeder, compress and hash each one,
 /// and send over the given network stream.
 ///
-/// The compress+hash step runs in a blocking thread (never the async executor)
-/// and is pipelined 1-ahead of the network send: while chunk N is being sent,
-/// chunk N+1 is already being compressed in a blocking thread.
+/// Compress+SHA-256 runs in a blocking thread so it never stalls the async
+/// executor (which would delay QUIC ACK processing and hurt BBR at high RTT).
+///
+/// Pipeline: after spawning the compress+hash task for chunk N we immediately
+/// try to pre-fetch chunk N+1 from the channel and spawn its task too.  Both
+/// blocking threads run concurrently.  When we then call `send(N).await`, the
+/// blocking thread for N+1 has already been running for the full send duration,
+/// so `task(N+1).await` usually returns immediately after the send completes.
 async fn send_from_channel<W>(
     writer: &mut W,
     mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
@@ -579,49 +575,48 @@ where
     let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, compression: Compression| {
         tokio::task::spawn_blocking(move || -> Result<Ready> {
             let (payload, compressed) = maybe_compress(raw, &compression)?;
-            // SHA-256 here in the blocking thread — never blocks the async executor.
+            // SHA-256 in the blocking thread — never stalls the async executor.
             let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
             Ok((chunk_index, payload, chunk_hash, compressed))
         })
     };
 
-    // Pre-start first chunk preparation before entering the send loop.
-    let mut pending: Option<tokio::task::JoinHandle<Result<Ready>>> = None;
-    if let Some((idx, raw)) = rx.recv().await {
-        pending = Some(spawn_prepare(idx, raw, compression.clone()));
-    }
+    while let Some((idx, raw)) = rx.recv().await {
+        let mut task = spawn_prepare(idx, raw, compression.clone());
 
-    while let Some(task) = pending.take() {
-        let (chunk_index, payload, chunk_hash, compressed) =
-            task.await.context("compress task panicked")??;
+        loop {
+            // Try to prefetch the next raw chunk and start its prepare task
+            // before awaiting the current one.  Because spawn_blocking runs on
+            // a separate thread pool, this prepare runs concurrently with both
+            // the current task.await and the subsequent send_chunk_data.await.
+            let next_task = rx
+                .try_recv()
+                .ok()
+                .map(|(ni, nr)| spawn_prepare(ni, nr, compression.clone()));
 
-        // Try to start the next preparation immediately so it runs concurrently
-        // with the network send below.  If the channel is empty right now (disk
-        // is the bottleneck), fall back to waiting after the send completes.
-        pending = match rx.try_recv() {
-            Ok((idx, raw)) => Some(spawn_prepare(idx, raw, compression.clone())),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
-        };
+            let (chunk_index, payload, chunk_hash, compressed) =
+                task.await.context("prepare task panicked")??;
 
-        framing::send_chunk_data(
-            writer,
-            &ChunkData {
-                transfer_id,
-                chunk_index,
-                chunk_hash,
-                compressed,
-                payload,
-            },
-        )
-        .await?;
-        debug!(chunk = chunk_index, "sent");
+            framing::send_chunk_data(
+                writer,
+                &ChunkData {
+                    transfer_id,
+                    chunk_index,
+                    chunk_hash,
+                    compressed,
+                    payload,
+                },
+            )
+            .await?;
+            debug!(chunk = chunk_index, "sent");
 
-        // If we couldn't start the next prepare before the send (channel was
-        // empty), wait for the next chunk now.
-        if pending.is_none() {
-            if let Some((idx, raw)) = rx.recv().await {
-                pending = Some(spawn_prepare(idx, raw, compression.clone()));
+            match next_task {
+                // next_task's blocking thread was running during task.await +
+                // send_chunk_data; it is likely done already.
+                Some(nt) => task = nt,
+                // Channel was empty at try_recv; break to the outer recv loop
+                // so we wait for the next chunk without spinning.
+                None => break,
             }
         }
     }
