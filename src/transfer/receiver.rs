@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -739,7 +738,7 @@ where
         let progress_tx = progress_tx.clone();
 
         processing.spawn_blocking(move || -> Result<()> {
-            let computed: [u8; 32] = Sha256::digest(&chunk.payload).into();
+            let computed: [u8; 32] = *blake3::hash(&chunk.payload).as_bytes();
             if computed != chunk.chunk_hash {
                 bail!("chunk {chunk_index} hash mismatch");
             }

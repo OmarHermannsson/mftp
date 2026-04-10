@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.38"
+version = "0.1.40"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -44,7 +44,8 @@ bincode = "1"
 zstd = "0.13"
 
 # Hashing / integrity
-sha2 = "0.10"
+blake3 = "1"
+sha2 = "0.10"   # kept for TLS cert fingerprints and SSH key display
 hex = "0.4"
 
 # Forward error correction

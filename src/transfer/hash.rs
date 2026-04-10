@@ -1,8 +1,8 @@
 //! Streaming in-order file hasher for the receiver.
 //!
-//! Chunks arrive out of order across N parallel streams.  SHA-256 requires
-//! sequential input, so we maintain a small buffer of ahead-of-time chunks
-//! and drain it into the hasher whenever the next expected chunk arrives.
+//! Chunks arrive out of order across N parallel streams.  BLAKE3 (like SHA-256)
+//! requires sequential input, so we maintain a small buffer of ahead-of-time
+//! chunks and drain it into the hasher whenever the next expected chunk arrives.
 //!
 //! With N streams, at most N-1 chunks are ever buffered simultaneously.
 //! For the default of 8 streams with 4 MiB chunks that is ≤28 MiB.
@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
-use sha2::{Digest, Sha256};
 
 /// Maximum number of out-of-order chunks held in the pending buffer.
 ///
@@ -37,7 +36,7 @@ pub struct ChunkHasher {
 
 #[derive(Debug)]
 struct Inner {
-    hasher: Sha256,
+    hasher: blake3::Hasher,
     /// Index of the next chunk we are waiting to feed into the hasher.
     next: u64,
     total: u64,
@@ -49,7 +48,7 @@ impl ChunkHasher {
     pub fn new(total_chunks: u64) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                hasher: Sha256::new(),
+                hasher: blake3::Hasher::new(),
                 next: 0,
                 total: total_chunks,
                 pending: HashMap::new(),
@@ -91,7 +90,7 @@ impl ChunkHasher {
         Ok(())
     }
 
-    /// Finalise and return the SHA-256 digest.
+    /// Finalise and return the BLAKE3 digest.
     ///
     /// Must be called after all `feed` calls are complete.
     /// Returns an error if not all chunks were fed.
@@ -105,7 +104,7 @@ impl ChunkHasher {
                 g.pending.len()
             );
         }
-        Ok(g.hasher.finalize().into())
+        Ok(*g.hasher.finalize().as_bytes())
     }
 }
 
@@ -114,9 +113,9 @@ mod tests {
     use super::*;
 
     fn hash_sequential(chunks: &[&[u8]]) -> [u8; 32] {
-        let mut h = Sha256::new();
+        let mut h = blake3::Hasher::new();
         for c in chunks { h.update(c); }
-        h.finalize().into()
+        *h.finalize().as_bytes()
     }
 
     #[test]

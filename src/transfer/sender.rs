@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
@@ -575,8 +574,9 @@ where
     let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, compression: Compression| {
         tokio::task::spawn_blocking(move || -> Result<Ready> {
             let (payload, compressed) = maybe_compress(raw, &compression)?;
-            // SHA-256 in the blocking thread — never stalls the async executor.
-            let chunk_hash: [u8; 32] = Sha256::digest(&payload).into();
+            // BLAKE3 in the blocking thread — never stalls the async executor.
+            // BLAKE3 is ~3–8× faster than SHA-256 (much more on hardware without SHA-NI).
+            let chunk_hash: [u8; 32] = *blake3::hash(&payload).as_bytes();
             Ok((chunk_index, payload, chunk_hash, compressed))
         })
     };
@@ -697,7 +697,7 @@ fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, 
 pub(crate) fn hash_file_sync(path: &Path) -> Result<[u8; 32]> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB read buffer
     loop {
         let n = file.read(&mut buf)?;
@@ -706,5 +706,5 @@ pub(crate) fn hash_file_sync(path: &Path) -> Result<[u8; 32]> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().into())
+    Ok(*hasher.finalize().as_bytes())
 }
