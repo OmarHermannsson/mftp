@@ -94,7 +94,7 @@ where
 
     let frame_body_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
     if frame_body_len > MAX_DATA_FRAME_SIZE as usize {
-        bail!("chunk data frame too large: {frame_body_len} bytes (limit {})", MAX_DATA_FRAME_SIZE);
+        bail!("chunk data frame too large: {frame_body_len} bytes (limit {MAX_DATA_FRAME_SIZE})");
     }
     if frame_body_len < CHUNK_HDR {
         bail!("chunk data frame too small: {frame_body_len} bytes");

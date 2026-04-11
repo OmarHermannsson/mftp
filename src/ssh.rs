@@ -207,10 +207,13 @@ fn spawn_remote_binary(
         Some(p) => format!(" --port {p}"),
         None => String::new(),
     };
+    // Use scp-like semantics: if the remote path is not an existing directory,
+    // treat it as a file destination and use its parent as the output dir.
+    // E.g. host:/data/file writes to /data/file (parent = /data, filename from manifest).
+    let quoted_dir = shell_quote(&dest.remote_path);
     let remote_cmd = format!(
-        "{} server --output-dir {}{}",
+        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {} server --output-dir \"$d\"{}",
         shell_quote(bin),
-        shell_quote(&dest.remote_path),
         port_arg,
     );
     // Pass the command as a single argument so SSH sends it verbatim to the
@@ -269,7 +272,9 @@ else
   cat > /dev/null
   printf '[mftp] using cached binary\n' >&2
 fi
-exec "$f" server --output-dir {quoted_dir}{port_arg}"#
+d={quoted_dir}
+if [ ! -d "$d" ]; then d=$(dirname "$d"); fi
+exec "$f" server --output-dir "$d"{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")

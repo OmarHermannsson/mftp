@@ -309,7 +309,7 @@ fn verify_host_key(sess: &Session, host: &str) -> Result<()> {
 fn host_field_matches_hashed(hostname: &str, field: &str) -> bool {
     // Expected format when split on '|': ["", "1", salt_b64, hmac_b64]
     let parts: Vec<&str> = field.splitn(4, '|').collect();
-    if parts.len() != 4 || parts[0] != "" || parts[1] != "1" {
+    if parts.len() != 4 || !parts[0].is_empty() || parts[1] != "1" {
         return false;
     }
     let salt = match STANDARD

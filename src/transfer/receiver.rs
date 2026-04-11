@@ -402,7 +402,19 @@ where
         "transfer started"
     );
 
-    let pt = prepare_transfer(&manifest, &output_dir)?;
+    let pt = match prepare_transfer(&manifest, &output_dir) {
+        Ok(pt) => pt,
+        Err(e) => {
+            // Send the error to the sender before closing so the sender shows
+            // the actual filesystem error instead of "connection lost".
+            let _ = framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Error { message: format!("{e:#}") },
+            )
+            .await;
+            return Err(e);
+        }
+    };
     framing::send_message(
         &mut ctrl_send,
         &ReceiverMessage::Ready {
