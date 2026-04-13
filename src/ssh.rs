@@ -22,9 +22,126 @@ use std::process::Stdio;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::transfer::sender::{ForcedTransport, SendConfig};
+
+// ── Platform detection ────────────────────────────────────────────────────────
+
+/// OS + CPU architecture of a host.
+#[derive(Debug, PartialEq, Eq)]
+struct RemotePlatform {
+    os: String,   // "linux" | "macos" | "windows" | …
+    arch: String, // "x86_64" | "aarch64" | …
+}
+
+/// Platform of the currently-running binary (from `std::env::consts`).
+fn local_platform() -> RemotePlatform {
+    RemotePlatform {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+    }
+}
+
+/// Returns `true` when `remote` can run a binary built for `local`.
+///
+/// On Windows, arch-level compat is assumed (WoW64 / emulation) so only the
+/// OS is checked.  On Linux/macOS, both OS and arch must match.
+fn platform_matches(local: &RemotePlatform, remote: &RemotePlatform) -> bool {
+    if local.os == "windows" || remote.os == "windows" {
+        local.os == remote.os
+    } else {
+        local.os == remote.os && local.arch == remote.arch
+    }
+}
+
+/// Parse `uname -sm` / `ver` output into a `RemotePlatform`.
+///
+/// Scans `output` line by line, returning the first recognisable match.
+/// Returns `None` if no line matches a known pattern.
+fn parse_remote_platform_output(output: &str) -> Option<RemotePlatform> {
+    for line in output.lines() {
+        let line = line.trim();
+
+        // Windows `ver`: "Microsoft Windows [Version 10.0.19041.1706]"
+        if line.to_ascii_lowercase().contains("microsoft windows")
+            || line.to_ascii_lowercase().starts_with("windows")
+        {
+            return Some(RemotePlatform {
+                os: "windows".to_owned(),
+                // Can't determine remote arch from `ver` alone; caller treats
+                // windows→windows as arch-compatible (WoW64).
+                arch: "x86_64".to_owned(),
+            });
+        }
+
+        // Unix `uname -sm`: "Linux x86_64", "Darwin arm64", etc.
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        if parts.len() == 2 {
+            let os = match parts[0] {
+                "Linux" => "linux",
+                "Darwin" => "macos",
+                "FreeBSD" | "OpenBSD" | "NetBSD" => parts[0],
+                _ => continue,
+            };
+            // macOS reports "arm64"; Rust's ARCH constant uses "aarch64".
+            let arch = match parts[1] {
+                "arm64" => "aarch64",
+                other => other,
+            };
+            return Some(RemotePlatform {
+                os: os.to_owned(),
+                arch: arch.to_owned(),
+            });
+        }
+    }
+    None
+}
+
+/// Probe the remote host's OS and CPU architecture over SSH.
+///
+/// Runs `uname -sm` (Unix) and `ver` (Windows cmd.exe) in a single command;
+/// one of them will produce recognisable output.  The whole probe is bounded
+/// by a 10-second timeout so a slow or custom shell cannot block the transfer.
+///
+/// Returns `Ok(None)` when the remote output cannot be parsed (caller treats
+/// this conservatively as a mismatch).
+async fn probe_remote_platform(dest: &SshDest) -> Result<Option<RemotePlatform>> {
+    // `uname -sm` on Unix; `ver` on Windows cmd.exe.  Both are run; one will
+    // produce noise, the other the expected string — the parser skips noise.
+    let mut child = tokio::process::Command::new("ssh")
+        .arg(&dest.user_host)
+        .arg("uname -sm 2>/dev/null; ver 2>NUL")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn ssh(1) for platform probe")?;
+
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let read_output = async {
+        let mut reader = BufReader::new(stdout);
+        let mut out = String::new();
+        reader
+            .read_to_string(&mut out)
+            .await
+            .context("reading platform probe output")?;
+        Ok::<String, anyhow::Error>(out)
+    };
+
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(10), read_output).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            let _ = child.kill().await;
+            tracing::debug!("platform probe timed out — treating remote as unknown");
+            return Ok(None);
+        }
+    };
+
+    let _ = child.wait().await;
+    Ok(parse_remote_platform_output(&output))
+}
 
 // ── Destination parsing ───────────────────────────────────────────────────────
 
@@ -123,9 +240,45 @@ pub async fn send_via_ssh(
         return crate::sftp::send_via_sftp(file, dest, n).await;
     }
 
+    // When no pre-installed binary is specified we pipe the local binary to the
+    // remote.  That only works if the remote runs the same OS and architecture;
+    // probe first so we fail clearly instead of hanging on a bad exec.
     let child = match remote_mftp {
         Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
-        None => pipe_self_to_remote(&dest, remote_port).await?,
+        None => {
+            let local = local_platform();
+            let remote_platform = probe_remote_platform(&dest).await?;
+            let compatible = remote_platform
+                .as_ref()
+                .map(|r| platform_matches(&local, r))
+                .unwrap_or(false);
+
+            if !compatible {
+                let remote_desc = remote_platform
+                    .as_ref()
+                    .map(|r| format!("{}/{}", r.os, r.arch))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let local_desc = format!("{}/{}", local.os, local.arch);
+
+                if config.forced_transport.is_some() {
+                    bail!(
+                        "remote platform ({remote_desc}) differs from local ({local_desc}); \
+                         cannot pipe the local binary to the remote. \
+                         Install mftp on the remote and pass --remote-mftp <path>, \
+                         or omit --transport to fall back to SFTP automatically."
+                    );
+                }
+
+                eprintln!(
+                    "[mftp] remote platform ({remote_desc}) differs from local ({local_desc}); \
+                     skipping binary push, falling back to SFTP…"
+                );
+                let n = config.streams.unwrap_or(8);
+                return crate::sftp::send_via_sftp(file, dest, n).await;
+            }
+
+            pipe_self_to_remote(&dest, remote_port).await?
+        }
     };
 
     // Wrap immediately so the process is killed on any early return.
@@ -258,6 +411,11 @@ async fn pipe_self_to_remote(
         hex::encode(&digest[..8])
     };
 
+    // Embed OS + arch in the cache name so that a shared remote receiving
+    // from clients of different platforms stores binaries separately.
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
     let quoted_dir = shell_quote(&dest.remote_path);
     let port_arg = match remote_port {
         Some(p) => format!(" --port {p}"),
@@ -265,13 +423,13 @@ async fn pipe_self_to_remote(
     };
 
     // Remote script:
-    //   • Derive a stable cache path from the binary's content hash.
+    //   • Derive a stable cache path from OS, arch, and binary content hash.
     //   • If the cached file does not exist: write stdin to it and chmod +x.
     //   • Otherwise: drain stdin (cat > /dev/null) so the pipe is clean.
     //   • Exec the cached binary as a one-shot server.
     let remote_cmd = format!(
         r#"set -e
-f="${{HOME:-/tmp}}/.cache/mftp-{hash}"
+f="${{HOME:-/tmp}}/.cache/mftp-{os}-{arch}-{hash}"
 if [ ! -x "$f" ]; then
   mkdir -p "$(dirname "$f")"
   cat > "$f"
@@ -331,7 +489,9 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::{
+        local_platform, parse_remote_platform_output, platform_matches, shell_quote, RemotePlatform,
+    };
 
     #[test]
     fn shell_quote_plain() {
@@ -346,5 +506,124 @@ mod tests {
     #[test]
     fn shell_quote_single_quote() {
         assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
+    }
+
+    #[test]
+    fn parse_remote_platform_linux() {
+        let p = parse_remote_platform_output("Linux x86_64\n").unwrap();
+        assert_eq!(p.os, "linux");
+        assert_eq!(p.arch, "x86_64");
+    }
+
+    #[test]
+    fn parse_remote_platform_linux_arm() {
+        let p = parse_remote_platform_output("Linux aarch64\n").unwrap();
+        assert_eq!(p.os, "linux");
+        assert_eq!(p.arch, "aarch64");
+    }
+
+    #[test]
+    fn parse_remote_platform_macos_intel() {
+        let p = parse_remote_platform_output("Darwin x86_64\n").unwrap();
+        assert_eq!(p.os, "macos");
+        assert_eq!(p.arch, "x86_64");
+    }
+
+    #[test]
+    fn parse_remote_platform_macos_arm() {
+        // macOS reports "arm64"; we normalise to Rust's "aarch64".
+        let p = parse_remote_platform_output("Darwin arm64\n").unwrap();
+        assert_eq!(p.os, "macos");
+        assert_eq!(p.arch, "aarch64");
+    }
+
+    #[test]
+    fn parse_remote_platform_windows_ver() {
+        let out = "Microsoft Windows [Version 10.0.19041.1706]\n";
+        let p = parse_remote_platform_output(out).unwrap();
+        assert_eq!(p.os, "windows");
+    }
+
+    #[test]
+    fn parse_remote_platform_windows_with_banner() {
+        // PowerShell / cmd.exe may print other lines before/after `ver`.
+        let out = "some banner line\r\nMicrosoft Windows [Version 11.0.22621.0]\r\n\r\n";
+        let p = parse_remote_platform_output(out).unwrap();
+        assert_eq!(p.os, "windows");
+    }
+
+    #[test]
+    fn parse_remote_platform_linux_with_preamble() {
+        // Shell startup files can print noise before uname output.
+        let out = "Welcome to my server!\nLinux x86_64\n";
+        let p = parse_remote_platform_output(out).unwrap();
+        assert_eq!(p.os, "linux");
+        assert_eq!(p.arch, "x86_64");
+    }
+
+    #[test]
+    fn parse_remote_platform_garbage() {
+        assert!(parse_remote_platform_output("nothing useful here\n").is_none());
+        assert!(parse_remote_platform_output("").is_none());
+    }
+
+    #[test]
+    fn local_platform_matches_env_consts() {
+        let p = local_platform();
+        assert_eq!(p.os, std::env::consts::OS);
+        assert_eq!(p.arch, std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn platform_matches_same() {
+        let a = RemotePlatform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let b = RemotePlatform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        assert!(platform_matches(&a, &b));
+    }
+
+    #[test]
+    fn platform_matches_os_mismatch() {
+        let local = RemotePlatform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let remote = RemotePlatform {
+            os: "macos".into(),
+            arch: "x86_64".into(),
+        };
+        assert!(!platform_matches(&local, &remote));
+    }
+
+    #[test]
+    fn platform_matches_arch_mismatch() {
+        let local = RemotePlatform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let remote = RemotePlatform {
+            os: "linux".into(),
+            arch: "aarch64".into(),
+        };
+        assert!(!platform_matches(&local, &remote));
+    }
+
+    #[test]
+    fn platform_matches_windows_ignores_arch() {
+        // Windows→Windows is compatible regardless of reported arch.
+        let local = RemotePlatform {
+            os: "windows".into(),
+            arch: "x86_64".into(),
+        };
+        let remote = RemotePlatform {
+            os: "windows".into(),
+            arch: "x86_64".into(),
+        };
+        assert!(platform_matches(&local, &remote));
     }
 }
