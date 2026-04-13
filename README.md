@@ -22,6 +22,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
 | **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
+| **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`) for lossy links; tolerates burst loss without retransmission |
 | **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
@@ -110,6 +111,11 @@ Options:
                            raise to 12 if the remote sshd allows it).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
+      --fec <DATA:PARITY>  Enable Reed-Solomon forward error correction.
+                           e.g. --fec 8:2 adds 20% overhead but tolerates up to 2
+                           lost chunks per stripe without retransmission.
+                           Automatically disabled when the transport falls back to
+                           TCP (reliable delivery).
       --transport <TRANSPORT>
                            Force a specific transport path:
                            quic — QUIC only; fails immediately if UDP is blocked
@@ -134,13 +140,14 @@ mftp receive [OPTIONS] [BIND]
 ```
 Options:
   -o, --output-dir <DIR>   Directory to write received files into (default: .).
-      --tcp                TCP+TLS only; don't open a QUIC endpoint.
+      --fec <DATA:PARITY>  Must match the sender's --fec value (passed automatically
+                           in SSH mode via the TransferManifest).
 ```
 
 ### `mftp --version`
 
 ```
-mftp 0.1.47
+mftp 0.1.54
 ```
 
 ---
@@ -170,6 +177,7 @@ When you write `mftp send file.bin user@host:/path`, the sender:
 
 1. SSHes to `user@host` and runs `mftp server --output-dir /path`
    - If mftp is not installed on the remote, the local binary is piped over SSH stdin and cached at `~/.cache/mftp-<hash>` — subsequent transfers with the same binary version skip the copy.
+   - The remote OS and architecture are probed first so the correct binary is delivered (Linux/macOS/Windows, x86_64/arm64).
    - Use `--port <N>` to have the remote server bind on a specific port instead of a random one (required when the transfer port must be in a firewall allow-list; without `--port`, the random port will almost certainly be blocked).
 2. The remote server binds on the chosen (or random) port and prints one JSON line to stdout:
    ```json
@@ -220,7 +228,8 @@ File on disk
               ├─ detect already-compressed format (magic bytes)
               ├─ BLAKE3 hash of raw chunk bytes
               ├─ zstd compress full chunk; discard if < 5% gain
-              └─ send ChunkData frame (hash + compressed-or-raw payload)
+              ├─ [FEC] accumulate DATA shards into stripe; RS-encode PARITY shards
+              └─ send ChunkData / FecChunkData frame (hash + payload)
 
 Control stream (after all data streams finish):
   Sender ──► SenderMessage::Complete { file_hash }
@@ -244,9 +253,25 @@ Control stream (1 per connection):
   Sender → SenderMessage::Complete  { file_hash }
   Receiver → ReceiverMessage::Complete { file_hash }
 
-Data streams (N per connection, one ChunkData per chunk):
-  Sender → ChunkData { transfer_id, chunk_index, chunk_hash, compressed, payload }
+Data streams (N per connection):
+  Without FEC — one ChunkData per chunk:
+    Sender → ChunkData { transfer_id, chunk_index, chunk_hash, compressed, payload }
+
+  With FEC — one FecChunkData per shard (data + parity):
+    Sender → FecChunkData { transfer_id, chunk_index, chunk_hash, compressed,
+                            stripe_index, shard_index_in_stripe, is_parity,
+                            shard_lengths, payload }
 ```
+
+### Reed-Solomon FEC
+
+Enable with `--fec DATA:PARITY` on the sender (e.g. `--fec 8:2`). The receiver accepts both FEC and non-FEC transfers on the same port — the `TransferManifest` advertises whether FEC is active.
+
+**Stripe layout**: chunks are grouped into stripes of `DATA` shards. Each stripe is RS-encoded to produce `PARITY` additional shards. All `DATA + PARITY` shards are sent independently across the parallel streams. The receiver can reconstruct any stripe as long as it receives at least `DATA` out of the `DATA + PARITY` shards — tolerating up to `PARITY` lost shards per stripe without retransmission.
+
+**Ordering**: compression happens before FEC encoding, so parity shards are computed over (and are the same size as) compressed data shards. FEC is automatically disabled when the transport falls back to TCP, since TCP guarantees delivery.
+
+**Overhead**: `--fec 8:2` adds 25% to the wire size (`2/8`). Use it when packet loss is high enough that retransmission round-trips would dominate transfer time (satellite, intercontinental, congested links).
 
 ### Compression
 
@@ -261,7 +286,7 @@ Note that this always pays the compression CPU cost before deciding whether to u
 
 ### Integrity
 
-- **Per-chunk**: BLAKE3 of the raw (pre-compression) chunk bytes. The sender computes the hash before compressing, embeds it in the `ChunkData` frame, and the receiver decompresses then re-computes and compares before writing to disk.
+- **Per-chunk**: BLAKE3 of the raw (pre-compression) chunk bytes. The sender computes the hash before compressing, embeds it in the frame, and the receiver decompresses then re-computes and compares before writing to disk.
 - **Full-file**: BLAKE3 of the concatenated per-chunk hashes — `blake3(hash[0] || hash[1] || … || hash[N-1])`. The sender sends this in `SenderMessage::Complete`; the receiver verifies it after all chunks land. A mismatch fails the transfer.
 - **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver process.
 
@@ -318,8 +343,6 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 - **Firewall**: the QUIC and TCP+TLS paths both require an open port on the receiver. In SSH mode a random port is used by default — likely to be blocked. Use `--port <N>` with a known-open port, or rely on the automatic SFTP fallback (port 22 only, but capped at ~22–32 MiB/s).
 - **TOFU fingerprint persistence**: `--trust` fingerprints are not stored between sessions. You must pass `--trust` on every non-interactive invocation, or accept the prompt each time.
 - **SFTP throughput ceiling**: ~3 MiB/s per stream due to synchronous SSH SFTP write acknowledgments (a protocol limitation, not an implementation one).
-- **Windows**: not supported. Linux and macOS only.
-- **FEC**: the Reed-Solomon FEC framework is in place but not yet exposed as a CLI flag.
 - **Single file**: recursive directory transfer is not yet supported.
 
 ---
@@ -327,6 +350,7 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 ## Performance tips
 
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
+- **Lossy links**: add `--fec 8:2` (or `--fec 4:1` for lighter overhead) to tolerate burst loss without retransmission. FEC shines on links where 1–5% packet loss is common.
 - **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms. No flags needed — just run the same command.
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips compression. No `--no-compress` needed.
 - **Open port required**: in SSH mode, use `--port <N>` with a firewall-allowed port to avoid the automatic fallback to SFTP. The SFTP path is reliable but slower.
@@ -345,7 +369,7 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 cargo build --release
 ```
 
-Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu).
+Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu). On Windows, OpenSSL is vendored automatically — no extra setup needed.
 
 ```sh
 # Check only (fast)
@@ -362,10 +386,8 @@ cargo clippy -- -D warnings
 
 ## Roadmap
 
-- **Reed-Solomon FEC** — parity shards for lossy links (e.g. satellite with burst loss); framework is in place
 - **Directory transfer** — recursive send with a single command
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
-- **Windows support** — currently Linux/macOS only
 
 ---
 
