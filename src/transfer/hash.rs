@@ -124,7 +124,6 @@ impl ChunkHasher {
 /// Used on the resume path where some chunks are already at the receiver,
 /// and by the sender when skipping already-received chunks.
 pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]> {
-    use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
     let total_chunks = file_size.div_ceil(chunk_size as u64);
@@ -133,7 +132,7 @@ pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]>
     for idx in 0..total_chunks {
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
-        file.read_exact_at(&mut buf[..len], offset)?;
+        crate::fs_ext::read_exact_at(&file, &mut buf[..len], offset)?;
         let h = blake3::hash(&buf[..len]);
         chunk_hashes.extend_from_slice(h.as_bytes());
     }

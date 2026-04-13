@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.50"
+version = "0.1.51"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -78,6 +78,10 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
+
+# On Windows, libssh2-sys can't find a system OpenSSL — vendor it from source.
+[target.'cfg(windows)'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3

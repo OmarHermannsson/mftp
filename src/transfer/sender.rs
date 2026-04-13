@@ -565,8 +565,6 @@ fn feed_chunks(
     skip: &HashSet<u64>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-
     let file = std::fs::File::open(path)
         .with_context(|| format!("open {}", path.display()))?;
 
@@ -590,7 +588,7 @@ fn feed_chunks(
         let len = (chunk_size as u64).min(file_size - offset) as usize;
 
         let mut raw = vec![0u8; len];
-        file.read_exact_at(&mut raw, offset)
+        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
             .with_context(|| format!("read chunk {idx}"))?;
 
         // blocking_send provides backpressure: if this worker's channel is
@@ -792,8 +790,6 @@ fn feed_chunks_single(
     chunk_size: usize,
     tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-
     let file = std::fs::File::open(path)
         .with_context(|| format!("open {}", path.display()))?;
 
@@ -810,7 +806,7 @@ fn feed_chunks_single(
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
         let mut raw = vec![0u8; len];
-        file.read_exact_at(&mut raw, offset)
+        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
             .with_context(|| format!("read chunk {idx}"))?;
         if tx.blocking_send((idx, raw)).is_err() {
             break; // encoder side dropped (failed) — feeder exits cleanly

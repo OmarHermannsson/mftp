@@ -468,8 +468,6 @@ fn write_fec_chunk(
     pb: &ProgressBar,
     progress_tx: &tokio::sync::mpsc::Sender<u64>,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt;
-
     let data = if compressed {
         compress::decompress_chunk(payload, chunk_size)
             .with_context(|| format!("decompress FEC chunk {chunk_index}"))?
@@ -485,8 +483,7 @@ fn write_fec_chunk(
     }
 
     let offset = chunk_index * chunk_size as u64;
-    out_file
-        .write_all_at(&data, offset)
+    crate::fs_ext::write_all_at(out_file, &data, offset)
         .with_context(|| format!("write FEC chunk {chunk_index} at offset {offset}"))?;
 
     if let Some(h) = hasher {
@@ -1072,12 +1069,8 @@ where
             }
 
             let offset = chunk_index * chunk_size as u64;
-            {
-                use std::os::unix::fs::FileExt;
-                out_file
-                    .write_all_at(&data, offset)
-                    .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
-            }
+            crate::fs_ext::write_all_at(&*out_file, &data, offset)
+                .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
 
             // Feed the already-verified hash (not the raw bytes) — ChunkHasher
             // collects per-chunk hashes and combines them, no second BLAKE3 pass.

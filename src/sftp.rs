@@ -18,7 +18,6 @@
 
 use std::io::{Seek, SeekFrom, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -161,8 +160,7 @@ fn sftp_worker(
 
     while done < len {
         let n = ((len - done) as usize).min(buf.len());
-        local_file
-            .read_exact_at(&mut buf[..n], offset + done)
+        crate::fs_ext::read_exact_at(&local_file, &mut buf[..n], offset + done)
             .context("pread local file")?;
         remote_file.write_all(&buf[..n]).context("SFTP write")?;
         done += n as u64;
