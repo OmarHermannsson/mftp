@@ -13,7 +13,7 @@
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocol::messages::ChunkData;
+use crate::protocol::messages::{ChunkData, FecChunkData};
 
 /// Hard cap for chunk data frames (one compressed chunk payload).
 const MAX_DATA_FRAME_SIZE: u32 = 128 * 1024 * 1024; // 128 MiB
@@ -120,6 +120,138 @@ where
         .context("read chunk data payload")?;
 
     Ok(Some(ChunkData { transfer_id, chunk_index, chunk_hash, compressed, payload }))
+}
+
+// ── FEC chunk-data framing ────────────────────────────────────────────────────
+
+/// Fixed-size fields before the variable shard-metadata block in a `FecChunkData` frame:
+///   transfer_id [16]  +  chunk_index u64 [8]  +  chunk_hash [32]
+///   +  compressed u8 [1]  +  stripe_index u32 [4]
+///   +  shard_index_in_stripe u16 [2]  +  is_parity u8 [1]
+///   +  shard_count u32 [4]
+///   = 68 bytes
+const FEC_FIXED_HDR: usize = 16 + 8 + 32 + 1 + 4 + 2 + 1 + 4;
+
+/// Send a `FecChunkData` frame without copying the payload through bincode.
+///
+/// Wire format:
+///   [u32 LE: frame_body_len]
+///   [68 bytes: fixed fields (see FEC_FIXED_HDR)]
+///   [shard_count × 4 bytes: shard_lengths as u32 LE]
+///   [shard_count bytes: shard_compressed flags]
+///   [8 bytes: payload_len u64 LE]
+///   [payload_len bytes: payload]
+pub async fn send_fec_chunk_data<W>(stream: &mut W, msg: &FecChunkData) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let shard_count = msg.shard_lengths.len() as u32;
+    let payload_len = msg.payload.len();
+    let frame_body_len = u32::try_from(FEC_FIXED_HDR + (shard_count as usize) * 5 + 8 + payload_len)
+        .context("FEC chunk data frame too large")?;
+
+    // Build frame prefix + fixed header + shard metadata into one contiguous buffer.
+    let var_hdr_len = (shard_count as usize) * 5; // 4 bytes per length + 1 byte per flag
+    let mut hdr = Vec::with_capacity(4 + FEC_FIXED_HDR + var_hdr_len + 8);
+    hdr.extend_from_slice(&frame_body_len.to_le_bytes());
+    hdr.extend_from_slice(&msg.transfer_id);
+    hdr.extend_from_slice(&msg.chunk_index.to_le_bytes());
+    hdr.extend_from_slice(&msg.chunk_hash);
+    hdr.push(msg.compressed as u8);
+    hdr.extend_from_slice(&msg.stripe_index.to_le_bytes());
+    hdr.extend_from_slice(&msg.shard_index_in_stripe.to_le_bytes());
+    hdr.push(msg.is_parity as u8);
+    hdr.extend_from_slice(&shard_count.to_le_bytes());
+    for &l in &msg.shard_lengths {
+        hdr.extend_from_slice(&l.to_le_bytes());
+    }
+    hdr.extend_from_slice(&msg.shard_compressed);
+    hdr.extend_from_slice(&(payload_len as u64).to_le_bytes());
+
+    stream.write_all(&hdr).await?;
+    stream.write_all(&msg.payload).await?;
+    Ok(())
+}
+
+/// Receive a `FecChunkData` frame without the intermediate bincode copy.
+///
+/// Returns `Ok(None)` on clean EOF at a frame boundary.
+pub async fn recv_fec_chunk_data<R>(stream: &mut R) -> Result<Option<FecChunkData>>
+where
+    R: AsyncRead + Unpin,
+{
+    // Read frame_body_len (4) + fixed header (68) in one call.
+    const FIXED_TOTAL: usize = 4 + FEC_FIXED_HDR;
+    let mut hdr = [0u8; FIXED_TOTAL];
+
+    if stream.read(&mut hdr[..1]).await.context("read FEC chunk frame byte 0")? == 0 {
+        return Ok(None); // clean EOF at frame boundary
+    }
+    stream.read_exact(&mut hdr[1..]).await.context("read FEC chunk frame fixed header")?;
+
+    let frame_body_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+    if frame_body_len > MAX_DATA_FRAME_SIZE as usize {
+        bail!(
+            "FEC chunk data frame too large: {frame_body_len} bytes (limit {MAX_DATA_FRAME_SIZE})"
+        );
+    }
+
+    let transfer_id: [u8; 16] = hdr[4..20].try_into().unwrap();
+    let chunk_index = u64::from_le_bytes(hdr[20..28].try_into().unwrap());
+    let chunk_hash: [u8; 32] = hdr[28..60].try_into().unwrap();
+    let compressed = hdr[60] != 0;
+    let stripe_index = u32::from_le_bytes(hdr[61..65].try_into().unwrap());
+    let shard_index_in_stripe = u16::from_le_bytes(hdr[65..67].try_into().unwrap());
+    let is_parity = hdr[67] != 0;
+    let shard_count = u32::from_le_bytes(hdr[68..72].try_into().unwrap()) as usize;
+
+    // Read shard_lengths (4 bytes each).
+    let mut lengths_buf = vec![0u8; shard_count * 4];
+    if !lengths_buf.is_empty() {
+        stream.read_exact(&mut lengths_buf).await.context("read FEC shard_lengths")?;
+    }
+    let shard_lengths: Vec<u32> = lengths_buf
+        .chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    // Read shard_compressed (1 byte each).
+    let mut shard_compressed = vec![0u8; shard_count];
+    if !shard_compressed.is_empty() {
+        stream
+            .read_exact(&mut shard_compressed)
+            .await
+            .context("read FEC shard_compressed")?;
+    }
+
+    // Read payload_len then payload.
+    let mut payload_len_buf = [0u8; 8];
+    stream.read_exact(&mut payload_len_buf).await.context("read FEC payload_len")?;
+    let payload_len = u64::from_le_bytes(payload_len_buf) as usize;
+
+    let expected_frame_body = FEC_FIXED_HDR + shard_count * 5 + 8 + payload_len;
+    if frame_body_len != expected_frame_body {
+        bail!(
+            "FEC chunk frame body length mismatch: \
+             got {frame_body_len}, expected {expected_frame_body}"
+        );
+    }
+
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload).await.context("read FEC chunk payload")?;
+
+    Ok(Some(FecChunkData {
+        transfer_id,
+        chunk_index,
+        chunk_hash,
+        compressed,
+        stripe_index,
+        shard_index_in_stripe,
+        is_parity,
+        shard_lengths,
+        shard_compressed,
+        payload,
+    }))
 }
 
 /// Read one chunk-data frame (128 MiB cap).

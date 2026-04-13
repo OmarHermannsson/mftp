@@ -62,6 +62,42 @@ pub struct ChunkData {
     pub payload: Vec<u8>,
 }
 
+/// One chunk of file data in a FEC-enabled transfer.
+///
+/// **Data shards** (`is_parity = false`):
+///   - `chunk_index` is the actual file chunk index.
+///   - `chunk_hash` is `blake3(raw_uncompressed_bytes)`, same as non-FEC `ChunkData`.
+///   - `compressed` indicates whether the payload is zstd-compressed.
+///   - `shard_lengths` and `shard_compressed` are empty (zero-length).
+///   - `payload` contains the compressed (or raw) bytes, **not** RS-padded.
+///
+/// **Parity shards** (`is_parity = true`):
+///   - `chunk_index` is a sentinel value (not used for file writes).
+///   - `chunk_hash` is `blake3(payload)` for parity wire-integrity only.
+///   - `compressed` is always `false`.
+///   - `shard_lengths[i]` is the unpadded wire length of data shard `i` in this stripe.
+///   - `shard_compressed[i]` is `1` if data shard `i` was zstd-compressed, `0` otherwise.
+///   - `payload` is the RS-computed parity shard (length = stripe maximum).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FecChunkData {
+    pub transfer_id: [u8; 16],
+    /// File chunk index (data shards only; sentinel for parity shards).
+    pub chunk_index: u64,
+    /// BLAKE3 hash: `blake3(raw_uncompressed)` for data; `blake3(payload)` for parity.
+    pub chunk_hash: [u8; 32],
+    /// True if the payload is zstd-compressed (always false for parity shards).
+    pub compressed: bool,
+    pub stripe_index: u32,
+    /// 0-based index within the stripe (`0..data_shards` for data; `data_shards..` for parity).
+    pub shard_index_in_stripe: u16,
+    pub is_parity: bool,
+    /// Non-empty only on parity shards: unpadded compressed length of each data shard.
+    pub shard_lengths: Vec<u32>,
+    /// Non-empty only on parity shards: `1` if the corresponding data shard was compressed.
+    pub shard_compressed: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
 /// Sent by the sender on the control stream after all data streams finish.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SenderMessage {

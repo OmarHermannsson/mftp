@@ -15,13 +15,14 @@ use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 use crate::compress;
+use crate::fec::codec::FecEncoder;
 use crate::net::connection::make_client_endpoint;
 use crate::net::tcp::connect_tls;
 use crate::protocol::{
     framing,
     messages::{
-        ChunkData, Compression, NegotiateRequest, NegotiateResponse, ReceiverMessage,
-        SenderMessage, TransferManifest,
+        ChunkData, Compression, FecChunkData, FecParams, NegotiateRequest, NegotiateResponse,
+        ReceiverMessage, SenderMessage, TransferManifest,
     },
 };
 use crate::transfer::hash::{hash_file_sync, ChunkHasher};
@@ -58,6 +59,10 @@ pub struct SendConfig {
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this
     /// threshold.  Ignored when `forced_transport` is set.
     pub tcp_rtt_threshold: Duration,
+    /// Reed-Solomon FEC parameters; `None` = FEC disabled.
+    /// Automatically forced to `None` when the transport falls back to TCP+TLS
+    /// (TCP already provides reliable delivery; FEC would only add overhead).
+    pub fec: Option<FecParams>,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
@@ -157,27 +162,52 @@ async fn send_quic_with_conn(
 
     let conn_for_workers = conn.clone();
 
-    run_transfer(
-        &file,
-        file_size,
-        &mut ctrl_send,
-        ctrl_recv,
-        rtt,
-        sender_cores,
-        neg_resp.cpu_cores,
-        &config,
-        move |rx, transfer_id, compression, file_hasher| {
-            let conn = conn_for_workers.clone();
-            async move {
-                let stream = conn
-                    .open_uni()
-                    .await
-                    .context("open QUIC data stream")?;
-                quic_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
-            }
-        },
-    )
-    .await?;
+    if let Some(fec_params) = config.fec.clone() {
+        run_transfer_fec(
+            &file,
+            file_size,
+            &mut ctrl_send,
+            ctrl_recv,
+            rtt,
+            sender_cores,
+            neg_resp.cpu_cores,
+            &config,
+            fec_params,
+            move |rx, transfer_id| {
+                let conn = conn_for_workers.clone();
+                async move {
+                    let stream = conn
+                        .open_uni()
+                        .await
+                        .context("open QUIC data stream")?;
+                    quic_fec_stream_worker(stream, rx, transfer_id).await
+                }
+            },
+        )
+        .await?;
+    } else {
+        run_transfer(
+            &file,
+            file_size,
+            &mut ctrl_send,
+            ctrl_recv,
+            rtt,
+            sender_cores,
+            neg_resp.cpu_cores,
+            &config,
+            move |rx, transfer_id, compression, file_hasher| {
+                let conn = conn_for_workers.clone();
+                async move {
+                    let stream = conn
+                        .open_uni()
+                        .await
+                        .context("open QUIC data stream")?;
+                    quic_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
+                }
+            },
+        )
+        .await?;
+    }
 
     let _ = ctrl_send.finish();
     conn.close(0u32.into(), b"done");
@@ -196,9 +226,26 @@ async fn quic_stream_worker(
     Ok(())
 }
 
+async fn quic_fec_stream_worker(
+    mut stream: quinn::SendStream,
+    rx: tokio::sync::mpsc::Receiver<FecChunkData>,
+    _transfer_id: [u8; 16],
+) -> Result<()> {
+    send_fec_from_channel(&mut stream, rx).await?;
+    stream.finish()?;
+    Ok(())
+}
+
 // ── TCP path ──────────────────────────────────────────────────────────────────
 
-async fn send_tcp(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
+async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig) -> Result<()> {
+    if config.fec.is_some() {
+        eprintln!(
+            "[mftp] FEC is not used over TCP+TLS (reliable transport provides equivalent \
+             protection without bandwidth overhead) — disabling FEC."
+        );
+        config.fec = None;
+    }
     let file_size = tokio::fs::metadata(&file)
         .await
         .with_context(|| format!("cannot stat {}", file.display()))?
@@ -714,5 +761,413 @@ fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, 
             None => Ok((data, false)),
         },
     }
+}
+
+// ── FEC sender path ───────────────────────────────────────────────────────────
+
+/// Simple FEC worker: drain pre-encoded `FecChunkData` from the channel and
+/// write each frame to the stream.  All CPU work (compress + RS encode) is
+/// already done by the `stripe_encode_chunks` blocking task.
+async fn send_fec_from_channel<W>(
+    writer: &mut W,
+    mut rx: tokio::sync::mpsc::Receiver<FecChunkData>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(fcd) = rx.recv().await {
+        framing::send_fec_chunk_data(writer, &fcd).await?;
+        debug!(chunk = fcd.chunk_index, parity = fcd.is_parity, "sent FEC shard");
+    }
+    Ok(())
+}
+
+/// Sequential file reader for the FEC pipeline.
+///
+/// Sends all chunks (no resume skipping) to a single channel that feeds the
+/// `stripe_encode_chunks` blocking task.  Designed to run in `spawn_blocking`.
+fn feed_chunks_single(
+    path: &Path,
+    file_size: u64,
+    chunk_size: usize,
+    tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+    }
+
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    for idx in 0..total_chunks {
+        let offset = idx * chunk_size as u64;
+        let len = (chunk_size as u64).min(file_size - offset) as usize;
+        let mut raw = vec![0u8; len];
+        file.read_exact_at(&mut raw, offset)
+            .with_context(|| format!("read chunk {idx}"))?;
+        if tx.blocking_send((idx, raw)).is_err() {
+            break; // encoder side dropped (failed) — feeder exits cleanly
+        }
+    }
+    Ok(())
+}
+
+/// Compress + hash + RS-encode a full stripe, then dispatch data and parity
+/// `FecChunkData` items round-robin to the per-worker channels.
+///
+/// `buf` must have exactly `encoder.data_shards` entries.  Entries at indices
+/// `[real_count..data_shards)` are synthetic zeros (last-stripe padding) and
+/// are used for RS parity computation but **not** dispatched as data shards.
+fn encode_and_dispatch(
+    buf: &[(u64, Vec<u8>)],
+    real_count: usize,
+    encoder: &FecEncoder,
+    compression: &Compression,
+    transfer_id: [u8; 16],
+    stripe_index: u32,
+    worker_txs: &[tokio::sync::mpsc::Sender<FecChunkData>],
+    worker_i: &mut usize,
+    n: usize,
+    file_hasher: &Arc<ChunkHasher>,
+) -> Result<()> {
+    let data_shards = encoder.data_shards;
+    let parity_shards = encoder.parity_shards;
+
+    // Step 1: compress each shard and hash real ones.
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(data_shards);
+    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(data_shards);
+    let mut comp_flags: Vec<bool> = Vec::with_capacity(data_shards);
+
+    for (i, (chunk_idx, raw)) in buf.iter().enumerate() {
+        let hash = *blake3::hash(raw).as_bytes();
+        // Feed real chunk hashes into the file hasher inline.
+        if i < real_count {
+            file_hasher.feed(*chunk_idx, hash)?;
+        }
+        let (payload, comp) = maybe_compress(raw.clone(), compression)?;
+        hashes.push(hash);
+        payloads.push(payload);
+        comp_flags.push(comp);
+    }
+
+    // Step 2: RS encode — FecEncoder pads to stripe_max internally.
+    let (parity, shard_lengths) = encoder.encode(payloads.clone())?;
+    let shard_compressed: Vec<u8> = comp_flags.iter().map(|&c| c as u8).collect();
+
+    // Step 3: dispatch real data shards.
+    for i in 0..real_count {
+        let fcd = FecChunkData {
+            transfer_id,
+            chunk_index: buf[i].0,
+            chunk_hash: hashes[i],
+            compressed: comp_flags[i],
+            stripe_index,
+            shard_index_in_stripe: i as u16,
+            is_parity: false,
+            shard_lengths: Vec::new(),
+            shard_compressed: Vec::new(),
+            payload: payloads[i].clone(),
+        };
+        if worker_txs[*worker_i].blocking_send(fcd).is_err() {
+            bail!("FEC worker channel closed prematurely");
+        }
+        *worker_i = (*worker_i + 1) % n;
+    }
+
+    // Step 4: dispatch parity shards (all, even for partial last stripe).
+    for j in 0..parity_shards {
+        let parity_hash = *blake3::hash(&parity[j]).as_bytes();
+        let fcd = FecChunkData {
+            transfer_id,
+            chunk_index: stripe_index as u64 * (data_shards + parity_shards) as u64
+                + data_shards as u64
+                + j as u64,
+            chunk_hash: parity_hash,
+            compressed: false,
+            stripe_index,
+            shard_index_in_stripe: data_shards as u16 + j as u16,
+            is_parity: true,
+            shard_lengths: shard_lengths.clone(),
+            shard_compressed: shard_compressed.clone(),
+            payload: parity[j].clone(),
+        };
+        if worker_txs[*worker_i].blocking_send(fcd).is_err() {
+            bail!("FEC worker channel closed prematurely");
+        }
+        *worker_i = (*worker_i + 1) % n;
+    }
+
+    Ok(())
+}
+
+/// Blocking task: reads raw chunks from the feeder channel, groups them into
+/// stripes of `data_shards`, RS-encodes parity, and dispatches `FecChunkData`
+/// to the per-worker channels.
+///
+/// Runs on Tokio's blocking thread pool so RS computation never stalls the
+/// async executor (which would delay QUIC ACK processing at high RTT).
+fn stripe_encode_chunks(
+    mut chunk_rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    fec_params: FecParams,
+    compression: Compression,
+    transfer_id: [u8; 16],
+    file_hasher: Arc<ChunkHasher>,
+    worker_txs: Vec<tokio::sync::mpsc::Sender<FecChunkData>>,
+) -> Result<()> {
+    let encoder = FecEncoder::new(fec_params.data_shards, fec_params.parity_shards)?;
+    let data_shards = fec_params.data_shards;
+    let n = worker_txs.len();
+    let mut worker_i = 0usize;
+    let mut stripe_index = 0u32;
+
+    // Accumulate `data_shards` chunks per stripe before encoding.
+    let mut buf: Vec<(u64, Vec<u8>)> = Vec::with_capacity(data_shards);
+
+    loop {
+        match chunk_rx.blocking_recv() {
+            Some(item) => {
+                buf.push(item);
+                if buf.len() == data_shards {
+                    encode_and_dispatch(
+                        &buf,
+                        data_shards, // all real
+                        &encoder,
+                        &compression,
+                        transfer_id,
+                        stripe_index,
+                        &worker_txs,
+                        &mut worker_i,
+                        n,
+                        &file_hasher,
+                    )?;
+                    buf.clear();
+                    stripe_index += 1;
+                }
+            }
+            None => break, // feeder finished
+        }
+    }
+
+    // Flush the last partial stripe (file size not a multiple of data_shards * chunk_size).
+    if !buf.is_empty() {
+        let real_count = buf.len();
+        // Pad with synthetic zero-length entries so RS sees `data_shards` shards.
+        // The encoder pads empty payloads to stripe_max with zeros — identical to
+        // what the receiver will pre-fill for these virtual shard positions.
+        while buf.len() < data_shards {
+            buf.push((u64::MAX, Vec::new())); // sentinel chunk_index; empty payload
+        }
+        encode_and_dispatch(
+            &buf,
+            real_count,
+            &encoder,
+            &compression,
+            transfer_id,
+            stripe_index,
+            &worker_txs,
+            &mut worker_i,
+            n,
+            &file_hasher,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Core FEC transfer logic, analogous to `run_transfer` for the non-FEC path.
+///
+/// Key differences from `run_transfer`:
+/// - Sends all chunks regardless of receiver resume state (FEC v1 does not
+///   resume mid-stripe; the receiver's file hash check will catch any gap).
+/// - Uses a two-stage pipeline: feeder → stripe_encoder → workers.
+///   All compression and RS encoding happens in the stripe_encoder blocking task;
+///   workers only frame and send pre-built `FecChunkData` items.
+/// - File hash is collected inline by the stripe encoder (no second disk pass).
+#[allow(clippy::too_many_arguments)]
+async fn run_transfer_fec<CW, CR, F, Fut>(
+    file: &Path,
+    file_size: u64,
+    ctrl_send: &mut CW,
+    mut ctrl_recv: CR,
+    rtt: Duration,
+    sender_cores: u32,
+    receiver_cores: u32,
+    config: &SendConfig,
+    fec_params: FecParams,
+    spawn_worker: F,
+) -> Result<()>
+where
+    CW: AsyncWrite + Unpin,
+    CR: AsyncRead + Unpin + Send + 'static,
+    F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16]) -> Fut,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let file_name = file
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let compression = if config.compress {
+        Compression::Zstd { level: config.compress_level }
+    } else {
+        Compression::None
+    };
+
+    let params = compute_params(
+        rtt,
+        file_size,
+        sender_cores,
+        receiver_cores,
+        config.streams,
+        config.chunk_size,
+    );
+    println!(
+        "Negotiated: {} streams, {} MiB chunks, FEC {}/{} \
+         (RTT {:.1} ms, sender {} cores, receiver {} cores)",
+        params.streams,
+        params.chunk_size / (1024 * 1024),
+        fec_params.data_shards,
+        fec_params.parity_shards,
+        rtt.as_secs_f64() * 1000.0,
+        sender_cores,
+        receiver_cores,
+    );
+
+    let chunk_size = params.chunk_size;
+    let transfer_id: [u8; 16] = {
+        let mut h = blake3::Hasher::new();
+        h.update(file_name.as_bytes());
+        h.update(&file_size.to_le_bytes());
+        h.update(&(chunk_size as u64).to_le_bytes());
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        id
+    };
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let num_streams = params.streams;
+
+    let manifest = TransferManifest {
+        transfer_id,
+        file_name: file_name.clone(),
+        file_size,
+        chunk_size,
+        total_chunks,
+        num_streams,
+        compression: compression.clone(),
+        fec: Some(fec_params.clone()),
+    };
+    framing::send_message(ctrl_send, &manifest).await?;
+
+    // Receive Ready.  FEC v1 ignores the resume bitvec and sends all chunks.
+    let ready: ReceiverMessage = framing::recv_data_message(&mut ctrl_recv)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
+    match ready {
+        ReceiverMessage::Ready { received_bits, total_chunks: tc } => {
+            let skip_count = bits_to_chunk_set(&received_bits, tc).len();
+            if skip_count > 0 {
+                info!(
+                    "{skip_count} chunks already at receiver — FEC v1 resends everything; \
+                     receiver will skip duplicate writes"
+                );
+            }
+        }
+        ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
+        other => bail!("unexpected message from receiver: {other:?}"),
+    }
+
+    // Inline per-chunk hashing via the stripe encoder — no extra disk pass.
+    let file_hasher = Arc::new(ChunkHasher::new(total_chunks));
+
+    let pb = make_progress_bar(&file_name, file_size);
+    let transfer_start = Instant::now();
+    let pb_for_reader = pb.clone();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    let reader = tokio::spawn(async move {
+        loop {
+            match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
+                Ok(Some(ReceiverMessage::Progress { bytes_written })) => {
+                    pb_for_reader.set_position(bytes_written);
+                }
+                Ok(Some(other)) => {
+                    let _ = completion_tx.send(other);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    });
+
+    // Feeder → stripe encoder channel; depth allows a stripe ahead.
+    const FEEDER_CHAN_DEPTH: usize = 16;
+    const WORKER_CHAN_DEPTH: usize = 4;
+    let actual_streams = num_streams.min(total_chunks.max(1) as usize);
+
+    let (feeder_tx, feeder_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(FEEDER_CHAN_DEPTH);
+
+    let mut worker_txs: Vec<tokio::sync::mpsc::Sender<FecChunkData>> = Vec::new();
+    let mut worker_rxs: Vec<tokio::sync::mpsc::Receiver<FecChunkData>> = Vec::new();
+    for _ in 0..actual_streams {
+        let (tx, rx) = tokio::sync::mpsc::channel(WORKER_CHAN_DEPTH);
+        worker_txs.push(tx);
+        worker_rxs.push(rx);
+    }
+
+    // Feeder: sequential file read → feeder channel.
+    let feeder = {
+        let path = file.to_owned();
+        tokio::task::spawn_blocking(move || {
+            feed_chunks_single(&path, file_size, chunk_size, feeder_tx)
+        })
+    };
+
+    // Stripe encoder: read from feeder, RS encode, dispatch FecChunkData to workers.
+    let fec_params_clone = fec_params.clone();
+    let compression_clone = compression.clone();
+    let hasher_for_encoder = file_hasher.clone();
+    let encoder_task = tokio::task::spawn_blocking(move || {
+        stripe_encode_chunks(
+            feeder_rx,
+            fec_params_clone,
+            compression_clone,
+            transfer_id,
+            hasher_for_encoder,
+            worker_txs,
+        )
+    });
+
+    // Spawn N QUIC stream workers.
+    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    for rx in worker_rxs {
+        tasks.spawn(spawn_worker(rx, transfer_id));
+    }
+    while let Some(res) = tasks.join_next().await {
+        res??;
+    }
+
+    // Ensure encoder and feeder finished cleanly.
+    encoder_task.await.context("stripe encoder task panicked")??;
+    feeder.await.context("feeder task panicked")??;
+
+    pb.set_message("verifying…");
+
+    let file_hash = Arc::try_unwrap(file_hasher)
+        .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain")
+        .finish()?;
+    framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
+
+    let msg = completion_rx.await.context("receiver closed without completing")?;
+    reader.await.ok();
+    pb.finish_and_clear();
+    print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
+
+    Ok(())
 }
 

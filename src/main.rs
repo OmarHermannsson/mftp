@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use mftp::protocol::messages::FecParams;
 use mftp::transfer::{receiver, sender};
 use mftp::transfer::sender::ForcedTransport;
 
@@ -38,6 +39,15 @@ struct Cli {
     /// Disable adaptive zstd compression
     #[arg(long, global = true)]
     no_compress: bool,
+
+    /// Enable Reed-Solomon forward error correction.
+    ///
+    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 20% bandwidth overhead but
+    /// tolerates up to 2 lost chunks per 8-chunk stripe without retransmission).
+    /// Most useful on high-latency lossy links (satellite, intercontinental).
+    /// Automatically disabled when the transport falls back to TCP (reliable delivery).
+    #[arg(long, global = true, value_name = "DATA:PARITY")]
+    fec: Option<String>,
 
     /// Force a specific transport path.
     ///
@@ -148,6 +158,22 @@ async fn main() -> Result<()> {
                 (Some(Transport::Sftp), _) => Some(ForcedTransport::Sftp),
                 (None, false) => None,
             };
+            let fec = cli.fec.as_deref().map(|s| {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!("[mftp] --fec must be DATA:PARITY (e.g. 8:2); ignoring");
+                    return None;
+                }
+                let data = parts[0].parse::<usize>().ok();
+                let parity = parts[1].parse::<usize>().ok();
+                match (data, parity) {
+                    (Some(d), Some(p)) if d >= 2 && p >= 1 => Some(FecParams { data_shards: d, parity_shards: p }),
+                    _ => {
+                        eprintln!("[mftp] --fec: DATA must be ≥ 2 and PARITY must be ≥ 1; ignoring");
+                        None
+                    }
+                }
+            }).flatten();
             let config = sender::SendConfig {
                 streams: cli.streams,
                 chunk_size: cli.chunk_size,
@@ -156,6 +182,7 @@ async fn main() -> Result<()> {
                 trusted_fingerprint: trust,
                 forced_transport,
                 tcp_rtt_threshold,
+                fec,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
                 mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port).await

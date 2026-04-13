@@ -1,5 +1,6 @@
 //! Receiver-side transfer orchestration. See `transfer/mod.rs` for the full flow.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::compress;
+use crate::fec::codec::FecDecoder;
 use crate::net::connection::{
     cert_fingerprint, generate_self_signed_cert, make_private_key, make_server_endpoint,
 };
@@ -23,8 +25,8 @@ use crate::net::tcp::{ServerTlsStream, make_tls_acceptor};
 use crate::protocol::{
     framing,
     messages::{
-        ChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage, SenderMessage,
-        TransferManifest,
+        ChunkData, FecChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage,
+        SenderMessage, TransferManifest,
     },
 };
 use crate::transfer::hash::ChunkHasher;
@@ -363,6 +365,254 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+// ── FEC stripe accumulator ────────────────────────────────────────────────────
+
+/// Per-stripe shard accumulator used by FEC-enabled transfers.
+///
+/// Created when the first shard for a stripe arrives; removed from the shared
+/// map and processed (written to disk) as soon as `is_ready()` returns true.
+struct StripeBuffer {
+    stripe_index: u32,
+    data_shards: usize,
+    parity_shards: usize,
+    /// Number of real file chunks in this stripe (`≤ data_shards`; `< data_shards`
+    /// only for the last stripe when `total_chunks % data_shards != 0`).
+    real_data_count: usize,
+    /// Received data shard slots: `(compressed_payload, chunk_hash, compressed_flag)`.
+    data: Vec<Option<(Vec<u8>, [u8; 32], bool)>>,
+    /// Received parity shard slots (RS-encoded payload at stripe-max length).
+    parity: Vec<Option<Vec<u8>>>,
+    /// Unpadded compressed length of each data shard; non-empty once any parity
+    /// shard arrives.  Needed to trim RS-reconstructed data shards after padding.
+    shard_lengths: Option<Vec<u32>>,
+    /// Compression flag for each data shard (0=raw, 1=compressed); same source.
+    shard_compressed_flags: Option<Vec<u8>>,
+    received_data: usize,
+    received_parity: usize,
+}
+
+impl StripeBuffer {
+    fn new(stripe_index: u32, data_shards: usize, parity_shards: usize, real_data_count: usize) -> Self {
+        Self {
+            stripe_index,
+            data_shards,
+            parity_shards,
+            real_data_count,
+            data: vec![None; data_shards],
+            parity: vec![None; parity_shards],
+            shard_lengths: None,
+            shard_compressed_flags: None,
+            received_data: 0,
+            received_parity: 0,
+        }
+    }
+
+    fn insert(&mut self, fcd: FecChunkData) -> Result<()> {
+        if fcd.is_parity {
+            let j = fcd.shard_index_in_stripe as usize - self.data_shards;
+            if j >= self.parity_shards {
+                bail!(
+                    "FEC stripe {}: parity shard index {} out of range",
+                    self.stripe_index, j
+                );
+            }
+            if self.parity[j].is_none() {
+                self.parity[j] = Some(fcd.payload);
+                self.received_parity += 1;
+            }
+            // All parity shards for the same stripe carry identical metadata;
+            // store it once from whichever arrives first.
+            if self.shard_lengths.is_none() && !fcd.shard_lengths.is_empty() {
+                self.shard_lengths = Some(fcd.shard_lengths);
+                self.shard_compressed_flags = Some(fcd.shard_compressed);
+            }
+        } else {
+            let i = fcd.shard_index_in_stripe as usize;
+            if i >= self.data_shards {
+                bail!(
+                    "FEC stripe {}: data shard index {} out of range",
+                    self.stripe_index, i
+                );
+            }
+            if self.data[i].is_none() {
+                self.data[i] = Some((fcd.payload, fcd.chunk_hash, fcd.compressed));
+                self.received_data += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// True when we have enough shards (real data + parity + synthetic zeros) to
+    /// reconstruct all real file chunks in this stripe.
+    fn is_ready(&self) -> bool {
+        self.received_data + self.received_parity >= self.real_data_count
+    }
+}
+
+/// Decompress, verify, write, and account for one data chunk from a FEC stripe.
+///
+/// Called from `process_stripe` for both directly received and RS-reconstructed
+/// data shards.  `payload` is the possibly-compressed chunk data after any RS
+/// trimming.  `expected_hash` is `Some(h)` for directly received shards (verify
+/// against `blake3(raw)`), `None` for reconstructed shards (trust RS; file hash
+/// catches errors end-to-end).
+fn write_fec_chunk(
+    chunk_index: u64,
+    payload: &[u8],
+    compressed: bool,
+    expected_hash: Option<[u8; 32]>,
+    chunk_size: usize,
+    out_file: &std::fs::File,
+    resume: &Mutex<ResumeState>,
+    hasher: &Option<Arc<ChunkHasher>>,
+    pb: &ProgressBar,
+    progress_tx: &tokio::sync::mpsc::Sender<u64>,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let data = if compressed {
+        compress::decompress_chunk(payload, chunk_size)
+            .with_context(|| format!("decompress FEC chunk {chunk_index}"))?
+    } else {
+        payload.to_vec()
+    };
+
+    let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
+    if let Some(expected) = expected_hash {
+        if computed != expected {
+            bail!("FEC chunk {chunk_index}: hash mismatch");
+        }
+    }
+
+    let offset = chunk_index * chunk_size as u64;
+    out_file
+        .write_all_at(&data, offset)
+        .with_context(|| format!("write FEC chunk {chunk_index} at offset {offset}"))?;
+
+    if let Some(h) = hasher {
+        h.feed(chunk_index, computed)?;
+    }
+    let n = data.len() as u64;
+    pb.inc(n);
+    let _ = progress_tx.try_send(n);
+
+    let snap = {
+        let mut r = resume.lock().unwrap();
+        r.mark_received(chunk_index);
+        if r.incr_dirty() >= RESUME_SAVE_BATCH {
+            r.reset_dirty();
+            Some(r.snapshot()?)
+        } else {
+            None
+        }
+    };
+    if let Some(snap) = snap {
+        snap.write_to_disk()?;
+    }
+
+    debug!(chunk = chunk_index, "FEC chunk written");
+    Ok(())
+}
+
+/// Process a completed stripe: write directly received data shards and use
+/// RS reconstruction for any missing ones.
+///
+/// Designed to run in `spawn_blocking`; all I/O is synchronous.
+fn process_stripe(
+    stripe: StripeBuffer,
+    chunk_size: usize,
+    out_file: Arc<std::fs::File>,
+    resume: Arc<Mutex<ResumeState>>,
+    hasher: Option<Arc<ChunkHasher>>,
+    pb: Arc<ProgressBar>,
+    progress_tx: tokio::sync::mpsc::Sender<u64>,
+) -> Result<()> {
+    let data_shards = stripe.data_shards;
+    let parity_shards = stripe.parity_shards;
+    let real_data_count = stripe.real_data_count;
+    let first_chunk = stripe.stripe_index as u64 * data_shards as u64;
+
+    if stripe.received_data == real_data_count && stripe.shard_lengths.is_none() {
+        // Happy path: all real data shards arrived; no RS needed.
+        for i in 0..real_data_count {
+            let (payload, hash, compressed) = stripe.data[i].as_ref().unwrap();
+            write_fec_chunk(
+                first_chunk + i as u64,
+                payload,
+                *compressed,
+                Some(*hash),
+                chunk_size,
+                &out_file,
+                &resume,
+                &hasher,
+                &pb,
+                &progress_tx,
+            )?;
+        }
+        return Ok(());
+    }
+
+    // RS reconstruction path.
+    let shard_lengths = stripe.shard_lengths.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "FEC stripe {}: RS reconstruction needed but no parity metadata received",
+            stripe.stripe_index
+        )
+    })?;
+    let shard_compressed_flags = stripe.shard_compressed_flags.as_ref().unwrap();
+    let stripe_max = shard_lengths.iter().copied().max().unwrap_or(0) as usize;
+
+    // Build the shard array for FecDecoder.
+    //   data shards:   Some(padded_to_stripe_max) if received; None if missing.
+    //   virtual shards (last stripe only): Some(zeros at stripe_max).
+    //   parity shards: Some(payload) or None if missing.
+    let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(data_shards + parity_shards);
+    for i in 0..data_shards {
+        if i >= real_data_count {
+            // Synthetic zero shard — known, counted as "present" by FecDecoder.
+            shards.push(Some(vec![0u8; stripe_max]));
+        } else if let Some((payload, _, _)) = &stripe.data[i] {
+            let mut padded = payload.clone();
+            padded.resize(stripe_max, 0);
+            shards.push(Some(padded));
+        } else {
+            shards.push(None); // missing; RS will reconstruct
+        }
+    }
+    for j in 0..parity_shards {
+        shards.push(stripe.parity[j].clone());
+    }
+
+    let decoder = FecDecoder::new(data_shards, parity_shards)?;
+    let reconstructed = decoder.reconstruct(shards, shard_lengths)?;
+
+    for i in 0..real_data_count {
+        let was_reconstructed = stripe.data[i].is_none();
+        let payload = &reconstructed[i]; // already trimmed to shard_lengths[i]
+        let compressed = shard_compressed_flags[i] != 0;
+        // expected_hash: Some for directly received (verify), None for reconstructed (trust RS).
+        let expected_hash = if was_reconstructed {
+            None
+        } else {
+            stripe.data[i].as_ref().map(|(_, h, _)| *h)
+        };
+        write_fec_chunk(
+            first_chunk + i as u64,
+            payload,
+            compressed,
+            expected_hash,
+            chunk_size,
+            &out_file,
+            &resume,
+            &hasher,
+            &pb,
+            &progress_tx,
+        )?;
+    }
+
+    Ok(())
+}
+
 // ── Shared transfer body ──────────────────────────────────────────────────────
 
 /// Core receive logic shared by both the QUIC and TCP paths.
@@ -447,6 +697,14 @@ where
         });
     }
 
+    // For FEC transfers, workers share a stripe accumulator map.
+    let fec_stripe_bufs: Option<Arc<Mutex<HashMap<u32, StripeBuffer>>>> =
+        if manifest.fec.is_some() {
+            Some(Arc::new(Mutex::new(HashMap::new())))
+        } else {
+            None
+        };
+
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     while let Some(accept_res) = accept_tasks.join_next().await {
         let stream = accept_res.context("accept task panicked")??;
@@ -456,9 +714,20 @@ where
         let pb = pt.pb.clone();
         let hasher = pt.hasher.clone();
         let progress_tx = progress_tx.clone();
-        tasks.spawn(async move {
-            recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx).await
-        });
+        if let Some(ref bufs_arc) = fec_stripe_bufs {
+            let stripe_bufs = Arc::clone(bufs_arc);
+            tasks.spawn(async move {
+                recv_fec_stream_worker(
+                    stream, out_file, resume, manifest, pb, hasher, progress_tx, stripe_bufs,
+                )
+                .await
+            });
+        } else {
+            tasks.spawn(async move {
+                recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx)
+                    .await
+            });
+        }
     }
     // Drop the original sender so the channel closes when all workers finish.
     drop(progress_tx);
@@ -470,6 +739,20 @@ where
 
     let task_err = drain_tasks(&mut tasks).await;
     pt.pb.finish();
+
+    // FEC: after all stream workers finish, any remaining stripes in the map
+    // did not receive enough shards for reconstruction — warn and let the
+    // file-hash check in finish_transfer surface the error.
+    if let Some(ref bufs_arc) = fec_stripe_bufs {
+        let remaining = bufs_arc.lock().unwrap();
+        if !remaining.is_empty() {
+            warn!(
+                "{} FEC stripe(s) incomplete after transfer: received too few shards \
+                 to reconstruct — those chunks will fail the file hash check",
+                remaining.len()
+            );
+        }
+    }
 
     let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
@@ -834,6 +1117,126 @@ where
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(e) => bail!("chunk processing task panicked: {e}"),
+        }
+    }
+
+    Ok(())
+}
+
+// ── FEC stream worker ─────────────────────────────────────────────────────────
+
+/// Stream worker for FEC-enabled transfers.
+///
+/// Reads `FecChunkData` frames from one data stream.  Each received shard is
+/// inserted into the shared `stripe_bufs` map.  When a stripe has received
+/// enough shards (`is_ready()`), the stripe is extracted from the map and
+/// processed (RS reconstruct if needed, then decompress → verify → pwrite)
+/// in a `spawn_blocking` task so it does not stall the async executor.
+///
+/// At most `MAX_IN_FLIGHT` stripe-processing tasks run concurrently per stream
+/// worker.  The shared `stripe_bufs` map bounds total in-flight stripes across
+/// all workers.
+async fn recv_fec_stream_worker<R>(
+    mut stream: R,
+    out_file: Arc<std::fs::File>,
+    resume: Arc<Mutex<ResumeState>>,
+    manifest: TransferManifest,
+    pb: Arc<ProgressBar>,
+    hasher: Option<Arc<ChunkHasher>>,
+    progress_tx: tokio::sync::mpsc::Sender<u64>,
+    stripe_bufs: Arc<Mutex<HashMap<u32, StripeBuffer>>>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    const MAX_IN_FLIGHT: usize = 4;
+    let mut processing: JoinSet<Result<()>> = JoinSet::new();
+    let fec_params = manifest.fec.as_ref().expect("recv_fec_stream_worker called without FEC params");
+    let data_shards = fec_params.data_shards;
+    let parity_shards = fec_params.parity_shards;
+    let total_chunks = manifest.total_chunks;
+    let chunk_size = manifest.chunk_size;
+    let transfer_id = manifest.transfer_id;
+    let mut shard_count = 0u64;
+
+    loop {
+        // Drain any completed processing tasks before accepting more shards
+        // so in-flight memory stays bounded.
+        if processing.len() >= MAX_IN_FLIGHT {
+            match processing.join_next().await {
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => return Err(e),
+                Some(Err(e)) => bail!("FEC stripe processing task panicked: {e}"),
+                None => {}
+            }
+        }
+
+        let fcd = match framing::recv_fec_chunk_data(&mut stream)
+            .await
+            .with_context(|| format!("recv FEC shard #{shard_count}"))?
+        {
+            Some(c) => c,
+            None => break, // clean EOF — all shards for this stream delivered
+        };
+
+        if fcd.transfer_id != transfer_id {
+            bail!(
+                "FEC shard: transfer_id mismatch (shard {}, chunk {})",
+                shard_count,
+                fcd.chunk_index
+            );
+        }
+
+        // Wire integrity check for parity shards only (data shards are verified
+        // against chunk_hash after RS reconstruction / decompression).
+        if fcd.is_parity {
+            let computed: [u8; 32] = *blake3::hash(&fcd.payload).as_bytes();
+            if computed != fcd.chunk_hash {
+                bail!(
+                    "FEC parity shard stripe={} shard={}: wire hash mismatch",
+                    fcd.stripe_index,
+                    fcd.shard_index_in_stripe
+                );
+            }
+        }
+
+        let stripe_index = fcd.stripe_index;
+
+        // Insert shard into the shared buffer; extract the stripe if it is now ready.
+        let ready_stripe = {
+            let mut bufs = stripe_bufs.lock().unwrap();
+            let real_count = {
+                let first = stripe_index as u64 * data_shards as u64;
+                (total_chunks - first).min(data_shards as u64) as usize
+            };
+            let buf = bufs
+                .entry(stripe_index)
+                .or_insert_with(|| StripeBuffer::new(stripe_index, data_shards, parity_shards, real_count));
+            buf.insert(fcd)?;
+            let ready = buf.is_ready();
+            if ready { bufs.remove(&stripe_index) } else { None }
+        };
+
+        if let Some(stripe) = ready_stripe {
+            let out_file = Arc::clone(&out_file);
+            let resume = Arc::clone(&resume);
+            let hasher = hasher.as_ref().map(Arc::clone);
+            let pb = Arc::clone(&pb);
+            let ptx = progress_tx.clone();
+            processing.spawn_blocking(move || {
+                process_stripe(stripe, chunk_size, out_file, resume, hasher, pb, ptx)
+            });
+        }
+
+        shard_count += 1;
+    }
+
+    // Await all remaining stripe processing tasks.
+    while let Some(res) = processing.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => bail!("FEC stripe processing task panicked: {e}"),
         }
     }
 
