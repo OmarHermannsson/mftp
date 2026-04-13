@@ -22,7 +22,11 @@ impl FecEncoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> Result<Self> {
         let rs = ReedSolomon::new(data_shards, parity_shards)
             .map_err(|e| anyhow::anyhow!("FEC encoder init: {:?}", e))?;
-        Ok(Self { rs, data_shards, parity_shards })
+        Ok(Self {
+            rs,
+            data_shards,
+            parity_shards,
+        })
     }
 
     /// Encode a stripe of compressed data shards.
@@ -35,7 +39,11 @@ impl FecEncoder {
     /// Empty data is allowed (all lengths zero → parity is also all-zero).
     pub fn encode(&self, data: Vec<Vec<u8>>) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
         if data.len() != self.data_shards {
-            bail!("FEC encode: expected {} data shards, got {}", self.data_shards, data.len());
+            bail!(
+                "FEC encode: expected {} data shards, got {}",
+                self.data_shards,
+                data.len()
+            );
         }
 
         let shard_lengths: Vec<u32> = data.iter().map(|s| s.len() as u32).collect();
@@ -58,7 +66,9 @@ impl FecEncoder {
             shards.push(vec![0u8; stripe_max]);
         }
 
-        self.rs.encode(&mut shards).map_err(|e| anyhow::anyhow!("FEC encode: {:?}", e))?;
+        self.rs
+            .encode(&mut shards)
+            .map_err(|e| anyhow::anyhow!("FEC encode: {:?}", e))?;
 
         // Parity shards are the tail of the slice after encode.
         let parity: Vec<Vec<u8>> = shards.drain(self.data_shards..).collect();
@@ -78,7 +88,11 @@ impl FecDecoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> Result<Self> {
         let rs = ReedSolomon::new(data_shards, parity_shards)
             .map_err(|e| anyhow::anyhow!("FEC decoder init: {:?}", e))?;
-        Ok(Self { rs, data_shards, parity_shards })
+        Ok(Self {
+            rs,
+            data_shards,
+            parity_shards,
+        })
     }
 
     /// Reconstruct missing shards and return trimmed data shards.
@@ -144,7 +158,11 @@ mod tests {
         let dec = FecDecoder::new(4, 2).unwrap();
         let shards: Vec<Option<Vec<u8>>> = original
             .iter()
-            .map(|s| { let mut v = s.clone(); v.resize(100, 0); Some(v) })
+            .map(|s| {
+                let mut v = s.clone();
+                v.resize(100, 0);
+                Some(v)
+            })
             .chain(parity.iter().map(|p| Some(p.clone())))
             .collect();
         let got = dec.reconstruct(shards, &shard_lengths).unwrap();
@@ -165,7 +183,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                if i == 2 { None } else {
+                if i == 2 {
+                    None
+                } else {
                     let mut v = s.clone();
                     v.resize(stripe_max, 0);
                     Some(v)
@@ -181,11 +201,7 @@ mod tests {
     fn reconstruct_variable_lengths() {
         // Shards of different compressed sizes — core of the pad-to-max design.
         let enc = FecEncoder::new(3, 1).unwrap();
-        let data = vec![
-            vec![0u8; 50],
-            vec![1u8; 100],
-            vec![2u8; 80],
-        ];
+        let data = vec![vec![0u8; 50], vec![1u8; 100], vec![2u8; 80]];
         let original = data.clone();
         let (parity, shard_lengths) = enc.encode(data).unwrap();
         assert_eq!(shard_lengths, vec![50, 100, 80]);
@@ -197,7 +213,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                if i == 0 { None } else {
+                if i == 0 {
+                    None
+                } else {
                     let mut v = s.clone();
                     v.resize(stripe_max, 0);
                     Some(v)
@@ -225,7 +243,9 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                if i == 1 || i == 3 { None } else {
+                if i == 1 || i == 3 {
+                    None
+                } else {
                     let mut v = s.clone();
                     v.resize(stripe_max, 0);
                     Some(v)

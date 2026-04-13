@@ -53,9 +53,7 @@ pub fn decompress_chunk(data: &[u8], max_output: usize) -> Result<Vec<u8>> {
     // maliciously large and we reject it.
     decoder.take(max_output as u64 + 1).read_to_end(&mut out)?;
     if out.len() > max_output {
-        anyhow::bail!(
-            "decompressed chunk exceeds maximum size of {max_output} bytes"
-        );
+        anyhow::bail!("decompressed chunk exceeds maximum size of {max_output} bytes");
     }
     Ok(out)
 }

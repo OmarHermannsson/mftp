@@ -35,15 +35,25 @@ pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 ///
 /// Returns the tokio [`TcpListener`] and the actual bound address.
 pub async fn bind_tcp(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .context("TCP socket creation failed")?;
     socket.set_reuse_address(true).context("SO_REUSEADDR")?;
     if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_RCVBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
     if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_SNDBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
     socket.set_nonblocking(true).context("set_nonblocking")?;
     socket.bind(&addr.into()).context("TCP bind")?;
@@ -101,15 +111,23 @@ async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
 
     // Mirror the buffer sizing from the server side (bind_tcp) and the QUIC path.
     if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
-        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_RCVBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
     if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
-        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_SNDBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
 
     let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.connect(addr))
         .await
-        .with_context(|| format!("TCP connect to {addr} timed out after {TCP_CONNECT_TIMEOUT:.1?}"))?
+        .with_context(|| {
+            format!("TCP connect to {addr} timed out after {TCP_CONNECT_TIMEOUT:.1?}")
+        })?
         .with_context(|| format!("TCP connect to {addr}"))?;
     stream.set_nodelay(true).context("TCP_NODELAY")?;
     Ok(stream)

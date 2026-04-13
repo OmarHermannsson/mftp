@@ -87,7 +87,10 @@ pub fn compute_params(
     let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
     let streams = streams.min(total_chunks.max(1));
 
-    TransferParams { streams, chunk_size }
+    TransferParams {
+        streams,
+        chunk_size,
+    }
 }
 
 #[cfg(test)]
@@ -121,7 +124,7 @@ mod tests {
             None,
         );
         assert_eq!(p.chunk_size, 2 * 1024 * 1024); // ≥ 200 ms → 2 MiB
-        // rtt_streams = 120, cpu_cap = 16 → clamped to 16
+                                                   // rtt_streams = 120, cpu_cap = 16 → clamped to 16
         assert_eq!(p.streams, 16);
     }
 
@@ -136,7 +139,7 @@ mod tests {
             None,
         );
         assert_eq!(p.chunk_size, 4 * 1024 * 1024); // < 200 ms → 4 MiB
-        // rtt_streams = 20, cpu_cap = 16 → 16
+                                                   // rtt_streams = 20, cpu_cap = 16 → 16
         assert_eq!(p.streams, 16);
     }
 

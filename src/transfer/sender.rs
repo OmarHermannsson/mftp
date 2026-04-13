@@ -112,13 +112,16 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
                 conn.close(0u32.into(), b"switching to tcp");
                 send_tcp(file, destination, config).await
             } else {
-                info!("connected via QUIC (RTT {:.1} ms)", rtt.as_secs_f64() * 1000.0);
+                info!(
+                    "connected via QUIC (RTT {:.1} ms)",
+                    rtt.as_secs_f64() * 1000.0
+                );
                 send_quic_with_conn(file, config, conn).await
             }
         }
-        Ok(Err(e)) if forced_quic => Err(e.context(
-            "QUIC connection failed (--transport quic; no TCP+TLS fallback)"
-        )),
+        Ok(Err(e)) if forced_quic => {
+            Err(e.context("QUIC connection failed (--transport quic; no TCP+TLS fallback)"))
+        }
         Ok(Err(e)) => {
             eprintln!("[mftp] QUIC connect failed ({e:#}), retrying over TCP+TLS…");
             send_tcp(file, destination, config).await
@@ -146,18 +149,20 @@ async fn send_quic_with_conn(
         .with_context(|| format!("cannot stat {}", file.display()))?
         .len();
 
-    let sender_cores =
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
+    let sender_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u32;
 
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
 
     framing::send_message(
         &mut ctrl_send,
-        &NegotiateRequest { cpu_cores: sender_cores },
+        &NegotiateRequest {
+            cpu_cores: sender_cores,
+        },
     )
     .await?;
-    let neg_resp: NegotiateResponse =
-        framing::recv_message_required(&mut ctrl_recv).await?;
+    let neg_resp: NegotiateResponse = framing::recv_message_required(&mut ctrl_recv).await?;
     let rtt = conn.stats().path.rtt;
 
     let conn_for_workers = conn.clone();
@@ -176,10 +181,7 @@ async fn send_quic_with_conn(
             move |rx, transfer_id| {
                 let conn = conn_for_workers.clone();
                 async move {
-                    let stream = conn
-                        .open_uni()
-                        .await
-                        .context("open QUIC data stream")?;
+                    let stream = conn.open_uni().await.context("open QUIC data stream")?;
                     quic_fec_stream_worker(stream, rx, transfer_id).await
                 }
             },
@@ -198,10 +200,7 @@ async fn send_quic_with_conn(
             move |rx, transfer_id, compression, file_hasher| {
                 let conn = conn_for_workers.clone();
                 async move {
-                    let stream = conn
-                        .open_uni()
-                        .await
-                        .context("open QUIC data stream")?;
+                    let stream = conn.open_uni().await.context("open QUIC data stream")?;
                     quic_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
                 }
             },
@@ -251,8 +250,9 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
         .with_context(|| format!("cannot stat {}", file.display()))?
         .len();
 
-    let sender_cores =
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
+    let sender_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u32;
 
     info!("connecting to {destination} (TCP+TLS)");
     let ctrl = connect_tls(destination, config.trusted_fingerprint.as_deref()).await?;
@@ -264,11 +264,12 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
     let rtt_start = Instant::now();
     framing::send_message(
         &mut ctrl_send,
-        &NegotiateRequest { cpu_cores: sender_cores },
+        &NegotiateRequest {
+            cpu_cores: sender_cores,
+        },
     )
     .await?;
-    let neg_resp: NegotiateResponse =
-        framing::recv_message_required(&mut ctrl_recv).await?;
+    let neg_resp: NegotiateResponse = framing::recv_message_required(&mut ctrl_recv).await?;
     let rtt = rtt_start.elapsed();
 
     let trusted_fp = config.trusted_fingerprint.clone();
@@ -308,7 +309,10 @@ async fn tcp_stream_worker(
         .await
         .context("send_from_channel")?;
     // Send TLS close_notify so the receiver sees a clean EOF.
-    stream.shutdown().await.context("TLS shutdown on data stream")?;
+    stream
+        .shutdown()
+        .await
+        .context("TLS shutdown on data stream")?;
     // Drain the server's close_notify before dropping.  Without this, the
     // kernel sends a RST when the socket is dropped with unread data in the
     // receive buffer, which arrives on the server side as ECONNRESET mid-read.
@@ -343,7 +347,12 @@ async fn run_transfer<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>, [u8; 16], Compression, Option<Arc<ChunkHasher>>) -> Fut,
+    F: Fn(
+        tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+        [u8; 16],
+        Compression,
+        Option<Arc<ChunkHasher>>,
+    ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let file_name = file
@@ -353,7 +362,9 @@ where
         .into_owned();
 
     let compression = if config.compress {
-        Compression::Zstd { level: config.compress_level }
+        Compression::Zstd {
+            level: config.compress_level,
+        }
     } else {
         Compression::None
     };
@@ -412,9 +423,10 @@ where
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
     let have: HashSet<u64> = match ready {
-        ReceiverMessage::Ready { received_bits, total_chunks } => {
-            bits_to_chunk_set(&received_bits, total_chunks)
-        }
+        ReceiverMessage::Ready {
+            received_bits,
+            total_chunks,
+        } => bits_to_chunk_set(&received_bits, total_chunks),
         ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
         other => bail!("unexpected message from receiver: {other:?}"),
     };
@@ -434,15 +446,20 @@ where
         None
     } else {
         let path = file.to_owned();
-        Some(tokio::task::spawn_blocking(move || hash_file_sync(&path, chunk_size)))
+        Some(tokio::task::spawn_blocking(move || {
+            hash_file_sync(&path, chunk_size)
+        }))
     };
 
     let pb = make_progress_bar(&file_name, file_size);
     // Seed the bar with bytes the receiver already confirmed (resume).
-    let resume_bytes: u64 = have.iter().map(|&i| {
-        let offset = i * chunk_size as u64;
-        (file_size - offset).min(chunk_size as u64)
-    }).sum();
+    let resume_bytes: u64 = have
+        .iter()
+        .map(|&i| {
+            let offset = i * chunk_size as u64;
+            (file_size - offset).min(chunk_size as u64)
+        })
+        .sum();
     pb.set_position(resume_bytes);
     let transfer_start = Instant::now();
 
@@ -525,7 +542,9 @@ where
 
     let file_hash: [u8; 32] = match file_hasher {
         Some(h) => Arc::try_unwrap(h)
-            .expect("all stream workers have completed; no other Arc<ChunkHasher> references remain")
+            .expect(
+                "all stream workers have completed; no other Arc<ChunkHasher> references remain",
+            )
             .finish()?,
         None => hash_task
             .expect("resume path always spawns hash_task")
@@ -535,7 +554,9 @@ where
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // The reader task keeps consuming Progress messages until Complete arrives.
-    let msg = completion_rx.await.context("receiver closed without completing")?;
+    let msg = completion_rx
+        .await
+        .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
     print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
@@ -565,8 +586,7 @@ fn feed_chunks(
     skip: &HashSet<u64>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>>,
 ) -> Result<()> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
     #[cfg(target_os = "linux")]
     {
@@ -642,7 +662,9 @@ where
             // Previously we hashed raw for file integrity AND payload for wire, doing
             // BLAKE3 twice on the same data for incompressible inputs (~40% CPU waste).
             let chunk_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
-            if let Some(h) = hasher { h.feed(chunk_index, chunk_hash)?; }
+            if let Some(h) = hasher {
+                h.feed(chunk_index, chunk_hash)?;
+            }
             let (payload, compressed) = maybe_compress(raw, &compression)?;
             Ok((chunk_index, payload, chunk_hash, compressed))
         })
@@ -715,7 +737,9 @@ fn print_completion(
     transfer_start: Instant,
 ) -> Result<()> {
     match msg {
-        ReceiverMessage::Complete { file_hash: recv_hash } => {
+        ReceiverMessage::Complete {
+            file_hash: recv_hash,
+        } => {
             if recv_hash != file_hash {
                 bail!("file hash mismatch: receiver computed a different hash");
             }
@@ -742,7 +766,11 @@ fn bits_to_chunk_set(bits: &[u64], total_chunks: u64) -> HashSet<u64> {
             (0u64..64).filter_map(move |bit| {
                 if word & (1 << bit) != 0 {
                     let idx = wi as u64 * 64 + bit;
-                    if idx < total_chunks { Some(idx) } else { None }
+                    if idx < total_chunks {
+                        Some(idx)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -775,7 +803,11 @@ where
 {
     while let Some(fcd) = rx.recv().await {
         framing::send_fec_chunk_data(writer, &fcd).await?;
-        debug!(chunk = fcd.chunk_index, parity = fcd.is_parity, "sent FEC shard");
+        debug!(
+            chunk = fcd.chunk_index,
+            parity = fcd.is_parity,
+            "sent FEC shard"
+        );
     }
     Ok(())
 }
@@ -790,8 +822,7 @@ fn feed_chunks_single(
     chunk_size: usize,
     tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
 ) -> Result<()> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
     #[cfg(target_os = "linux")]
     {
@@ -1011,7 +1042,9 @@ where
         .to_string_lossy()
         .into_owned();
     let compression = if config.compress {
-        Compression::Zstd { level: config.compress_level }
+        Compression::Zstd {
+            level: config.compress_level,
+        }
     } else {
         Compression::None
     };
@@ -1066,7 +1099,10 @@ where
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
     match ready {
-        ReceiverMessage::Ready { received_bits, total_chunks: tc } => {
+        ReceiverMessage::Ready {
+            received_bits,
+            total_chunks: tc,
+        } => {
             let skip_count = bits_to_chunk_set(&received_bits, tc).len();
             if skip_count > 0 {
                 info!(
@@ -1149,7 +1185,9 @@ where
     }
 
     // Ensure encoder and feeder finished cleanly.
-    encoder_task.await.context("stripe encoder task panicked")??;
+    encoder_task
+        .await
+        .context("stripe encoder task panicked")??;
     feeder.await.context("feeder task panicked")??;
 
     pb.set_message("verifying…");
@@ -1159,11 +1197,12 @@ where
         .finish()?;
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    let msg = completion_rx.await.context("receiver closed without completing")?;
+    let msg = completion_rx
+        .await
+        .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
     print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
 
     Ok(())
 }
-

@@ -21,7 +21,7 @@ use crate::fec::codec::FecDecoder;
 use crate::net::connection::{
     cert_fingerprint, generate_self_signed_cert, make_private_key, make_server_endpoint,
 };
-use crate::net::tcp::{ServerTlsStream, make_tls_acceptor};
+use crate::net::tcp::{make_tls_acceptor, ServerTlsStream};
 use crate::protocol::{
     framing,
     messages::{
@@ -50,7 +50,12 @@ impl Server {
     pub fn bind(addr: SocketAddr, output_dir: PathBuf) -> Result<Self> {
         let (endpoint, fingerprint) = make_server_endpoint(addr)?;
         let local_addr = endpoint.local_addr()?;
-        Ok(Self { endpoint, local_addr, fingerprint, output_dir })
+        Ok(Self {
+            endpoint,
+            local_addr,
+            fingerprint,
+            output_dir,
+        })
     }
 
     /// Build from a pre-generated certificate so QUIC and TCP can share one cert.
@@ -64,7 +69,12 @@ impl Server {
         use crate::net::connection::make_server_endpoint_with_cert;
         let endpoint = make_server_endpoint_with_cert(addr, cert, key)?;
         let local_addr = endpoint.local_addr()?;
-        Ok(Self { endpoint, local_addr, fingerprint, output_dir })
+        Ok(Self {
+            endpoint,
+            local_addr,
+            fingerprint,
+            output_dir,
+        })
     }
 
     /// Accept and handle exactly one incoming connection, then return.
@@ -135,7 +145,13 @@ impl TcpServer {
     ) -> Result<Self> {
         let (listener, local_addr) = crate::net::tcp::bind_tcp(addr).await?;
         let acceptor = Arc::new(make_tls_acceptor(cert, key)?);
-        Ok(Self { listener: Arc::new(listener), acceptor, local_addr, fingerprint, output_dir })
+        Ok(Self {
+            listener: Arc::new(listener),
+            acceptor,
+            local_addr,
+            fingerprint,
+            output_dir,
+        })
     }
 
     /// Accept and handle exactly one complete transfer (control + data streams), then return.
@@ -209,7 +225,10 @@ pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
         TcpServer::bind_with_cert(bind, config.output_dir, cert, tcp_key, fingerprint.clone())
             .await?;
 
-    println!("Listening on {} (QUIC + TCP+TLS, auto-fallback)", quic_server.local_addr);
+    println!(
+        "Listening on {} (QUIC + TCP+TLS, auto-fallback)",
+        quic_server.local_addr
+    );
     println!("Certificate fingerprint (share with sender --trust):\n  {fingerprint}");
 
     tokio::try_join!(quic_server.serve(), tcp_server.serve())?;
@@ -220,7 +239,10 @@ pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
     let server = TcpServer::bind(bind, config.output_dir).await?;
     println!("Listening on {} (TCP+TLS)", server.local_addr);
-    println!("Certificate fingerprint (share with sender --trust):\n  {}", server.fingerprint);
+    println!(
+        "Certificate fingerprint (share with sender --trust):\n  {}",
+        server.fingerprint
+    );
     server.serve().await
 }
 
@@ -315,18 +337,13 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
     };
 
     let conn_for_accept = conn.clone();
-    let mut ctrl_send = run_receive(
-        ctrl_send,
-        ctrl_recv,
-        output_dir,
-        move || {
-            let conn = conn_for_accept.clone();
-            async move {
-                let stream = conn.accept_uni().await.context("accept QUIC data stream")?;
-                Ok(Box::new(stream) as Box<dyn AsyncRead + Unpin + Send + 'static>)
-            }
-        },
-    )
+    let mut ctrl_send = run_receive(ctrl_send, ctrl_recv, output_dir, move || {
+        let conn = conn_for_accept.clone();
+        async move {
+            let stream = conn.accept_uni().await.context("accept QUIC data stream")?;
+            Ok(Box::new(stream) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+        }
+    })
     .await?;
 
     // Gracefully close the control stream so the sender sees a clean FIN.
@@ -345,22 +362,19 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
-    run_receive(
-        ctrl_send,
-        ctrl_recv,
-        output_dir,
-        move || {
-            let listener = Arc::clone(&listener);
-            let acceptor = Arc::clone(&acceptor);
-            async move {
-                let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
-                raw.set_nodelay(true)?;
-                let tls =
-                    acceptor.accept(raw).await.context("TLS handshake on data stream")?;
-                Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
-            }
-        },
-    )
+    run_receive(ctrl_send, ctrl_recv, output_dir, move || {
+        let listener = Arc::clone(&listener);
+        let acceptor = Arc::clone(&acceptor);
+        async move {
+            let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
+            raw.set_nodelay(true)?;
+            let tls = acceptor
+                .accept(raw)
+                .await
+                .context("TLS handshake on data stream")?;
+            Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+        }
+    })
     .await?;
     Ok(())
 }
@@ -392,7 +406,12 @@ struct StripeBuffer {
 }
 
 impl StripeBuffer {
-    fn new(stripe_index: u32, data_shards: usize, parity_shards: usize, real_data_count: usize) -> Self {
+    fn new(
+        stripe_index: u32,
+        data_shards: usize,
+        parity_shards: usize,
+        real_data_count: usize,
+    ) -> Self {
         Self {
             stripe_index,
             data_shards,
@@ -413,7 +432,8 @@ impl StripeBuffer {
             if j >= self.parity_shards {
                 bail!(
                     "FEC stripe {}: parity shard index {} out of range",
-                    self.stripe_index, j
+                    self.stripe_index,
+                    j
                 );
             }
             if self.parity[j].is_none() {
@@ -431,7 +451,8 @@ impl StripeBuffer {
             if i >= self.data_shards {
                 bail!(
                     "FEC stripe {}: data shard index {} out of range",
-                    self.stripe_index, i
+                    self.stripe_index,
+                    i
                 );
             }
             if self.data[i].is_none() {
@@ -633,11 +654,20 @@ where
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
-    let receiver_cores =
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u32;
-    framing::send_message(&mut ctrl_send, &NegotiateResponse { cpu_cores: receiver_cores })
-        .await?;
-    debug!(sender_cores = neg_req.cpu_cores, receiver_cores, "negotiation complete");
+    let receiver_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4) as u32;
+    framing::send_message(
+        &mut ctrl_send,
+        &NegotiateResponse {
+            cpu_cores: receiver_cores,
+        },
+    )
+    .await?;
+    debug!(
+        sender_cores = neg_req.cpu_cores,
+        receiver_cores, "negotiation complete"
+    );
 
     let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
     validate_manifest(&manifest)?;
@@ -656,7 +686,9 @@ where
             // the actual filesystem error instead of "connection lost".
             let _ = framing::send_message(
                 &mut ctrl_send,
-                &ReceiverMessage::Error { message: format!("{e:#}") },
+                &ReceiverMessage::Error {
+                    message: format!("{e:#}"),
+                },
             )
             .await;
             return Err(e);
@@ -690,17 +722,21 @@ where
         accept_tasks.spawn(async move {
             tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut)
                 .await
-                .unwrap_or_else(|_| Err(anyhow!("timed out waiting for data stream — sender disconnected")))
+                .unwrap_or_else(|_| {
+                    Err(anyhow!(
+                        "timed out waiting for data stream — sender disconnected"
+                    ))
+                })
         });
     }
 
     // For FEC transfers, workers share a stripe accumulator map.
-    let fec_stripe_bufs: Option<Arc<Mutex<HashMap<u32, StripeBuffer>>>> =
-        if manifest.fec.is_some() {
-            Some(Arc::new(Mutex::new(HashMap::new())))
-        } else {
-            None
-        };
+    let fec_stripe_bufs: Option<Arc<Mutex<HashMap<u32, StripeBuffer>>>> = if manifest.fec.is_some()
+    {
+        Some(Arc::new(Mutex::new(HashMap::new())))
+    } else {
+        None
+    };
 
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     while let Some(accept_res) = accept_tasks.join_next().await {
@@ -715,7 +751,14 @@ where
             let stripe_bufs = Arc::clone(bufs_arc);
             tasks.spawn(async move {
                 recv_fec_stream_worker(
-                    stream, out_file, resume, manifest, pb, hasher, progress_tx, stripe_bufs,
+                    stream,
+                    out_file,
+                    resume,
+                    manifest,
+                    pb,
+                    hasher,
+                    progress_tx,
+                    stripe_bufs,
                 )
                 .await
             });
@@ -731,8 +774,11 @@ where
 
     // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
     // It runs concurrently with the data workers and returns ctrl_send when done.
-    let reporter =
-        tokio::spawn(progress_reporter(ctrl_send, progress_rx, pt.bytes_already_received));
+    let reporter = tokio::spawn(progress_reporter(
+        ctrl_send,
+        progress_rx,
+        pt.bytes_already_received,
+    ));
 
     let task_err = drain_tasks(&mut tasks).await;
     pt.pb.finish();
@@ -756,7 +802,9 @@ where
     if let Some(e) = task_err {
         let _ = framing::send_message(
             &mut ctrl_send,
-            &ReceiverMessage::Error { message: e.to_string() },
+            &ReceiverMessage::Error {
+                message: e.to_string(),
+            },
         )
         .await;
         bail!("{e}");
@@ -825,9 +873,8 @@ fn prepare_transfer(
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            let rc = unsafe {
-                libc::fallocate(f.as_raw_fd(), 0, 0, manifest.file_size as libc::off_t)
-            };
+            let rc =
+                unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, manifest.file_size as libc::off_t) };
             if rc != 0 {
                 f.set_len(manifest.file_size)?;
             }
@@ -858,7 +905,14 @@ fn prepare_transfer(
         None
     };
 
-    Ok(PreparedTransfer { out_file, resume, pb, hasher, bytes_already_received, received_bits })
+    Ok(PreparedTransfer {
+        out_file,
+        resume,
+        pb,
+        hasher,
+        bytes_already_received,
+        received_bits,
+    })
 }
 
 async fn drain_tasks(tasks: &mut JoinSet<Result<()>>) -> Option<anyhow::Error> {
@@ -925,11 +979,7 @@ where
 
     // Final update to make sure the sender sees 100%.
     if bytes_written != last_reported {
-        framing::send_message(
-            &mut ctrl_send,
-            &ReceiverMessage::Progress { bytes_written },
-        )
-        .await?;
+        framing::send_message(&mut ctrl_send, &ReceiverMessage::Progress { bytes_written }).await?;
     }
 
     Ok(ctrl_send)
@@ -974,7 +1024,9 @@ where
         let _ = resume.lock().unwrap().delete();
         framing::send_message(
             ctrl_send,
-            &ReceiverMessage::Error { message: "file hash mismatch".into() },
+            &ReceiverMessage::Error {
+                message: "file hash mismatch".into(),
+            },
         )
         .await?;
         bail!("file hash mismatch — file is corrupted");
@@ -983,7 +1035,10 @@ where
     framing::send_message(ctrl_send, &ReceiverMessage::Complete { file_hash }).await?;
 
     resume.lock().unwrap().delete()?;
-    println!("Received: {}", output_dir.join(&manifest.file_name).display());
+    println!(
+        "Received: {}",
+        output_dir.join(&manifest.file_name).display()
+    );
     Ok(())
 }
 
@@ -1144,7 +1199,10 @@ where
 {
     const MAX_IN_FLIGHT: usize = 4;
     let mut processing: JoinSet<Result<()>> = JoinSet::new();
-    let fec_params = manifest.fec.as_ref().expect("recv_fec_stream_worker called without FEC params");
+    let fec_params = manifest
+        .fec
+        .as_ref()
+        .expect("recv_fec_stream_worker called without FEC params");
     let data_shards = fec_params.data_shards;
     let parity_shards = fec_params.parity_shards;
     let total_chunks = manifest.total_chunks;
@@ -1202,12 +1260,16 @@ where
                 let first = stripe_index as u64 * data_shards as u64;
                 (total_chunks - first).min(data_shards as u64) as usize
             };
-            let buf = bufs
-                .entry(stripe_index)
-                .or_insert_with(|| StripeBuffer::new(stripe_index, data_shards, parity_shards, real_count));
+            let buf = bufs.entry(stripe_index).or_insert_with(|| {
+                StripeBuffer::new(stripe_index, data_shards, parity_shards, real_count)
+            });
             buf.insert(fcd)?;
             let ready = buf.is_ready();
-            if ready { bufs.remove(&stripe_index) } else { None }
+            if ready {
+                bufs.remove(&stripe_index)
+            } else {
+                None
+            }
         };
 
         if let Some(stripe) = ready_stripe {
@@ -1259,13 +1321,23 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
         bail!("manifest: file_name contains null byte");
     }
     if m.file_name.contains('/') || m.file_name.contains('\\') {
-        bail!("manifest: file_name contains path separator: {:?}", m.file_name);
+        bail!(
+            "manifest: file_name contains path separator: {:?}",
+            m.file_name
+        );
     }
     if m.file_name == ".." || m.file_name == "." {
-        bail!("manifest: file_name is a relative-path component: {:?}", m.file_name);
+        bail!(
+            "manifest: file_name is a relative-path component: {:?}",
+            m.file_name
+        );
     }
     if m.file_size > MAX_FILE_SIZE {
-        bail!("manifest: file_size {} exceeds limit of {} bytes", m.file_size, MAX_FILE_SIZE);
+        bail!(
+            "manifest: file_size {} exceeds limit of {} bytes",
+            m.file_size,
+            MAX_FILE_SIZE
+        );
     }
     if m.chunk_size < MIN_CHUNK_SIZE || m.chunk_size > MAX_CHUNK_SIZE {
         bail!(
@@ -1284,7 +1356,10 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
         );
     }
     if m.num_streams == 0 || m.num_streams > MAX_STREAMS {
-        bail!("manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]", m.num_streams);
+        bail!(
+            "manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]",
+            m.num_streams
+        );
     }
     Ok(())
 }

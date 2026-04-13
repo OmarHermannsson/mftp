@@ -57,13 +57,22 @@ pub fn parse_ssh_dest(dest: &str) -> Option<SshDest> {
     }
 
     let (user_host, user, host) = if let Some(at) = before.find('@') {
-        (before.to_owned(), before[..at].to_owned(), before[at + 1..].to_owned())
+        (
+            before.to_owned(),
+            before[..at].to_owned(),
+            before[at + 1..].to_owned(),
+        )
     } else {
         let user = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
         (before.to_owned(), user, before.to_owned())
     };
 
-    Some(SshDest { user_host, user, host, remote_path: after.to_owned() })
+    Some(SshDest {
+        user_host,
+        user,
+        host,
+        remote_path: after.to_owned(),
+    })
 }
 
 // ── SSH launch + transfer ─────────────────────────────────────────────────────
@@ -291,7 +300,10 @@ exec "$f" server --output-dir "$d"{port_arg}"#
     // Write the binary to ssh's stdin, then close it so the remote `cat`
     // sees EOF and the script continues to the exec.
     let mut stdin = child.stdin.take().expect("stdin is piped");
-    stdin.write_all(&binary).await.context("writing binary to ssh stdin")?;
+    stdin
+        .write_all(&binary)
+        .await
+        .context("writing binary to ssh stdin")?;
     drop(stdin);
 
     Ok(child)

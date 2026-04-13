@@ -115,7 +115,10 @@ pub enum ReceiverMessage {
     /// `received_bits[i]` has bit `j` set iff chunk `i*64+j` was already written to
     /// disk.  This is 64× smaller than a list of chunk indices and stays well within
     /// the wire frame limit for any file that mftp can transfer.
-    Ready { received_bits: Vec<u64>, total_chunks: u64 },
+    Ready {
+        received_bits: Vec<u64>,
+        total_chunks: u64,
+    },
     /// Periodic progress update: total bytes written to disk so far.
     /// Sent at most every 100 ms during the data-transfer phase so the
     /// sender can display an accurate progress bar.

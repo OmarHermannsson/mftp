@@ -56,7 +56,7 @@ fn install_crypto_provider() {
 // even with 16 streams.  256 MiB covers 8 streams × 32 MiB each.
 const STREAM_RECEIVE_WINDOW: u32 = super::SOCKET_BUFFER_SIZE as u32; // 32 MiB per stream
 const CONNECTION_RECEIVE_WINDOW: u32 = 8 * super::SOCKET_BUFFER_SIZE as u32; // 256 MiB total
-const SEND_WINDOW: u64 = 8 * super::SOCKET_BUFFER_SIZE as u64;               // 256 MiB
+const SEND_WINDOW: u64 = 8 * super::SOCKET_BUFFER_SIZE as u64; // 256 MiB
 
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
@@ -146,11 +146,10 @@ pub fn make_client_endpoint(
     server_addr: SocketAddr,
 ) -> Result<Endpoint> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-        match trusted_fingerprint {
-            Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-            None => Arc::new(TofuVerifier::new(server_addr)),
-        };
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
+        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
+        None => Arc::new(TofuVerifier::new(server_addr)),
+    };
 
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -165,12 +164,7 @@ pub fn make_client_endpoint(
     let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let socket = make_udp_socket(bind)?;
     let runtime = quinn::default_runtime().context("no async runtime")?;
-    let mut endpoint = Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        socket,
-        runtime,
-    )?;
+    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
@@ -179,16 +173,26 @@ pub fn make_client_endpoint(
 // ── Socket helpers ────────────────────────────────────────────────────────────
 
 fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
-    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
         .context("UDP socket creation failed")?;
 
     // Best-effort: some kernels cap at /proc/sys/net/core/rmem_max.
     if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_RCVBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_RCVBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
     if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!("could not set SO_SNDBUF to {}: {e}", super::SOCKET_BUFFER_SIZE);
+        tracing::warn!(
+            "could not set SO_SNDBUF to {}: {e}",
+            super::SOCKET_BUFFER_SIZE
+        );
     }
 
     socket.set_nonblocking(true)?;
@@ -213,8 +217,7 @@ pub fn generate_self_signed_cert() -> Result<(CertificateDer<'static>, Vec<u8>)>
 
 /// Wrap raw key bytes in a [`PrivateKeyDer`].
 pub fn make_private_key(key_bytes: Vec<u8>) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::try_from(key_bytes)
-        .map_err(|e| anyhow::anyhow!("bad private key: {e}"))
+    PrivateKeyDer::try_from(key_bytes).map_err(|e| anyhow::anyhow!("bad private key: {e}"))
 }
 
 /// SHA-256 fingerprint of a DER certificate, hex-encoded.
@@ -240,11 +243,10 @@ pub fn make_client_tls_config(
     server_addr: SocketAddr,
 ) -> Result<rustls::ClientConfig> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-        match trusted_fingerprint {
-            Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-            None => Arc::new(TofuVerifier::new(server_addr)),
-        };
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
+        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
+        None => Arc::new(TofuVerifier::new(server_addr)),
+    };
     Ok(rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -355,7 +357,9 @@ impl PinnedFingerprintVerifier {
         if fp.len() != 64 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!("invalid fingerprint (expected 64 hex chars): {fp}");
         }
-        Ok(Self { expected: fp.to_ascii_lowercase() })
+        Ok(Self {
+            expected: fp.to_ascii_lowercase(),
+        })
     }
 }
 
@@ -440,12 +444,18 @@ fn load_known_host(addr: SocketAddr) -> Option<String> {
 
 /// Append an `addr fingerprint` entry to `~/.config/mftp/known_hosts`.
 fn store_known_host(addr: SocketAddr, fp: &str) {
-    let Some(path) = known_hosts_path() else { return };
+    let Some(path) = known_hosts_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "{addr} {fp}");
     }
 }
@@ -458,14 +468,20 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
 /// must refuse the connection and tell the user to pass `--trust <fingerprint>`.
 fn prompt_trust() -> bool {
     use std::io::{BufRead, BufReader, Write};
-    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+    let Ok(mut tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
         // No controlling terminal — cannot prompt.  Caller emits error with --trust hint.
         return false;
     };
     let _ = write!(tty, "Trust this certificate? [yes/N]: ");
     let _ = tty.flush();
     // Re-open for reading so we don't hold a conflicting borrow.
-    let Ok(tty_r) = std::fs::File::open("/dev/tty") else { return false };
+    let Ok(tty_r) = std::fs::File::open("/dev/tty") else {
+        return false;
+    };
     let mut answer = String::new();
     BufReader::new(tty_r).read_line(&mut answer).ok();
     answer.trim().eq_ignore_ascii_case("yes")

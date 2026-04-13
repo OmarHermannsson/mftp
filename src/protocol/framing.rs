@@ -34,8 +34,8 @@ where
     T: serde::Serialize,
 {
     let payload = bincode::serialize(msg)?;
-    let len = u32::try_from(payload.len())
-        .context("serialized message exceeds 4 GiB — cannot frame")?;
+    let len =
+        u32::try_from(payload.len()).context("serialized message exceeds 4 GiB — cannot frame")?;
     // Write length prefix + payload as a single buffer so the TLS layer sees one
     // contiguous write (no separate tiny record for the 4-byte length prefix).
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -87,10 +87,18 @@ where
     let mut hdr = [0u8; 4 + CHUNK_HDR];
 
     // Single byte first so we can detect clean EOF without treating it as an error.
-    if stream.read(&mut hdr[..1]).await.context("read chunk frame byte 0")? == 0 {
+    if stream
+        .read(&mut hdr[..1])
+        .await
+        .context("read chunk frame byte 0")?
+        == 0
+    {
         return Ok(None);
     }
-    stream.read_exact(&mut hdr[1..]).await.context("read chunk frame header")?;
+    stream
+        .read_exact(&mut hdr[1..])
+        .await
+        .context("read chunk frame header")?;
 
     let frame_body_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
     if frame_body_len > MAX_DATA_FRAME_SIZE as usize {
@@ -119,7 +127,13 @@ where
         .await
         .context("read chunk data payload")?;
 
-    Ok(Some(ChunkData { transfer_id, chunk_index, chunk_hash, compressed, payload }))
+    Ok(Some(ChunkData {
+        transfer_id,
+        chunk_index,
+        chunk_hash,
+        compressed,
+        payload,
+    }))
 }
 
 // ── FEC chunk-data framing ────────────────────────────────────────────────────
@@ -147,8 +161,9 @@ where
 {
     let shard_count = msg.shard_lengths.len() as u32;
     let payload_len = msg.payload.len();
-    let frame_body_len = u32::try_from(FEC_FIXED_HDR + (shard_count as usize) * 5 + 8 + payload_len)
-        .context("FEC chunk data frame too large")?;
+    let frame_body_len =
+        u32::try_from(FEC_FIXED_HDR + (shard_count as usize) * 5 + 8 + payload_len)
+            .context("FEC chunk data frame too large")?;
 
     // Build frame prefix + fixed header + shard metadata into one contiguous buffer.
     let var_hdr_len = (shard_count as usize) * 5; // 4 bytes per length + 1 byte per flag
@@ -184,10 +199,18 @@ where
     const FIXED_TOTAL: usize = 4 + FEC_FIXED_HDR;
     let mut hdr = [0u8; FIXED_TOTAL];
 
-    if stream.read(&mut hdr[..1]).await.context("read FEC chunk frame byte 0")? == 0 {
+    if stream
+        .read(&mut hdr[..1])
+        .await
+        .context("read FEC chunk frame byte 0")?
+        == 0
+    {
         return Ok(None); // clean EOF at frame boundary
     }
-    stream.read_exact(&mut hdr[1..]).await.context("read FEC chunk frame fixed header")?;
+    stream
+        .read_exact(&mut hdr[1..])
+        .await
+        .context("read FEC chunk frame fixed header")?;
 
     let frame_body_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
     if frame_body_len > MAX_DATA_FRAME_SIZE as usize {
@@ -208,7 +231,10 @@ where
     // Read shard_lengths (4 bytes each).
     let mut lengths_buf = vec![0u8; shard_count * 4];
     if !lengths_buf.is_empty() {
-        stream.read_exact(&mut lengths_buf).await.context("read FEC shard_lengths")?;
+        stream
+            .read_exact(&mut lengths_buf)
+            .await
+            .context("read FEC shard_lengths")?;
     }
     let shard_lengths: Vec<u32> = lengths_buf
         .chunks(4)
@@ -226,7 +252,10 @@ where
 
     // Read payload_len then payload.
     let mut payload_len_buf = [0u8; 8];
-    stream.read_exact(&mut payload_len_buf).await.context("read FEC payload_len")?;
+    stream
+        .read_exact(&mut payload_len_buf)
+        .await
+        .context("read FEC payload_len")?;
     let payload_len = u64::from_le_bytes(payload_len_buf) as usize;
 
     let expected_frame_body = FEC_FIXED_HDR + shard_count * 5 + 8 + payload_len;
@@ -238,7 +267,10 @@ where
     }
 
     let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload).await.context("read FEC chunk payload")?;
+    stream
+        .read_exact(&mut payload)
+        .await
+        .context("read FEC chunk payload")?;
 
     Ok(Some(FecChunkData {
         transfer_id,
@@ -296,16 +328,27 @@ where
     // Read the first byte with read() so we can distinguish a clean EOF
     // (returns 0) from a mid-frame truncation.
     let mut len_buf = [0u8; 4];
-    if stream.read(&mut len_buf[..1]).await.context("read frame header byte 0")? == 0 {
+    if stream
+        .read(&mut len_buf[..1])
+        .await
+        .context("read frame header byte 0")?
+        == 0
+    {
         return Ok(None); // clean EOF at a frame boundary
     }
-    stream.read_exact(&mut len_buf[1..]).await.context("read frame header bytes 1-3")?;
+    stream
+        .read_exact(&mut len_buf[1..])
+        .await
+        .context("read frame header bytes 1-3")?;
 
     let len = u32::from_le_bytes(len_buf);
     if len > max_size {
         bail!("frame too large: {len} bytes (limit {max_size})");
     }
     let mut buf = vec![0u8; len as usize];
-    stream.read_exact(&mut buf).await.with_context(|| format!("read frame body ({len} bytes)"))?;
+    stream
+        .read_exact(&mut buf)
+        .await
+        .with_context(|| format!("read frame body ({len} bytes)"))?;
     Ok(Some(bincode::deserialize(&buf)?))
 }

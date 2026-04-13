@@ -81,7 +81,10 @@ impl ChunkHasher {
             loop {
                 let key = g.next;
                 match g.pending.remove(&key) {
-                    Some(h) => { g.collected.push(h); g.next += 1; }
+                    Some(h) => {
+                        g.collected.push(h);
+                        g.next += 1;
+                    }
                     None => break,
                 }
             }

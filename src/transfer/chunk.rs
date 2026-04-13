@@ -38,7 +38,11 @@ impl ChunkQueue {
         }
         let offset = idx * self.chunk_size as u64;
         let len = ((self.file_size - offset) as usize).min(self.chunk_size);
-        Some(ChunkInfo { index: idx, offset, len })
+        Some(ChunkInfo {
+            index: idx,
+            offset,
+            len,
+        })
     }
 
     pub fn total_chunks(&self) -> u64 {

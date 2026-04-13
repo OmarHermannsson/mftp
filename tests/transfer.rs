@@ -220,22 +220,35 @@ async fn roundtrip_tcp(
     )
     .await;
     let recv_res = recv_task.await?;
-    if let Err(ref e) = send_res { eprintln!("SENDER ERROR: {e:#}"); }
-    if let Err(ref e) = recv_res { eprintln!("RECEIVER ERROR: {e:#}"); }
+    if let Err(ref e) = send_res {
+        eprintln!("SENDER ERROR: {e:#}");
+    }
+    if let Err(ref e) = recv_res {
+        eprintln!("RECEIVER ERROR: {e:#}");
+    }
     recv_res?;
     send_res?;
 
     let file_name = src.file_name().unwrap().to_string_lossy();
     let received = std::fs::read(recv_dir.path().join(file_name.as_ref()))?;
     let original = std::fs::read(&src)?;
-    assert_eq!(received, original, "TCP: received file differs from original");
+    assert_eq!(
+        received, original,
+        "TCP: received file differs from original"
+    );
     Ok(())
 }
 
 /// Minimal TLS two-stream test (no mftp logic).
 #[tokio::test]
 async fn test_tls_two_streams_raw() -> anyhow::Result<()> {
-    use mftp::net::{connection::{generate_self_signed_cert, make_private_key, make_server_tls_config, make_client_tls_config}, tcp::bind_tcp};
+    use mftp::net::{
+        connection::{
+            generate_self_signed_cert, make_client_tls_config, make_private_key,
+            make_server_tls_config,
+        },
+        tcp::bind_tcp,
+    };
     use rustls::pki_types::ServerName;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -333,7 +346,10 @@ async fn roundtrip_fec(
             trusted_fingerprint: Some(fingerprint),
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
-            fec: Some(FecParams { data_shards, parity_shards }),
+            fec: Some(FecParams {
+                data_shards,
+                parity_shards,
+            }),
         },
     )
     .await?;
@@ -426,13 +442,20 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             // FEC requested but should be silently discarded for TCP
-            fec: Some(FecParams { data_shards: 4, parity_shards: 1 }),
+            fec: Some(FecParams {
+                data_shards: 4,
+                parity_shards: 1,
+            }),
         },
     )
     .await;
     let recv_res = recv_task.await?;
-    if let Err(ref e) = send_res { eprintln!("SENDER ERROR: {e:#}"); }
-    if let Err(ref e) = recv_res { eprintln!("RECEIVER ERROR: {e:#}"); }
+    if let Err(ref e) = send_res {
+        eprintln!("SENDER ERROR: {e:#}");
+    }
+    if let Err(ref e) = recv_res {
+        eprintln!("RECEIVER ERROR: {e:#}");
+    }
     recv_res?;
     send_res?;
 

@@ -61,9 +61,10 @@ impl ResumeSnapshot {
     pub fn write_to_disk(&self) -> Result<()> {
         let tmp = self.path.with_extension("tmp");
         {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
-            f.write_all(&self.payload).context("write resume snapshot")?;
+            let mut f =
+                std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(&self.payload)
+                .context("write resume snapshot")?;
             f.sync_data().context("fsync resume snapshot")?;
         }
         std::fs::rename(&tmp, &self.path)
@@ -93,9 +94,7 @@ impl ResumeState {
             Ok(state) => {
                 let n = state.received_chunks().len();
                 if n > 0 {
-                    tracing::info!(
-                        "resuming transfer: {n}/{total_chunks} chunks already on disk"
-                    );
+                    tracing::info!("resuming transfer: {n}/{total_chunks} chunks already on disk");
                 }
                 state
             }
@@ -110,8 +109,8 @@ impl ResumeState {
         let name = format!("{}.mftp-resume", hex::encode(transfer_id));
         let path = dir.join(&name);
 
-        let mut f = std::fs::File::open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let mut f =
+            std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
 
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic).context("read magic")?;
@@ -141,7 +140,13 @@ impl ResumeState {
             );
         }
 
-        Ok(Self { path, transfer_id: *transfer_id, received: data.received, total_chunks, dirty: 0 })
+        Ok(Self {
+            path,
+            transfer_id: *transfer_id,
+            received: data.received,
+            total_chunks,
+            dirty: 0,
+        })
     }
 
     pub fn mark_received(&mut self, chunk_index: u64) {
@@ -157,7 +162,9 @@ impl ResumeState {
     }
 
     pub fn missing_chunks(&self) -> Vec<u64> {
-        (0..self.total_chunks).filter(|&i| !self.is_received(i)).collect()
+        (0..self.total_chunks)
+            .filter(|&i| !self.is_received(i))
+            .collect()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -175,7 +182,9 @@ impl ResumeState {
     }
 
     pub fn received_chunks(&self) -> Vec<u64> {
-        (0..self.total_chunks).filter(|&i| self.is_received(i)).collect()
+        (0..self.total_chunks)
+            .filter(|&i| self.is_received(i))
+            .collect()
     }
 
     /// Return a clone of the raw packed bitvector for use in the wire protocol.
@@ -212,7 +221,10 @@ impl ResumeState {
         let mut payload = Vec::with_capacity(RESUME_MAGIC.len() + bincode_payload.len());
         payload.extend_from_slice(RESUME_MAGIC);
         payload.extend_from_slice(&bincode_payload);
-        Ok(ResumeSnapshot { path: self.path.clone(), payload })
+        Ok(ResumeSnapshot {
+            path: self.path.clone(),
+            payload,
+        })
     }
 
     /// Persist the current state to disk atomically (write-then-rename).

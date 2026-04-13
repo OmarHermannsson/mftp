@@ -27,8 +27,8 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha1::Sha1;
 use ssh2::{MethodType, OpenFlags, OpenType, Session};
 
 use crate::ssh::SshDest;
@@ -53,11 +53,7 @@ pub async fn send_via_sftp(file: PathBuf, dest: SshDest, n_streams: usize) -> Re
         .with_context(|| format!("stat {}", file.display()))?
         .len();
 
-    let remote_path = format!(
-        "{}/{}",
-        dest.remote_path.trim_end_matches('/'),
-        file_name
-    );
+    let remote_path = format!("{}/{}", dest.remote_path.trim_end_matches('/'), file_name);
 
     eprintln!(
         "[mftp] SFTP fallback: {n_streams} streams → {} (single SSH encryption layer)",
@@ -149,9 +145,16 @@ fn sftp_worker(
     let sftp = sess.sftp().context("open SFTP subsystem")?;
 
     let mut remote_file = sftp
-        .open_mode(Path::new(remote_path), OpenFlags::WRITE, 0o644, OpenType::File)
+        .open_mode(
+            Path::new(remote_path),
+            OpenFlags::WRITE,
+            0o644,
+            OpenType::File,
+        )
         .with_context(|| format!("SFTP open {remote_path}"))?;
-    remote_file.seek(SeekFrom::Start(offset)).context("SFTP seek")?;
+    remote_file
+        .seek(SeekFrom::Start(offset))
+        .context("SFTP seek")?;
 
     let local_file =
         std::fs::File::open(file_path).with_context(|| format!("open {}", file_path.display()))?;
@@ -193,7 +196,8 @@ fn create_remote_file(dest: &SshDest, remote_path: &str, file_size: u64) -> Resu
     if file_size > 0 {
         f.seek(SeekFrom::Start(file_size.saturating_sub(1)))
             .context("SFTP seek for sparse allocation")?;
-        f.write_all(&[0u8]).context("SFTP sparse allocation write")?;
+        f.write_all(&[0u8])
+            .context("SFTP sparse allocation write")?;
     }
 
     Ok(())
@@ -324,7 +328,9 @@ fn host_field_matches_hashed(hostname: &str, field: &str) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(&salt) else { return false };
+    let Ok(mut mac) = Hmac::<Sha1>::new_from_slice(&salt) else {
+        return false;
+    };
     mac.update(hostname.as_bytes());
     mac.finalize().into_bytes().as_slice() == expected.as_slice()
 }
