@@ -852,6 +852,7 @@ fn feed_chunks_single(
 /// `buf` must have exactly `encoder.data_shards` entries.  Entries at indices
 /// `[real_count..data_shards)` are synthetic zeros (last-stripe padding) and
 /// are used for RS parity computation but **not** dispatched as data shards.
+#[allow(clippy::too_many_arguments)]
 fn encode_and_dispatch(
     buf: &[(u64, Vec<u8>)],
     real_count: usize,
@@ -909,8 +910,8 @@ fn encode_and_dispatch(
     }
 
     // Step 4: dispatch parity shards (all, even for partial last stripe).
-    for j in 0..parity_shards {
-        let parity_hash = *blake3::hash(&parity[j]).as_bytes();
+    for (j, parity_shard) in parity.iter().enumerate().take(parity_shards) {
+        let parity_hash = *blake3::hash(parity_shard).as_bytes();
         let fcd = FecChunkData {
             transfer_id,
             chunk_index: stripe_index as u64 * (data_shards + parity_shards) as u64
@@ -923,7 +924,7 @@ fn encode_and_dispatch(
             is_parity: true,
             shard_lengths: shard_lengths.clone(),
             shard_compressed: shard_compressed.clone(),
-            payload: parity[j].clone(),
+            payload: parity_shard.clone(),
         };
         if worker_txs[*worker_i].blocking_send(fcd).is_err() {
             bail!("FEC worker channel closed prematurely");
@@ -957,28 +958,23 @@ fn stripe_encode_chunks(
     // Accumulate `data_shards` chunks per stripe before encoding.
     let mut buf: Vec<(u64, Vec<u8>)> = Vec::with_capacity(data_shards);
 
-    loop {
-        match chunk_rx.blocking_recv() {
-            Some(item) => {
-                buf.push(item);
-                if buf.len() == data_shards {
-                    encode_and_dispatch(
-                        &buf,
-                        data_shards, // all real
-                        &encoder,
-                        &compression,
-                        transfer_id,
-                        stripe_index,
-                        &worker_txs,
-                        &mut worker_i,
-                        n,
-                        &file_hasher,
-                    )?;
-                    buf.clear();
-                    stripe_index += 1;
-                }
-            }
-            None => break, // feeder finished
+    while let Some(item) = chunk_rx.blocking_recv() {
+        buf.push(item);
+        if buf.len() == data_shards {
+            encode_and_dispatch(
+                &buf,
+                data_shards, // all real
+                &encoder,
+                &compression,
+                transfer_id,
+                stripe_index,
+                &worker_txs,
+                &mut worker_i,
+                n,
+                &file_hasher,
+            )?;
+            buf.clear();
+            stripe_index += 1;
         }
     }
 

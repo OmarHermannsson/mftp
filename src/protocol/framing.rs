@@ -143,7 +143,7 @@ where
 ///   +  compressed u8 [1]  +  stripe_index u32 [4]
 ///   +  shard_index_in_stripe u16 [2]  +  is_parity u8 [1]
 ///   +  shard_count u32 [4]
-///   = 68 bytes
+///      = 68 bytes
 const FEC_FIXED_HDR: usize = 16 + 8 + 32 + 1 + 4 + 2 + 1 + 4;
 
 /// Send a `FecChunkData` frame without copying the payload through bincode.

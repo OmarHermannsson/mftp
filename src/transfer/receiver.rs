@@ -393,6 +393,7 @@ struct StripeBuffer {
     /// only for the last stripe when `total_chunks % data_shards != 0`).
     real_data_count: usize,
     /// Received data shard slots: `(compressed_payload, chunk_hash, compressed_flag)`.
+    #[allow(clippy::type_complexity)]
     data: Vec<Option<(Vec<u8>, [u8; 32], bool)>>,
     /// Received parity shard slots (RS-encoded payload at stripe-max length).
     parity: Vec<Option<Vec<u8>>>,
@@ -477,6 +478,7 @@ impl StripeBuffer {
 /// trimming.  `expected_hash` is `Some(h)` for directly received shards (verify
 /// against `blake3(raw)`), `None` for reconstructed shards (trust RS; file hash
 /// catches errors end-to-end).
+#[allow(clippy::too_many_arguments)]
 fn write_fec_chunk(
     chunk_index: u64,
     payload: &[u8],
@@ -1124,7 +1126,7 @@ where
             }
 
             let offset = chunk_index * chunk_size as u64;
-            crate::fs_ext::write_all_at(&*out_file, &data, offset)
+            crate::fs_ext::write_all_at(&out_file, &data, offset)
                 .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
 
             // Feed the already-verified hash (not the raw bytes) — ChunkHasher
@@ -1184,6 +1186,7 @@ where
 /// At most `MAX_IN_FLIGHT` stripe-processing tasks run concurrently per stream
 /// worker.  The shared `stripe_bufs` map bounds total in-flight stripes across
 /// all workers.
+#[allow(clippy::too_many_arguments)]
 async fn recv_fec_stream_worker<R>(
     mut stream: R,
     out_file: Arc<std::fs::File>,

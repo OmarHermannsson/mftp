@@ -168,31 +168,27 @@ async fn main() -> Result<()> {
                 (Some(Transport::Sftp), _) => Some(ForcedTransport::Sftp),
                 (None, false) => None,
             };
-            let fec = cli
-                .fec
-                .as_deref()
-                .map(|s| {
-                    let parts: Vec<&str> = s.splitn(2, ':').collect();
-                    if parts.len() != 2 {
-                        eprintln!("[mftp] --fec must be DATA:PARITY (e.g. 8:2); ignoring");
-                        return None;
+            let fec = cli.fec.as_deref().and_then(|s| {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    eprintln!("[mftp] --fec must be DATA:PARITY (e.g. 8:2); ignoring");
+                    return None;
+                }
+                let data = parts[0].parse::<usize>().ok();
+                let parity = parts[1].parse::<usize>().ok();
+                match (data, parity) {
+                    (Some(d), Some(p)) if d >= 2 && p >= 1 => Some(FecParams {
+                        data_shards: d,
+                        parity_shards: p,
+                    }),
+                    _ => {
+                        eprintln!(
+                            "[mftp] --fec: DATA must be ≥ 2 and PARITY must be ≥ 1; ignoring"
+                        );
+                        None
                     }
-                    let data = parts[0].parse::<usize>().ok();
-                    let parity = parts[1].parse::<usize>().ok();
-                    match (data, parity) {
-                        (Some(d), Some(p)) if d >= 2 && p >= 1 => Some(FecParams {
-                            data_shards: d,
-                            parity_shards: p,
-                        }),
-                        _ => {
-                            eprintln!(
-                                "[mftp] --fec: DATA must be ≥ 2 and PARITY must be ≥ 1; ignoring"
-                            );
-                            None
-                        }
-                    }
-                })
-                .flatten();
+                }
+            });
             let config = sender::SendConfig {
                 streams: cli.streams,
                 chunk_size: cli.chunk_size,

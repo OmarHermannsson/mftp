@@ -21,7 +21,7 @@ pub struct FecEncoder {
 impl FecEncoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> Result<Self> {
         let rs = ReedSolomon::new(data_shards, parity_shards)
-            .map_err(|e| anyhow::anyhow!("FEC encoder init: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("FEC encoder init: {e:?}"))?;
         Ok(Self {
             rs,
             data_shards,
@@ -68,7 +68,7 @@ impl FecEncoder {
 
         self.rs
             .encode(&mut shards)
-            .map_err(|e| anyhow::anyhow!("FEC encode: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("FEC encode: {e:?}"))?;
 
         // Parity shards are the tail of the slice after encode.
         let parity: Vec<Vec<u8>> = shards.drain(self.data_shards..).collect();
@@ -87,7 +87,7 @@ pub struct FecDecoder {
 impl FecDecoder {
     pub fn new(data_shards: usize, parity_shards: usize) -> Result<Self> {
         let rs = ReedSolomon::new(data_shards, parity_shards)
-            .map_err(|e| anyhow::anyhow!("FEC decoder init: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("FEC decoder init: {e:?}"))?;
         Ok(Self {
             rs,
             data_shards,
@@ -120,7 +120,7 @@ impl FecDecoder {
         }
         self.rs
             .reconstruct(&mut shards)
-            .map_err(|e| anyhow::anyhow!("FEC reconstruct: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("FEC reconstruct: {e:?}"))?;
 
         // Reconstruct fills all None slots.  Extract data shards and trim.
         let data: Vec<Vec<u8>> = shards
