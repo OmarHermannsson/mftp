@@ -808,13 +808,13 @@ where
                         )
                         .await?;
                         pending_scale = Some(target);
-                    }
-                    Some(ScaleMsg::Ack(accepted)) if config.fec.is_none() => {
+                        // Scale-up: open new streams NOW, before the receiver acks.
+                        // The receiver calls accept_stream() as soon as it processes
+                        // AdjustStreams; if we wait for the ack first, the two sides
+                        // deadlock (receiver blocks on accept, sender blocks on ack).
                         let current = current_streams_arc.load(AtomicOrd::Relaxed);
-                        let new_count = accepted as usize;
-                        if new_count > current {
-                            // Scale-up: spawn additional workers for the new streams.
-                            let extra = new_count - current;
+                        if target as usize > current {
+                            let extra = target as usize - current;
                             for _ in 0..extra {
                                 let h = file_hasher.clone();
                                 tasks.spawn(spawn_worker(
@@ -826,6 +826,28 @@ where
                                 ));
                                 active_workers += 1;
                             }
+                            current_streams_arc.store(target as usize, AtomicOrd::Relaxed);
+                            if let Some(h) = &file_hasher {
+                                h.update_stream_count(target as usize);
+                            }
+                            tracing::info!(
+                                previous = current,
+                                now = target,
+                                "scaling up: connecting {extra} new streams"
+                            );
+                        }
+                    }
+                    Some(ScaleMsg::Ack(accepted)) if config.fec.is_none() => {
+                        let current = current_streams_arc.load(AtomicOrd::Relaxed);
+                        let new_count = accepted as usize;
+                        if new_count < current {
+                            // Receiver accepted fewer streams than we opened — either a
+                            // scale-down ack or a partial scale-up (some accepts failed).
+                            // Signal excess workers to stop after their current chunk.
+                            // active_workers is NOT decremented here; it decrements via
+                            // tasks.join_next() as each worker exits.
+                            let excess = current - new_count;
+                            excess_stop.store(excess, AtomicOrd::Release);
                             current_streams_arc.store(new_count, AtomicOrd::Relaxed);
                             if let Some(h) = &file_hasher {
                                 h.update_stream_count(new_count);
@@ -833,20 +855,10 @@ where
                             tracing::info!(
                                 previous = current,
                                 now = new_count,
-                                "scaled up to {new_count} streams"
-                            );
-                        } else if new_count < current {
-                            // Scale-down: signal excess workers to stop after their
-                            // current chunk.  active_workers is NOT decremented here —
-                            // it decrements via tasks.join_next() as each worker exits.
-                            let excess = current - new_count;
-                            excess_stop.store(excess, AtomicOrd::Release);
-                            current_streams_arc.store(new_count, AtomicOrd::Relaxed);
-                            tracing::info!(
-                                previous = current,
-                                now = new_count,
                                 "scaling down: {excess} workers will exit after current chunk"
                             );
+                        } else if new_count == current {
+                            tracing::info!(now = new_count, "scaled up to {new_count} streams");
                         }
                         pending_scale = None;
                     }

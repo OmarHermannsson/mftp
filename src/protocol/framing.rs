@@ -42,6 +42,7 @@ where
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&payload);
     stream.write_all(&frame).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -71,6 +72,7 @@ where
 
     stream.write_all(&hdr).await?;
     stream.write_all(&msg.payload).await?;
+    stream.flush().await?;
     Ok(())
 }
 
@@ -185,6 +187,7 @@ where
 
     stream.write_all(&hdr).await?;
     stream.write_all(&msg.payload).await?;
+    stream.flush().await?;
     Ok(())
 }
 
