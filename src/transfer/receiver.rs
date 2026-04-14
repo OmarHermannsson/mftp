@@ -537,7 +537,7 @@ fn write_fec_chunk(
     }
 
     let offset = chunk_index * chunk_size as u64;
-    crate::fs_ext::write_all_at(out_file, &data, offset)
+    crate::fs_ext::write_all_at_advise(out_file, &data, offset)
         .with_context(|| format!("write FEC chunk {chunk_index} at offset {offset}"))?;
 
     if let Some(h) = hasher {
@@ -755,6 +755,14 @@ where
     // Shared metrics: in-flight task count and peak disk latency.
     let stats = ReceiverStats::new();
 
+    // Global semaphore that caps concurrent pwrite operations across all stream
+    // workers.  Without this, N streams × MAX_IN_FLIGHT tasks each writing an
+    // 8 MiB chunk can generate 256+ MiB of dirty pages simultaneously, causing
+    // the kernel to stall pwrite callers while it flushes.  Limiting to 8
+    // concurrent writers keeps peak dirty pages at ~64 MiB, well below the
+    // kernel's dirty_ratio threshold on typical systems.
+    let write_sem = Arc::new(tokio::sync::Semaphore::new(8));
+
     // Accept all N data streams concurrently.
     //
     // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
@@ -796,6 +804,7 @@ where
         let hasher = pt.hasher.clone();
         let ptx = progress_tx.clone();
         let st = Arc::clone(&stats);
+        let wsem = Arc::clone(&write_sem);
         if let Some(ref bufs_arc) = fec_stripe_bufs {
             let stripe_bufs = Arc::clone(bufs_arc);
             tasks.spawn(async move {
@@ -809,12 +818,16 @@ where
                     ptx,
                     stripe_bufs,
                     st,
+                    wsem,
                 )
                 .await
             });
         } else {
             tasks.spawn(async move {
-                recv_stream_worker(stream, out_file, resume, manifest_c, pb, hasher, ptx, st).await
+                recv_stream_worker(
+                    stream, out_file, resume, manifest_c, pb, hasher, ptx, st, wsem,
+                )
+                .await
             });
         }
     }
@@ -875,8 +888,13 @@ where
                                 let hasher = pt.hasher.clone();
                                 let ptx = scale_progress_tx.clone();
                                 let st = Arc::clone(&stats);
+                                let wsem = Arc::clone(&write_sem);
                                 tasks.spawn(async move {
-                                    recv_stream_worker(stream, out_file, resume, manifest_c, pb, hasher, ptx, st).await
+                                    recv_stream_worker(
+                                        stream, out_file, resume, manifest_c, pb, hasher, ptx, st,
+                                        wsem,
+                                    )
+                                    .await
                                 });
                                 accepted += 1;
                                 active_workers += 1;
@@ -1014,6 +1032,14 @@ fn prepare_transfer(
         }
         #[cfg(not(target_os = "linux"))]
         f.set_len(manifest.file_size)?;
+        // On macOS, disable the page cache for this fd so writes bypass the
+        // unified buffer cache entirely.  This prevents dirty-page accumulation
+        // without needing per-write posix_fadvise (which macOS lacks).
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
+        }
         f
     });
 
@@ -1237,6 +1263,7 @@ async fn recv_stream_worker<R>(
     hasher: Option<Arc<ChunkHasher>>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
     stats: Arc<ReceiverStats>,
+    write_sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1295,6 +1322,17 @@ where
         let progress_tx = progress_tx.clone();
         let stats = Arc::clone(&stats);
 
+        // Acquire the global write semaphore before spawning.  This limits peak
+        // concurrent pwrite calls across all streams to 8, capping dirty-page
+        // pressure at ~64 MiB instead of the per-stream-MAX_IN_FLIGHT * N_streams
+        // ceiling (~256 MiB for 8 streams).  The permit is moved into the blocking
+        // task and dropped immediately after the write completes.
+        let write_permit = write_sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("write semaphore closed");
+
         stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
         processing.spawn_blocking(move || -> Result<()> {
             // Decompress first: chunk_hash is blake3(raw_bytes) on the sender,
@@ -1313,8 +1351,11 @@ where
 
             let offset = chunk_index * chunk_size as u64;
             let write_start = std::time::Instant::now();
-            crate::fs_ext::write_all_at(&out_file, &data, offset)
+            crate::fs_ext::write_all_at_advise(&out_file, &data, offset)
                 .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
+            // Release the write semaphore now that the pwrite (and its page-cache
+            // advisories) is done; the remaining work below is cheap.
+            drop(write_permit);
 
             // Feed the already-verified hash (not the raw bytes) — ChunkHasher
             // collects per-chunk hashes and combines them, no second BLAKE3 pass.
@@ -1389,6 +1430,7 @@ async fn recv_fec_stream_worker<R>(
     progress_tx: tokio::sync::mpsc::Sender<u64>,
     stripe_bufs: Arc<Mutex<HashMap<u32, StripeBuffer>>>,
     stats: Arc<ReceiverStats>,
+    write_sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1475,10 +1517,16 @@ where
             let pb = Arc::clone(&pb);
             let ptx = progress_tx.clone();
             let stats = Arc::clone(&stats);
+            let write_permit = write_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("write semaphore closed");
             stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
             processing.spawn_blocking(move || {
                 let write_start = std::time::Instant::now();
                 let result = process_stripe(stripe, chunk_size, out_file, resume, hasher, pb, ptx);
+                drop(write_permit);
                 let write_us = write_start.elapsed().as_micros() as u32;
                 stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
                 stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);

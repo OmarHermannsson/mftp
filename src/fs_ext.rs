@@ -11,6 +11,8 @@
 
 use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 /// Read exactly `buf.len()` bytes from `file` at `offset`.
 ///
@@ -66,4 +68,36 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
         }
         Ok(())
     }
+}
+
+/// Write all of `buf` to `file` at `offset`, then advise the kernel to begin
+/// flushing the written pages and release them from the page cache.
+///
+/// On Linux: calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` first to initiate
+/// non-blocking writeback, then `posix_fadvise(FADV_DONTNEED)` to drop the
+/// pages from the cache.  Together these prevent dirty-page accumulation when
+/// many concurrent writers are active — without them, the kernel accumulates
+/// dirty pages until the dirty_ratio threshold triggers a synchronous stall.
+///
+/// On macOS: identical to `write_all_at`; callers should set `F_NOCACHE` on
+/// the fd at open time to achieve an equivalent effect for the whole file.
+///
+/// On Windows: identical to `write_all_at`.
+pub fn write_all_at_advise(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    write_all_at(file, buf, offset)?;
+    #[cfg(target_os = "linux")]
+    {
+        let fd = file.as_raw_fd();
+        let off = offset as i64;
+        let len = buf.len() as i64;
+        // Kick off async writeback for this range (non-blocking).
+        unsafe {
+            libc::sync_file_range(fd, off, len, libc::SYNC_FILE_RANGE_WRITE);
+        }
+        // Release pages from the page cache so they don't accumulate as dirty.
+        unsafe {
+            libc::posix_fadvise(fd, off, len, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    Ok(())
 }
