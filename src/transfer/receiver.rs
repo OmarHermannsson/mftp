@@ -682,7 +682,7 @@ async fn run_receive<CW, CR, F, Fut>(
 ) -> Result<CW>
 where
     CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    CR: tokio::io::AsyncRead + Unpin,
+    CR: tokio::io::AsyncRead + Unpin + Send + 'static,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
@@ -740,6 +740,17 @@ where
 
     // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
+    // Keep one extra clone for scale-up workers added during transfer.
+    // Dropped after the main loop to let the reporter exit once all workers finish.
+    let scale_progress_tx = progress_tx.clone();
+
+    // Ack channel: main loop → reporter → ctrl_send (AdjustStreamsAck messages).
+    let (ack_req_tx, ack_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
+
+    // Ctrl-reader channels: ctrl_reader_task forwards SenderMessage variants
+    // received during the data phase to the main loop and finish_transfer.
+    let (scale_req_tx, mut scale_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
+    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel::<[u8; 32]>();
 
     // Shared metrics: in-flight task count and peak disk latency.
     let stats = ReceiverStats::new();
@@ -780,11 +791,11 @@ where
         let stream = accept_res.context("accept task panicked")??;
         let out_file = pt.out_file.clone();
         let resume = pt.resume.clone();
-        let manifest = manifest.clone();
+        let manifest_c = manifest.clone();
         let pb = pt.pb.clone();
         let hasher = pt.hasher.clone();
-        let progress_tx = progress_tx.clone();
-        let stats = Arc::clone(&stats);
+        let ptx = progress_tx.clone();
+        let st = Arc::clone(&stats);
         if let Some(ref bufs_arc) = fec_stripe_bufs {
             let stripe_bufs = Arc::clone(bufs_arc);
             tasks.spawn(async move {
@@ -792,44 +803,98 @@ where
                     stream,
                     out_file,
                     resume,
-                    manifest,
+                    manifest_c,
                     pb,
                     hasher,
-                    progress_tx,
+                    ptx,
                     stripe_bufs,
-                    stats,
+                    st,
                 )
                 .await
             });
         } else {
             tasks.spawn(async move {
-                recv_stream_worker(
-                    stream,
-                    out_file,
-                    resume,
-                    manifest,
-                    pb,
-                    hasher,
-                    progress_tx,
-                    stats,
-                )
-                .await
+                recv_stream_worker(stream, out_file, resume, manifest_c, pb, hasher, ptx, st).await
             });
         }
     }
-    // Drop the original sender so the channel closes when all workers finish.
+    // Drop the original sender so the reporter exits once all workers (including
+    // any dynamically added ones) finish and drop their own senders.
+    // `scale_progress_tx` keeps the channel open for scale-up workers.
     drop(progress_tx);
 
     // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
+    // It also forwards AdjustStreamsAck messages from the main loop (ack_req_rx).
     // It runs concurrently with the data workers and returns ctrl_send when done.
     let reporter = tokio::spawn(progress_reporter(
         ctrl_send,
         progress_rx,
         pt.bytes_already_received,
-        stats,
+        Arc::clone(&stats),
+        ack_req_rx,
     ));
 
-    let task_err = drain_tasks(&mut tasks).await;
+    // Ctrl-reader task: reads SenderMessage from the control stream during the
+    // data phase, forwarding AdjustStreams requests and the final Complete.
+    // Owns ctrl_recv so framing reads are never cancelled mid-frame.
+    tokio::spawn(ctrl_reader_task(ctrl_recv, scale_req_tx, complete_tx));
+
+    // Main transfer loop: drain worker tasks and handle dynamic stream scaling.
+    let mut task_err: Option<anyhow::Error> = None;
+    let mut active_workers = manifest.num_streams;
+    let mut current_workers = manifest.num_streams;
+
+    loop {
+        tokio::select! {
+            Some(join_res) = tasks.join_next() => {
+                let r = join_res.unwrap_or_else(|e| Err(anyhow!("stream worker panicked: {e}")));
+                if let Err(e) = r {
+                    if task_err.is_none() { task_err = Some(e); }
+                }
+                active_workers = active_workers.saturating_sub(1);
+                if active_workers == 0 { break; }
+            }
+            Some(target_count) = scale_req_rx.recv(), if fec_stripe_bufs.is_none() => {
+                // Scale up: accept new streams and spawn workers for non-FEC transfers.
+                // Scale-down: not yet implemented; if sender closes excess streams
+                // those workers exit via EOF naturally.
+                let target = target_count as usize;
+                if target > current_workers {
+                    let new_count = target - current_workers;
+                    info!(current = current_workers, target, "scaling up: accepting {new_count} new streams");
+                    if let Some(ref h) = pt.hasher {
+                        h.update_stream_count(target);
+                    }
+                    let mut accepted = current_workers;
+                    for _ in 0..new_count {
+                        let fut = accept_stream();
+                        match tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut).await {
+                            Ok(Ok(stream)) => {
+                                let out_file = pt.out_file.clone();
+                                let resume = pt.resume.clone();
+                                let manifest_c = manifest.clone();
+                                let pb = pt.pb.clone();
+                                let hasher = pt.hasher.clone();
+                                let ptx = scale_progress_tx.clone();
+                                let st = Arc::clone(&stats);
+                                tasks.spawn(async move {
+                                    recv_stream_worker(stream, out_file, resume, manifest_c, pb, hasher, ptx, st).await
+                                });
+                                accepted += 1;
+                                active_workers += 1;
+                            }
+                            Ok(Err(e)) => warn!("failed to accept new data stream: {e:#}"),
+                            Err(_) => warn!("timed out accepting new data stream"),
+                        }
+                    }
+                    current_workers = accepted;
+                    let _ = ack_req_tx.send(accepted as u8).await;
+                }
+            }
+        }
+    }
+    // Let the reporter know no more workers will be added (closes channel).
+    drop(scale_progress_tx);
     pt.pb.finish();
 
     // FEC: after all stream workers finish, any remaining stripes in the map
@@ -846,6 +911,8 @@ where
         }
     }
 
+    // Reporter closes when all workers finish (progress_tx fully dropped).
+    // Wait for it to return ctrl_send.
     let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
     if let Some(e) = task_err {
@@ -859,13 +926,18 @@ where
         bail!("{e}");
     }
 
+    // Wait for the sender's Complete message (forwarded by ctrl_reader_task).
+    let expected_hash = complete_rx
+        .await
+        .context("sender closed without sending Complete")?;
+
     finish_transfer(
         &mut ctrl_send,
-        &mut ctrl_recv,
         pt.resume,
         pt.hasher,
         &output_dir,
         &manifest,
+        expected_hash,
     )
     .await?;
 
@@ -968,33 +1040,23 @@ fn prepare_transfer(
     })
 }
 
-async fn drain_tasks(tasks: &mut JoinSet<Result<()>>) -> Option<anyhow::Error> {
-    let mut task_err: Option<anyhow::Error> = None;
-    while let Some(join_res) = tasks.join_next().await {
-        let task_result = match join_res {
-            Ok(r) => r,
-            Err(e) => Err(anyhow::anyhow!("stream worker panicked: {e}")),
-        };
-        if let Err(e) = task_result {
-            if task_err.is_none() {
-                task_err = Some(e);
-            }
-        }
-    }
-    task_err
-}
-
 /// Receives confirmed-written byte counts from data workers and sends
 /// throttled `ReceiverMessage::Progress` updates on the control stream.
 ///
 /// Takes ownership of `ctrl_send` and returns it when the channel closes
 /// (i.e. when all data workers have finished), so the caller can use it
 /// for the final `ReceiverMessage::Complete` / `Error` exchange.
+///
+/// When dynamic stream scaling is active, the caller may send accepted stream
+/// counts through `ack_rx`.  The reporter forwards them as
+/// `ReceiverMessage::AdjustStreamsAck` messages immediately (not rate-limited,
+/// since the sender is waiting for the ack to proceed with scaling).
 async fn progress_reporter<W>(
     mut ctrl_send: W,
     mut rx: tokio::sync::mpsc::Receiver<u64>,
     initial_bytes: u64,
     stats: Arc<ReceiverStats>,
+    mut ack_rx: tokio::sync::mpsc::Receiver<u8>,
 ) -> Result<W>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -1036,6 +1098,16 @@ where
                     .await?;
                     last_reported = bytes_written;
                 }
+                // Drain any pending acks (scale-up acknowledgements).
+                while let Ok(accepted) = ack_rx.try_recv() {
+                    framing::send_message(
+                        &mut ctrl_send,
+                        &ReceiverMessage::AdjustStreamsAck {
+                            accepted_count: accepted,
+                        },
+                    )
+                    .await?;
+                }
             }
         }
     }
@@ -1058,17 +1130,48 @@ where
     Ok(ctrl_send)
 }
 
-async fn finish_transfer<S, R>(
+/// Reads `SenderMessage` variants from the control stream during the data
+/// transfer phase (concurrently with data workers).
+///
+/// Forwards `AdjustStreams` requests to the main loop via `scale_tx` and the
+/// final `Complete` file hash via `complete_tx`.  Exits when the control
+/// stream is closed or `complete_tx` is sent.
+async fn ctrl_reader_task<R>(
+    mut ctrl_recv: R,
+    scale_tx: tokio::sync::mpsc::Sender<u8>,
+    complete_tx: tokio::sync::oneshot::Sender<[u8; 32]>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut complete_tx = Some(complete_tx);
+    loop {
+        match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await {
+            Ok(Some(SenderMessage::AdjustStreams { target_count })) => {
+                if scale_tx.send(target_count).await.is_err() {
+                    break; // main loop dropped receiver — transfer ending
+                }
+            }
+            Ok(Some(SenderMessage::Complete { file_hash })) => {
+                if let Some(tx) = complete_tx.take() {
+                    let _ = tx.send(file_hash);
+                }
+                break;
+            }
+            _ => break, // EOF or error — main loop will surface via complete_rx timeout
+        }
+    }
+}
+
+async fn finish_transfer<S>(
     ctrl_send: &mut S,
-    ctrl_recv: &mut R,
     resume: Arc<Mutex<ResumeState>>,
     hasher: Option<Arc<ChunkHasher>>,
     output_dir: &std::path::Path,
     manifest: &TransferManifest,
+    expected_hash: [u8; 32],
 ) -> Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
-    R: tokio::io::AsyncRead + Unpin,
 {
     let file_hash: [u8; 32] = match hasher {
         Some(h) => Arc::try_unwrap(h)
@@ -1084,15 +1187,6 @@ where
             })
             .await
             .context("hash task panicked")??
-        }
-    };
-
-    let expected_hash = match framing::recv_message_required(ctrl_recv).await? {
-        SenderMessage::Complete { file_hash } => file_hash,
-        // AdjustStreams is handled during data transfer (Commit 3); if we see
-        // it here the sender is misbehaving — treat it as a protocol error.
-        SenderMessage::AdjustStreams { target_count } => {
-            anyhow::bail!("unexpected AdjustStreams({target_count}) in finish phase");
         }
     };
 

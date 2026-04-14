@@ -107,6 +107,19 @@ impl ChunkHasher {
         Ok(())
     }
 
+    /// Increase the pending-buffer limit to accommodate a higher stream count.
+    ///
+    /// Called when dynamic stream scaling adds new streams mid-transfer.
+    /// The limit only ever increases (decreasing would risk spurious errors
+    /// while buffered hashes are still in flight).
+    pub fn update_stream_count(&self, new_count: usize) {
+        let new_limit = (new_count * 8).max(64);
+        let mut g = self.inner.lock().unwrap();
+        if new_limit > g.max_pending {
+            g.max_pending = new_limit;
+        }
+    }
+
     /// Finalise and return the file hash.
     ///
     /// Concatenates all per-chunk hashes in order and hashes that buffer with

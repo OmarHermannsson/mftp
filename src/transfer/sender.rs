@@ -14,6 +14,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+
 use async_channel as ac;
 
 use crate::compress;
@@ -471,26 +473,40 @@ where
     pb.set_position(resume_bytes);
     let transfer_start = Instant::now();
 
-    // Spawn a task that reads ReceiverMessage::Progress from the control
-    // stream and advances the progress bar.  It captures the terminal message
-    // (Complete / Retransmit / Error) via a oneshot channel.
+    // ── Control-stream reader task ────────────────────────────────────────────
     //
-    // The task also monitors `in_flight_chunks` and `disk_stall_ms` from the
-    // receiver.  If the receiver is consistently saturated (in-flight near its
-    // maximum across 3+ consecutive samples) or if writes are stalling, a
-    // tracing warning is emitted so operators can diagnose bottlenecks.
+    // A dedicated task owns ctrl_recv and reads ReceiverMessage variants:
     //
-    // When --adaptive-streams is enabled and both peers are protocol_version ≥ 2,
-    // the task also maintains a sliding window of progress samples and calls
-    // compute_target_streams() to log scaling recommendations.
+    // • Progress  — advances the progress bar; drives saturation/stall warnings
+    //               and, when --adaptive-streams is active, throughput measurement.
+    //               When a target stream count is recommended the task forwards it
+    //               to the main loop via `scale_tx` (ScaleMsg::Target).
+    // • AdjustStreamsAck — forwarded as ScaleMsg::Ack so the main loop can spawn
+    //               new workers.
+    // • Complete / Error — forwarded via `completion_tx` (terminal message).
+
+    /// Message sent from the reader task to the main transfer loop.
+    enum ScaleMsg {
+        /// Recommended stream target (scale-up only for now).
+        Target(u8),
+        /// Receiver confirmed new stream count.
+        Ack(u8),
+    }
+
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    let (scale_tx, mut scale_rx) = tokio::sync::mpsc::channel::<ScaleMsg>(8);
+    // Shared current stream count: reader reads it for compute_target_streams;
+    // main loop increments it when scale-up is accepted.
+    let current_streams_arc = Arc::new(AtomicUsize::new(num_streams));
+    let current_streams_for_reader = Arc::clone(&current_streams_arc);
     // MAX_IN_FLIGHT on the receiver is 4 per stream worker.
-    let max_in_flight = num_streams as u32 * 4;
+    let max_in_flight_base = num_streams as u32 * 4;
     // cpu_cap mirrors the same formula used in compute_params().
     let cpu_cap = (receiver_cores.min(sender_cores) as usize).max(1) * 2;
     let adaptive_enabled = config.adaptive_streams
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
+    let scale_tx_for_reader = scale_tx.clone();
     let reader = tokio::spawn(async move {
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
@@ -501,6 +517,8 @@ where
         const SAMPLE_WINDOW: usize = 10;
         let mut samples: Vec<ProgressSample> = Vec::with_capacity(SAMPLE_WINDOW + 1);
         let mut last_scale_at: Option<std::time::Instant> = None;
+        // Suppress sending another Target while a pending Ack is expected.
+        let mut pending_scale = false;
 
         loop {
             match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
@@ -510,6 +528,9 @@ where
                     disk_stall_ms,
                 })) => {
                     pb_for_reader.set_position(bytes_written);
+
+                    let current = current_streams_for_reader.load(AtomicOrd::Relaxed);
+                    let max_in_flight = current as u32 * 4;
 
                     // Saturation: ≥75% of max in-flight for 3+ consecutive samples.
                     if in_flight_chunks >= max_in_flight * 3 / 4 {
@@ -539,10 +560,8 @@ where
                         last_disk_warn = std::time::Instant::now();
                     }
 
-                    // Adaptive stream scaling: maintain sample window and log
-                    // recommendations.  Actual scaling is performed in Commit 3;
-                    // here we only measure and log.
-                    if adaptive_enabled {
+                    // Adaptive stream scaling.
+                    if adaptive_enabled && !pending_scale {
                         samples.push(ProgressSample {
                             bytes_written,
                             in_flight_chunks,
@@ -554,30 +573,39 @@ where
                         }
                         if let Some(target) = compute_target_streams(
                             &samples,
-                            num_streams,
+                            current,
                             cpu_cap,
                             file_size,
                             last_scale_at,
                         ) {
-                            if target as usize > num_streams {
-                                tracing::info!(
-                                    current = num_streams,
-                                    target,
-                                    "adaptive: would scale up streams"
-                                );
+                            if (target as usize) > current {
+                                tracing::info!(current, target, "adaptive: scaling up streams");
+                                if scale_tx_for_reader
+                                    .send(ScaleMsg::Target(target))
+                                    .await
+                                    .is_err()
+                                {
+                                    return; // main loop dropped receiver
+                                }
+                                pending_scale = true;
+                                last_scale_at = Some(std::time::Instant::now());
                             } else {
                                 tracing::info!(
-                                    current = num_streams,
+                                    current,
                                     target,
-                                    "adaptive: would scale down streams"
+                                    "adaptive: would scale down streams (not yet implemented)"
                                 );
+                                last_scale_at = Some(std::time::Instant::now());
                             }
-                            // Record the "last scale" time even though we're not
-                            // actually scaling yet — keeps the recommendation rate
-                            // consistent with what the real cooldown will enforce.
-                            last_scale_at = Some(std::time::Instant::now());
                         }
                     }
+                }
+                Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
+                    tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
+                    pending_scale = false;
+                    let _ = scale_tx_for_reader
+                        .send(ScaleMsg::Ack(accepted_count))
+                        .await;
                 }
                 Ok(Some(other)) => {
                     let _ = completion_tx.send(other);
@@ -587,6 +615,7 @@ where
             }
         }
     });
+    let _ = max_in_flight_base; // used only for reference
 
     // ── Single-reader feeder + N parallel workers ─────────────────────────────
     //
@@ -624,6 +653,7 @@ where
     // Spawn N stream workers.  Each worker gets a clone of the shared receiver
     // (MPMC — all clones drain the same queue) and an Arc of the file hasher.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let mut active_workers = actual_streams;
     for _ in 0..actual_streams {
         let h = file_hasher.clone();
         tasks.spawn(spawn_worker(
@@ -633,8 +663,71 @@ where
             h,
         ));
     }
-    while let Some(res) = tasks.join_next().await {
-        res??;
+
+    // ── Dynamic scaling main loop ─────────────────────────────────────────────
+    //
+    // Interleave worker completions with scale signals from the reader task.
+    // On ScaleMsg::Target: send AdjustStreams to the receiver.
+    // On ScaleMsg::Ack:    spawn new workers (scale-up) using work_rx.clone().
+    let mut pending_scale_up: Option<u8> = None; // target we sent; waiting for Ack
+    loop {
+        tokio::select! {
+            biased;
+
+            // Drain completed workers first so active_workers stays accurate.
+            Some(res) = tasks.join_next() => {
+                res??;
+                active_workers -= 1;
+                if active_workers == 0 && pending_scale_up.is_none() {
+                    break;
+                }
+            }
+
+            // Scale signal from the reader task.
+            msg = scale_rx.recv() => {
+                match msg {
+                    Some(ScaleMsg::Target(target)) if config.fec.is_none() => {
+                        // Send scale request to receiver.
+                        framing::send_message(
+                            ctrl_send,
+                            &SenderMessage::AdjustStreams { target_count: target },
+                        )
+                        .await?;
+                        pending_scale_up = Some(target);
+                    }
+                    Some(ScaleMsg::Ack(accepted)) if config.fec.is_none() => {
+                        let current = current_streams_arc.load(AtomicOrd::Relaxed);
+                        let new_count = accepted as usize;
+                        if new_count > current {
+                            // Spawn additional workers for the new streams.
+                            let extra = new_count - current;
+                            for _ in 0..extra {
+                                let h = file_hasher.clone();
+                                tasks.spawn(spawn_worker(
+                                    work_rx.clone(),
+                                    transfer_id,
+                                    compression.clone(),
+                                    h,
+                                ));
+                                active_workers += 1;
+                            }
+                            current_streams_arc.store(new_count, AtomicOrd::Relaxed);
+                            if let Some(h) = &file_hasher {
+                                h.update_stream_count(new_count);
+                            }
+                            tracing::info!(
+                                previous = current,
+                                now = new_count,
+                                "scaled up to {new_count} streams"
+                            );
+                        }
+                        pending_scale_up = None;
+                    }
+                    // FEC path, ignored variant, or channel closed — fall through.
+                    _ => {}
+                }
+            }
+        }
     }
 
     // Workers done; feeder should have finished by now (channel closed).
