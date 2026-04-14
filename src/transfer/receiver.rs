@@ -1044,14 +1044,22 @@ fn prepare_transfer(
     });
 
     let pb = Arc::new({
+        let term_width = console::Term::stdout().size().1 as usize;
+        let template = if term_width >= 140 {
+            "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
+             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}  {msg}"
+        } else {
+            "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
+             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}"
+        };
         let pb = ProgressBar::new(manifest.file_size);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-                 {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
-            )
-            .unwrap(),
-        );
+        pb.set_style(ProgressStyle::with_template(template).unwrap());
+        pb.enable_steady_tick(Duration::from_millis(100));
+        let chunk_mib = manifest.chunk_size / (1024 * 1024);
+        pb.set_prefix(format!(
+            "{} · {} streams · {} MiB",
+            manifest.file_name, manifest.num_streams, chunk_mib
+        ));
         pb
     });
 

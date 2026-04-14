@@ -370,11 +370,11 @@ fn make_progress_bar(file_name: &str, file_size: u64) -> ProgressBar {
     pb.set_style(
         ProgressStyle::with_template(
             "[sftp] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {msg}",
+             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}",
         )
         .unwrap(),
     );
     pb.enable_steady_tick(Duration::from_millis(100));
-    pb.set_message(file_name.to_owned());
+    pb.set_prefix(file_name.to_owned());
     pb
 }

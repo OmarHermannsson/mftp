@@ -553,8 +553,6 @@ where
     let scale_tx_for_reader = scale_tx.clone();
     let file_name_for_reader = file_name.clone();
     let reader = tokio::spawn(async move {
-        let mut normal_msg =
-            format!("{file_name_for_reader} · {num_streams} streams · {chunk_mib} MiB");
         let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
@@ -579,7 +577,7 @@ where
 
                     // Revert flash message if its display window has elapsed.
                     if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
-                        pb_for_reader.set_message(normal_msg.clone());
+                        pb_for_reader.set_message("");
                         flash_until = None;
                     }
 
@@ -673,10 +671,10 @@ where
                 Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
                     tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
                     pending_scale = false;
-                    normal_msg = format!(
+                    pb_for_reader.set_prefix(format!(
                         "{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB"
-                    );
-                    pb_for_reader.set_message(normal_msg.clone());
+                    ));
+                    pb_for_reader.set_message("");
                     flash_until = None;
                     let _ = scale_tx_for_reader
                         .send(ScaleMsg::Ack(accepted_count))
@@ -1128,17 +1126,19 @@ fn make_progress_bar(
     streams: usize,
     chunk_mib: usize,
 ) -> Arc<ProgressBar> {
+    let term_width = console::Term::stdout().size().1 as usize;
+    let template = if term_width >= 140 {
+        "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
+         {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}  {msg}"
+    } else {
+        "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
+         {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}"
+    };
     Arc::new({
         let pb = ProgressBar::new(file_size);
-        pb.set_style(
-            ProgressStyle::with_template(
-                "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-                 {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {msg}",
-            )
-            .unwrap(),
-        );
+        pb.set_style(ProgressStyle::with_template(template).unwrap());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message(format!("{file_name} · {streams} streams · {chunk_mib} MiB"));
+        pb.set_prefix(format!("{file_name} · {streams} streams · {chunk_mib} MiB"));
         pb
     })
 }
@@ -1641,10 +1641,7 @@ where
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
     let max_in_flight = num_streams as u32 * 4;
-    let file_name_for_reader = file_name.clone();
     let reader = tokio::spawn(async move {
-        let normal_msg =
-            format!("{file_name_for_reader} · {num_streams} streams · {chunk_mib} MiB");
         let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
@@ -1661,7 +1658,7 @@ where
 
                     // Revert flash message if its display window has elapsed.
                     if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
-                        pb_for_reader.set_message(normal_msg.clone());
+                        pb_for_reader.set_message("");
                         flash_until = None;
                     }
 
