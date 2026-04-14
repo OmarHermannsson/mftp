@@ -119,10 +119,22 @@ pub enum ReceiverMessage {
         received_bits: Vec<u64>,
         total_chunks: u64,
     },
-    /// Periodic progress update: total bytes written to disk so far.
-    /// Sent at most every 100 ms during the data-transfer phase so the
-    /// sender can display an accurate progress bar.
-    Progress { bytes_written: u64 },
+    /// Periodic progress update sent at most every 100 ms during the
+    /// data-transfer phase.
+    ///
+    /// - `bytes_written`: cumulative bytes confirmed written to disk.
+    /// - `in_flight_chunks`: number of chunk-processing tasks currently
+    ///   active across all stream workers.  Max is `num_streams × 4`
+    ///   (MAX_IN_FLIGHT per worker).  Consistently near the maximum signals
+    ///   receiver-side CPU or disk saturation.
+    /// - `disk_stall_ms`: peak chunk-write latency (ms) observed since the
+    ///   last Progress message; reset to 0 after each report.  Values above
+    ///   ~50 ms indicate the receiver disk is becoming a bottleneck.
+    Progress {
+        bytes_written: u64,
+        in_flight_chunks: u32,
+        disk_stall_ms: u32,
+    },
     /// All chunks received and verified; echoes the file hash.
     Complete { file_hash: [u8; 32] },
     /// Receiver encountered a fatal error.

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +32,29 @@ use crate::protocol::{
 };
 use crate::transfer::hash::ChunkHasher;
 use crate::transfer::resume::{ResumeState, RESUME_SAVE_BATCH};
+
+/// Shared receiver-side metrics updated by data workers and read by the
+/// progress reporter every 100 ms.
+struct ReceiverStats {
+    /// Total chunk-processing tasks currently active across all stream workers.
+    /// Each worker holds at most MAX_IN_FLIGHT (4) tasks, so the maximum value
+    /// is `num_streams × 4`.  Consistently near the maximum indicates CPU or
+    /// disk saturation on the receiver.
+    in_flight_chunks: AtomicU32,
+    /// Peak chunk-write latency (µs) observed since the last progress report.
+    /// Reset to 0 after each read.  Values above ~50 000 µs (50 ms) indicate
+    /// disk back-pressure on the receiver.
+    last_disk_us: AtomicU32,
+}
+
+impl ReceiverStats {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            in_flight_chunks: AtomicU32::new(0),
+            last_disk_us: AtomicU32::new(0),
+        })
+    }
+}
 
 pub struct ReceiveConfig {
     pub output_dir: PathBuf,
@@ -716,6 +740,9 @@ where
     // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
 
+    // Shared metrics: in-flight task count and peak disk latency.
+    let stats = ReceiverStats::new();
+
     // Accept all N data streams concurrently.
     //
     // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
@@ -756,6 +783,7 @@ where
         let pb = pt.pb.clone();
         let hasher = pt.hasher.clone();
         let progress_tx = progress_tx.clone();
+        let stats = Arc::clone(&stats);
         if let Some(ref bufs_arc) = fec_stripe_bufs {
             let stripe_bufs = Arc::clone(bufs_arc);
             tasks.spawn(async move {
@@ -768,13 +796,23 @@ where
                     hasher,
                     progress_tx,
                     stripe_bufs,
+                    stats,
                 )
                 .await
             });
         } else {
             tasks.spawn(async move {
-                recv_stream_worker(stream, out_file, resume, manifest, pb, hasher, progress_tx)
-                    .await
+                recv_stream_worker(
+                    stream,
+                    out_file,
+                    resume,
+                    manifest,
+                    pb,
+                    hasher,
+                    progress_tx,
+                    stats,
+                )
+                .await
             });
         }
     }
@@ -787,6 +825,7 @@ where
         ctrl_send,
         progress_rx,
         pt.bytes_already_received,
+        stats,
     ));
 
     let task_err = drain_tasks(&mut tasks).await;
@@ -954,6 +993,7 @@ async fn progress_reporter<W>(
     mut ctrl_send: W,
     mut rx: tokio::sync::mpsc::Receiver<u64>,
     initial_bytes: u64,
+    stats: Arc<ReceiverStats>,
 ) -> Result<W>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -980,10 +1020,19 @@ where
             }
             _ = interval.tick() => {
                 if bytes_written != last_reported {
+                    let in_flight_chunks = stats.in_flight_chunks.load(Ordering::Relaxed);
+                    // Swap resets the peak so we report per-interval maximum.
+                    let disk_us = stats.last_disk_us.swap(0, Ordering::Relaxed);
+                    let disk_stall_ms = disk_us / 1000;
                     framing::send_message(
                         &mut ctrl_send,
-                        &ReceiverMessage::Progress { bytes_written },
-                    ).await?;
+                        &ReceiverMessage::Progress {
+                            bytes_written,
+                            in_flight_chunks,
+                            disk_stall_ms,
+                        },
+                    )
+                    .await?;
                     last_reported = bytes_written;
                 }
             }
@@ -992,7 +1041,17 @@ where
 
     // Final update to make sure the sender sees 100%.
     if bytes_written != last_reported {
-        framing::send_message(&mut ctrl_send, &ReceiverMessage::Progress { bytes_written }).await?;
+        let in_flight_chunks = stats.in_flight_chunks.load(Ordering::Relaxed);
+        let disk_stall_ms = stats.last_disk_us.swap(0, Ordering::Relaxed) / 1000;
+        framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Progress {
+                bytes_written,
+                in_flight_chunks,
+                disk_stall_ms,
+            },
+        )
+        .await?;
     }
 
     Ok(ctrl_send)
@@ -1057,6 +1116,7 @@ where
 
 // ── Stream worker (generic over any AsyncRead) ────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn recv_stream_worker<R>(
     mut stream: R,
     out_file: Arc<std::fs::File>,
@@ -1065,6 +1125,7 @@ async fn recv_stream_worker<R>(
     pb: Arc<ProgressBar>,
     hasher: Option<Arc<ChunkHasher>>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
+    stats: Arc<ReceiverStats>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1121,7 +1182,9 @@ where
         let resume = Arc::clone(&resume);
         let pb = Arc::clone(&pb);
         let progress_tx = progress_tx.clone();
+        let stats = Arc::clone(&stats);
 
+        stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
         processing.spawn_blocking(move || -> Result<()> {
             // Decompress first: chunk_hash is blake3(raw_bytes) on the sender,
             // so we must verify against the decompressed data, not the wire payload.
@@ -1133,10 +1196,12 @@ where
 
             let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
             if computed != chunk.chunk_hash {
+                stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
                 bail!("chunk {chunk_index} hash mismatch");
             }
 
             let offset = chunk_index * chunk_size as u64;
+            let write_start = std::time::Instant::now();
             crate::fs_ext::write_all_at(&out_file, &data, offset)
                 .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
 
@@ -1167,6 +1232,11 @@ where
             if let Some(snap) = snap {
                 snap.write_to_disk()?;
             }
+
+            let write_us = write_start.elapsed().as_micros() as u32;
+            stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
+            stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
+
             debug!(chunk = chunk_index, "received");
             Ok(())
         });
@@ -1207,6 +1277,7 @@ async fn recv_fec_stream_worker<R>(
     hasher: Option<Arc<ChunkHasher>>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
     stripe_bufs: Arc<Mutex<HashMap<u32, StripeBuffer>>>,
+    stats: Arc<ReceiverStats>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1292,8 +1363,15 @@ where
             let hasher = hasher.as_ref().map(Arc::clone);
             let pb = Arc::clone(&pb);
             let ptx = progress_tx.clone();
+            let stats = Arc::clone(&stats);
+            stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
             processing.spawn_blocking(move || {
-                process_stripe(stripe, chunk_size, out_file, resume, hasher, pb, ptx)
+                let write_start = std::time::Instant::now();
+                let result = process_stripe(stripe, chunk_size, out_file, resume, hasher, pb, ptx);
+                let write_us = write_start.elapsed().as_micros() as u32;
+                stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
+                stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
+                result
             });
         }
 

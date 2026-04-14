@@ -466,13 +466,56 @@ where
     // Spawn a task that reads ReceiverMessage::Progress from the control
     // stream and advances the progress bar.  It captures the terminal message
     // (Complete / Retransmit / Error) via a oneshot channel.
+    //
+    // The task also monitors `in_flight_chunks` and `disk_stall_ms` from the
+    // receiver.  If the receiver is consistently saturated (in-flight near its
+    // maximum across 3+ consecutive samples) or if writes are stalling, a
+    // tracing warning is emitted so operators can diagnose bottlenecks.
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    // MAX_IN_FLIGHT on the receiver is 4 per stream worker.
+    let max_in_flight = num_streams as u32 * 4;
     let reader = tokio::spawn(async move {
+        let mut saturated_run = 0u32;
+        let mut last_disk_warn = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .unwrap_or_else(std::time::Instant::now);
         loop {
             match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
-                Ok(Some(ReceiverMessage::Progress { bytes_written })) => {
+                Ok(Some(ReceiverMessage::Progress {
+                    bytes_written,
+                    in_flight_chunks,
+                    disk_stall_ms,
+                })) => {
                     pb_for_reader.set_position(bytes_written);
+
+                    // Saturation: ≥75% of max in-flight for 3+ consecutive samples.
+                    if in_flight_chunks >= max_in_flight * 3 / 4 {
+                        saturated_run += 1;
+                        if saturated_run == 3 {
+                            tracing::warn!(
+                                in_flight = in_flight_chunks,
+                                max = max_in_flight,
+                                "receiver saturated: chunk processing cannot keep up with network"
+                            );
+                        }
+                    } else {
+                        if saturated_run >= 3 {
+                            tracing::info!("receiver saturation cleared");
+                        }
+                        saturated_run = 0;
+                    }
+
+                    // Disk stall: warn at most once per 10 s to avoid log spam.
+                    if disk_stall_ms > 50
+                        && last_disk_warn.elapsed() >= std::time::Duration::from_secs(10)
+                    {
+                        tracing::warn!(
+                            disk_stall_ms,
+                            "receiver disk stall: writes are taking longer than 50 ms"
+                        );
+                        last_disk_warn = std::time::Instant::now();
+                    }
                 }
                 Ok(Some(other)) => {
                     let _ = completion_tx.send(other);
@@ -1147,11 +1190,46 @@ where
     let transfer_start = Instant::now();
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    let max_in_flight = num_streams as u32 * 4;
     let reader = tokio::spawn(async move {
+        let mut saturated_run = 0u32;
+        let mut last_disk_warn = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .unwrap_or_else(std::time::Instant::now);
         loop {
             match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
-                Ok(Some(ReceiverMessage::Progress { bytes_written })) => {
+                Ok(Some(ReceiverMessage::Progress {
+                    bytes_written,
+                    in_flight_chunks,
+                    disk_stall_ms,
+                })) => {
                     pb_for_reader.set_position(bytes_written);
+
+                    if in_flight_chunks >= max_in_flight * 3 / 4 {
+                        saturated_run += 1;
+                        if saturated_run == 3 {
+                            tracing::warn!(
+                                in_flight = in_flight_chunks,
+                                max = max_in_flight,
+                                "receiver saturated: chunk processing cannot keep up with network"
+                            );
+                        }
+                    } else {
+                        if saturated_run >= 3 {
+                            tracing::info!("receiver saturation cleared");
+                        }
+                        saturated_run = 0;
+                    }
+
+                    if disk_stall_ms > 50
+                        && last_disk_warn.elapsed() >= std::time::Duration::from_secs(10)
+                    {
+                        tracing::warn!(
+                            disk_stall_ms,
+                            "receiver disk stall: writes are taking longer than 50 ms"
+                        );
+                        last_disk_warn = std::time::Instant::now();
+                    }
                 }
                 Ok(Some(other)) => {
                     let _ = completion_tx.send(other);
