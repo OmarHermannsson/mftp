@@ -208,11 +208,19 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             peer_version,
             &config,
-            move |rx, transfer_id, compression, file_hasher| {
+            move |rx, transfer_id, compression, file_hasher, excess_stop| {
                 let conn = conn_for_workers.clone();
                 async move {
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
-                    quic_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
+                    quic_stream_worker(
+                        stream,
+                        rx,
+                        transfer_id,
+                        compression,
+                        file_hasher,
+                        excess_stop,
+                    )
+                    .await
                 }
             },
         )
@@ -230,8 +238,17 @@ async fn quic_stream_worker(
     transfer_id: [u8; 16],
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
+    excess_stop: Arc<AtomicUsize>,
 ) -> Result<()> {
-    send_from_channel(&mut stream, rx, transfer_id, &compression, file_hasher).await?;
+    send_from_channel(
+        &mut stream,
+        rx,
+        transfer_id,
+        &compression,
+        file_hasher,
+        excess_stop,
+    )
+    .await?;
     stream.finish()?;
     Ok(())
 }
@@ -297,13 +314,21 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
         neg_resp.cpu_cores,
         peer_version,
         &config,
-        move |rx, transfer_id, compression, file_hasher| {
+        move |rx, transfer_id, compression, file_hasher, excess_stop| {
             let fp = trusted_fp.clone();
             async move {
                 let stream = connect_tls(destination, fp.as_deref())
                     .await
                     .context("open TCP data stream")?;
-                tcp_stream_worker(stream, rx, transfer_id, compression, file_hasher).await
+                tcp_stream_worker(
+                    stream,
+                    rx,
+                    transfer_id,
+                    compression,
+                    file_hasher,
+                    excess_stop,
+                )
+                .await
             }
         },
     )
@@ -317,11 +342,19 @@ async fn tcp_stream_worker(
     transfer_id: [u8; 16],
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
+    excess_stop: Arc<AtomicUsize>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    send_from_channel(&mut stream, rx, transfer_id, &compression, file_hasher)
-        .await
-        .context("send_from_channel")?;
+    send_from_channel(
+        &mut stream,
+        rx,
+        transfer_id,
+        &compression,
+        file_hasher,
+        excess_stop,
+    )
+    .await
+    .context("send_from_channel")?;
     // Send TLS close_notify so the receiver sees a clean EOF.
     stream
         .shutdown()
@@ -362,7 +395,13 @@ async fn run_transfer<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(ac::Receiver<(u64, Vec<u8>)>, [u8; 16], Compression, Option<Arc<ChunkHasher>>) -> Fut,
+    F: Fn(
+        ac::Receiver<(u64, Vec<u8>)>,
+        [u8; 16],
+        Compression,
+        Option<Arc<ChunkHasher>>,
+        Arc<AtomicUsize>,
+    ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let file_name = file
@@ -487,7 +526,7 @@ where
 
     /// Message sent from the reader task to the main transfer loop.
     enum ScaleMsg {
-        /// Recommended stream target (scale-up only for now).
+        /// Recommended stream target (scale-up or scale-down).
         Target(u8),
         /// Receiver confirmed new stream count.
         Ack(u8),
@@ -578,8 +617,17 @@ where
                             file_size,
                             last_scale_at,
                         ) {
-                            if (target as usize) > current {
-                                tracing::info!(current, target, "adaptive: scaling up streams");
+                            if (target as usize) != current {
+                                let direction = if (target as usize) > current {
+                                    "up"
+                                } else {
+                                    "down"
+                                };
+                                tracing::info!(
+                                    current,
+                                    target,
+                                    "adaptive: scaling {direction} streams"
+                                );
                                 if scale_tx_for_reader
                                     .send(ScaleMsg::Target(target))
                                     .await
@@ -588,13 +636,6 @@ where
                                     return; // main loop dropped receiver
                                 }
                                 pending_scale = true;
-                                last_scale_at = Some(std::time::Instant::now());
-                            } else {
-                                tracing::info!(
-                                    current,
-                                    target,
-                                    "adaptive: would scale down streams (not yet implemented)"
-                                );
                                 last_scale_at = Some(std::time::Instant::now());
                             }
                         }
@@ -639,6 +680,10 @@ where
 
     // Single shared MPMC work channel.
     let (work_tx, work_rx) = ac::bounded::<(u64, Vec<u8>)>(WORKER_CHAN_DEPTH * actual_streams);
+    // Scale-down: number of workers that should exit cleanly after their current chunk.
+    // Set by the main loop on receiving a scale-down Ack; checked by each worker after
+    // each chunk send.  Zero means no pending scale-down.
+    let excess_stop = Arc::new(AtomicUsize::new(0));
 
     // Feeder: sequential file read — pushes all chunks into the shared channel.
     // Runs entirely in a blocking thread — no async executor involved.
@@ -661,6 +706,7 @@ where
             transfer_id,
             compression.clone(),
             h,
+            excess_stop.clone(),
         ));
     }
 
@@ -669,7 +715,7 @@ where
     // Interleave worker completions with scale signals from the reader task.
     // On ScaleMsg::Target: send AdjustStreams to the receiver.
     // On ScaleMsg::Ack:    spawn new workers (scale-up) using work_rx.clone().
-    let mut pending_scale_up: Option<u8> = None; // target we sent; waiting for Ack
+    let mut pending_scale: Option<u8> = None; // target we sent; waiting for Ack
     loop {
         tokio::select! {
             biased;
@@ -678,7 +724,7 @@ where
             Some(res) = tasks.join_next() => {
                 res??;
                 active_workers -= 1;
-                if active_workers == 0 && pending_scale_up.is_none() {
+                if active_workers == 0 && pending_scale.is_none() {
                     break;
                 }
             }
@@ -693,13 +739,13 @@ where
                             &SenderMessage::AdjustStreams { target_count: target },
                         )
                         .await?;
-                        pending_scale_up = Some(target);
+                        pending_scale = Some(target);
                     }
                     Some(ScaleMsg::Ack(accepted)) if config.fec.is_none() => {
                         let current = current_streams_arc.load(AtomicOrd::Relaxed);
                         let new_count = accepted as usize;
                         if new_count > current {
-                            // Spawn additional workers for the new streams.
+                            // Scale-up: spawn additional workers for the new streams.
                             let extra = new_count - current;
                             for _ in 0..extra {
                                 let h = file_hasher.clone();
@@ -708,6 +754,7 @@ where
                                     transfer_id,
                                     compression.clone(),
                                     h,
+                                    excess_stop.clone(),
                                 ));
                                 active_workers += 1;
                             }
@@ -720,8 +767,20 @@ where
                                 now = new_count,
                                 "scaled up to {new_count} streams"
                             );
+                        } else if new_count < current {
+                            // Scale-down: signal excess workers to stop after their
+                            // current chunk.  active_workers is NOT decremented here —
+                            // it decrements via tasks.join_next() as each worker exits.
+                            let excess = current - new_count;
+                            excess_stop.store(excess, AtomicOrd::Release);
+                            current_streams_arc.store(new_count, AtomicOrd::Relaxed);
+                            tracing::info!(
+                                previous = current,
+                                now = new_count,
+                                "scaling down: {excess} workers will exit after current chunk"
+                            );
                         }
-                        pending_scale_up = None;
+                        pending_scale = None;
                     }
                     // FEC path, ignored variant, or channel closed — fall through.
                     _ => {}
@@ -836,6 +895,7 @@ async fn send_from_channel<W>(
     transfer_id: [u8; 16],
     compression: &Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
+    excess_stop: Arc<AtomicUsize>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -918,6 +978,53 @@ where
             )
             .await?;
             debug!(chunk = chunk_index, "sent");
+
+            // Scale-down: after each chunk, check if this worker should exit.
+            // Use compare_exchange loop to safely claim one exit slot without
+            // risking fetch_sub underflow if multiple workers race.
+            if excess_stop.load(AtomicOrd::Relaxed) > 0 {
+                let mut val = excess_stop.load(AtomicOrd::Acquire);
+                loop {
+                    if val == 0 {
+                        break;
+                    }
+                    match excess_stop.compare_exchange(
+                        val,
+                        val - 1,
+                        AtomicOrd::AcqRel,
+                        AtomicOrd::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // This worker claimed an exit slot.  If there is a
+                            // prefetched chunk already pulled from the channel,
+                            // send it too — dropping it would lose data.
+                            if let Some(nt) = next_task {
+                                let (ci, pl, ch, compr, rl) =
+                                    nt.await.context("prepare task panicked")??;
+                                if let Some(ref mut al) = adaptive {
+                                    al.update(rl, pl.len());
+                                }
+                                framing::send_chunk_data(
+                                    writer,
+                                    &ChunkData {
+                                        transfer_id,
+                                        chunk_index: ci,
+                                        chunk_hash: ch,
+                                        compressed: compr,
+                                        payload: pl,
+                                    },
+                                )
+                                .await?;
+                                debug!(chunk = ci, "sent (final before scale-down exit)");
+                            }
+                            return Ok(()); // caller will finish/shutdown the stream
+                        }
+                        Err(actual) => {
+                            val = actual; // retry with fresh value
+                        }
+                    }
+                }
+            }
 
             match next_task {
                 // next_task's blocking thread was running during task.await +

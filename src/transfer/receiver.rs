@@ -855,11 +855,9 @@ where
                 if active_workers == 0 { break; }
             }
             Some(target_count) = scale_req_rx.recv(), if fec_stripe_bufs.is_none() => {
-                // Scale up: accept new streams and spawn workers for non-FEC transfers.
-                // Scale-down: not yet implemented; if sender closes excess streams
-                // those workers exit via EOF naturally.
                 let target = target_count as usize;
                 if target > current_workers {
+                    // Scale-up: accept new streams and spawn workers.
                     let new_count = target - current_workers;
                     info!(current = current_workers, target, "scaling up: accepting {new_count} new streams");
                     if let Some(ref h) = pt.hasher {
@@ -889,6 +887,19 @@ where
                     }
                     current_workers = accepted;
                     let _ = ack_req_tx.send(accepted as u8).await;
+                } else if target < current_workers {
+                    // Scale-down: no stream management needed on the receiver side.
+                    // The sender will close excess streams (QUIC FIN / TLS shutdown);
+                    // those workers exit when they see EOF, decrementing active_workers
+                    // via the tasks.join_next() arm above.
+                    info!(
+                        current = current_workers,
+                        target,
+                        "scaling down: sender will close {} streams",
+                        current_workers - target
+                    );
+                    current_workers = target;
+                    let _ = ack_req_tx.send(target as u8).await;
                 }
             }
         }
