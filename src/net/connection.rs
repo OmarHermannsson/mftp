@@ -451,9 +451,12 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&path)
     {
         let _ = writeln!(f, "{addr} {fp}");

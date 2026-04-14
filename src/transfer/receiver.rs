@@ -429,7 +429,14 @@ impl StripeBuffer {
 
     fn insert(&mut self, fcd: FecChunkData) -> Result<()> {
         if fcd.is_parity {
-            let j = fcd.shard_index_in_stripe as usize - self.data_shards;
+            let j = (fcd.shard_index_in_stripe as usize)
+                .checked_sub(self.data_shards)
+                .with_context(|| {
+                    format!(
+                        "FEC stripe {}: parity shard_index_in_stripe {} < data_shards {}",
+                        self.stripe_index, fcd.shard_index_in_stripe, self.data_shards
+                    )
+                })?;
             if j >= self.parity_shards {
                 bail!(
                     "FEC stripe {}: parity shard index {} out of range",
@@ -875,8 +882,9 @@ fn prepare_transfer(
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            let rc =
-                unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, manifest.file_size as libc::off_t) };
+            let size =
+                i64::try_from(manifest.file_size).context("file too large for this platform")?;
+            let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size) };
             if rc != 0 {
                 f.set_len(manifest.file_size)?;
             }

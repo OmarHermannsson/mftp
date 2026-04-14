@@ -24,6 +24,18 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// Controls whether mftp may download a cross-platform binary from GitHub
+/// releases when the remote OS/arch differs from the local machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadPolicy {
+    /// Always download without prompting.
+    Always,
+    /// Never attempt a download; fall back to SFTP immediately.
+    Never,
+    /// Prompt the user interactively (default). Falls back to SFTP if no TTY.
+    Ask,
+}
+
 use crate::transfer::sender::{ForcedTransport, SendConfig};
 
 // ── Platform detection ────────────────────────────────────────────────────────
@@ -143,6 +155,141 @@ async fn probe_remote_platform(dest: &SshDest) -> Result<Option<RemotePlatform>>
     Ok(parse_remote_platform_output(&output))
 }
 
+// ── Cross-platform binary download ───────────────────────────────────────────
+
+/// Construct the GitHub release download URL for a given remote platform.
+///
+/// Artifact naming follows `std::env::consts` values so the URL matches the
+/// release filenames: `mftp-{os}-{arch}[.exe]`.
+fn download_url(platform: &RemotePlatform) -> String {
+    let suffix = if platform.os == "windows" { ".exe" } else { "" };
+    format!(
+        "https://github.com/OmarHermannsson/mftp/releases/latest/download/mftp-{}-{}{}",
+        platform.os, platform.arch, suffix,
+    )
+}
+
+/// Download the mftp binary for `platform` from GitHub releases.
+///
+/// `reqwest` follows GitHub's 302 redirect to the CDN automatically.
+/// Returns the raw binary bytes.
+async fn download_remote_binary(platform: &RemotePlatform) -> Result<Vec<u8>> {
+    let url = download_url(platform);
+    tracing::debug!("downloading remote binary from {url}");
+    eprintln!(
+        "[mftp] downloading mftp for {}/{} from GitHub…",
+        platform.os, platform.arch
+    );
+
+    let resp = reqwest::get(&url)
+        .await
+        .context("HTTP request to GitHub releases failed")?;
+
+    if !resp.status().is_success() {
+        bail!(
+            "GitHub release download returned HTTP {} — \
+             no pre-built binary for {}/{} ({})",
+            resp.status(),
+            platform.os,
+            platform.arch,
+            url,
+        );
+    }
+
+    let bytes = resp.bytes().await.context("reading download body")?;
+    eprintln!("[mftp] downloaded {} KiB", bytes.len() / 1024);
+    Ok(bytes.to_vec())
+}
+
+/// Pipe `binary` to the remote over SSH stdin and run it as a server.
+///
+/// Behaves like `pipe_self_to_remote` but accepts arbitrary bytes and uses
+/// `platform` for the remote cache path so cross-platform binaries are stored
+/// separately from the local binary.
+async fn pipe_binary_to_remote(
+    dest: &SshDest,
+    binary: &[u8],
+    platform: &RemotePlatform,
+    remote_port: Option<u16>,
+) -> Result<tokio::process::Child> {
+    let hash: String = {
+        let digest: [u8; 32] = Sha256::digest(binary).into();
+        hex::encode(&digest[..8])
+    };
+
+    let os = &platform.os;
+    let arch = &platform.arch;
+    let quoted_dir = shell_quote(&dest.remote_path);
+    let port_arg = match remote_port {
+        Some(p) => format!(" --port {p}"),
+        None => String::new(),
+    };
+
+    let remote_cmd = format!(
+        r#"set -e
+f="${{HOME:-/tmp}}/.cache/mftp-{os}-{arch}-{hash}"
+if [ ! -x "$f" ]; then
+  mkdir -p "$(dirname "$f")"
+  cat > "$f"
+  chmod +x "$f"
+  printf '[mftp] binary installed (%s)\n' "$(du -sh "$f" 2>/dev/null | cut -f1 || echo '?')" >&2
+else
+  cat > /dev/null
+  printf '[mftp] using cached binary\n' >&2
+fi
+d={quoted_dir}
+if [ ! -d "$d" ]; then d=$(dirname "$d"); fi
+exec "$f" server --output-dir "$d"{port_arg}"#
+    );
+
+    let mut child = tokio::process::Command::new("ssh")
+        .arg(&dest.user_host)
+        .arg("sh")
+        .arg("-c")
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn ssh(1)")?;
+
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    stdin
+        .write_all(binary)
+        .await
+        .context("writing binary to ssh stdin")?;
+    drop(stdin);
+
+    Ok(child)
+}
+
+/// Prompt the user on `/dev/tty` to confirm downloading a cross-platform binary.
+///
+/// Opens `/dev/tty` directly so the prompt works even when stdin is redirected.
+/// Returns `false` in non-interactive contexts where `/dev/tty` is unavailable.
+fn prompt_download(remote_desc: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(mut tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
+        return false;
+    };
+    let _ = write!(
+        tty,
+        "Download mftp for {remote_desc} from GitHub releases? [y/N]: "
+    );
+    let _ = tty.flush();
+    let Ok(tty_r) = std::fs::File::open("/dev/tty") else {
+        return false;
+    };
+    let mut answer = String::new();
+    BufReader::new(tty_r).read_line(&mut answer).ok();
+    let ans = answer.trim();
+    ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")
+}
+
 // ── Destination parsing ───────────────────────────────────────────────────────
 
 /// An SSH-style destination parsed from `[user@]host:/remote/path`.
@@ -160,17 +307,21 @@ pub struct SshDest {
 
 /// Try to parse `dest` as an SSH destination.
 ///
-/// Returns `None` when `dest` looks like a direct `host:port` address —
+/// Returns `Ok(None)` when `dest` looks like a direct `host:port` address —
 /// specifically, when it contains no `@` and the portion after `:` is a
 /// valid port number.
-pub fn parse_ssh_dest(dest: &str) -> Option<SshDest> {
-    let colon = dest.rfind(':')?;
+/// Returns `Err` if the destination looks like an SSH path but no username
+/// can be determined (no `user@` prefix and `$USER`/`$LOGNAME` are both unset).
+pub fn parse_ssh_dest(dest: &str) -> Result<Option<SshDest>> {
+    let Some(colon) = dest.rfind(':') else {
+        return Ok(None);
+    };
     let before = &dest[..colon];
     let after = &dest[colon + 1..];
 
     // No '@' and the part after ':' is a port number → plain host:port address.
     if !before.contains('@') && after.parse::<u16>().is_ok() {
-        return None;
+        return Ok(None);
     }
 
     let (user_host, user, host) = if let Some(at) = before.find('@') {
@@ -180,16 +331,23 @@ pub fn parse_ssh_dest(dest: &str) -> Option<SshDest> {
             before[at + 1..].to_owned(),
         )
     } else {
-        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "cannot determine SSH username for {dest:?}: \
+                     no user@host prefix and $USER/$LOGNAME are not set"
+                )
+            })?;
         (before.to_owned(), user, before.to_owned())
     };
 
-    Some(SshDest {
+    Ok(Some(SshDest {
         user_host,
         user,
         host,
         remote_path: after.to_owned(),
-    })
+    }))
 }
 
 // ── SSH launch + transfer ─────────────────────────────────────────────────────
@@ -232,6 +390,7 @@ pub async fn send_via_ssh(
     config: SendConfig,
     remote_mftp: Option<String>,
     remote_port: Option<u16>,
+    download_policy: DownloadPolicy,
 ) -> Result<()> {
     // Fast path: SFTP forced — skip remote server launch entirely and go
     // straight to parallel SFTP over port 22.
@@ -269,15 +428,49 @@ pub async fn send_via_ssh(
                     );
                 }
 
-                eprintln!(
-                    "[mftp] remote platform ({remote_desc}) differs from local ({local_desc}); \
-                     skipping binary push, falling back to SFTP…"
-                );
-                let n = config.streams.unwrap_or(8);
-                return crate::sftp::send_via_sftp(file, dest, n).await;
-            }
+                // Try to download the correct binary from GitHub releases,
+                // unless the user opted out or the remote platform is unknown.
+                let should_download = remote_platform.is_some()
+                    && match download_policy {
+                        DownloadPolicy::Always => true,
+                        DownloadPolicy::Never => false,
+                        DownloadPolicy::Ask => prompt_download(&remote_desc),
+                    };
 
-            pipe_self_to_remote(&dest, remote_port).await?
+                if should_download {
+                    let rp = remote_platform.as_ref().unwrap();
+                    match download_remote_binary(rp).await {
+                        Ok(binary) => {
+                            eprintln!("[mftp] piping downloaded binary to remote ({remote_desc})…");
+                            match pipe_binary_to_remote(&dest, &binary, rp, remote_port).await {
+                                Ok(child) => child,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[mftp] failed to pipe downloaded binary: {e:#}; \
+                                         falling back to SFTP…"
+                                    );
+                                    let n = config.streams.unwrap_or(8);
+                                    return crate::sftp::send_via_sftp(file, dest, n).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[mftp] download failed: {e:#}; falling back to SFTP…");
+                            let n = config.streams.unwrap_or(8);
+                            return crate::sftp::send_via_sftp(file, dest, n).await;
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[mftp] remote platform ({remote_desc}) differs from local \
+                         ({local_desc}); falling back to SFTP…"
+                    );
+                    let n = config.streams.unwrap_or(8);
+                    return crate::sftp::send_via_sftp(file, dest, n).await;
+                }
+            } else {
+                pipe_self_to_remote(&dest, remote_port).await?
+            }
         }
     };
 
@@ -478,11 +671,15 @@ fn shell_quote(s: &str) -> String {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
-    tokio::net::lookup_host((host, port))
-        .await
-        .with_context(|| format!("DNS lookup failed for {host}"))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses found for {host}"))
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .with_context(|| format!("DNS lookup timed out for {host}"))?
+    .with_context(|| format!("DNS lookup failed for {host}"))?
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("no addresses found for {host}"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -490,7 +687,8 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        local_platform, parse_remote_platform_output, platform_matches, shell_quote, RemotePlatform,
+        download_url, local_platform, parse_remote_platform_output, platform_matches, shell_quote,
+        RemotePlatform,
     };
 
     #[test]
@@ -611,6 +809,39 @@ mod tests {
             arch: "aarch64".into(),
         };
         assert!(!platform_matches(&local, &remote));
+    }
+
+    #[test]
+    fn download_url_linux() {
+        let p = RemotePlatform {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        assert_eq!(
+            download_url(&p),
+            "https://github.com/OmarHermannsson/mftp/releases/latest/download/mftp-linux-x86_64"
+        );
+    }
+
+    #[test]
+    fn download_url_windows_has_exe_suffix() {
+        let p = RemotePlatform {
+            os: "windows".into(),
+            arch: "x86_64".into(),
+        };
+        assert!(download_url(&p).ends_with(".exe"));
+    }
+
+    #[test]
+    fn download_url_macos_aarch64() {
+        let p = RemotePlatform {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+        };
+        assert_eq!(
+            download_url(&p),
+            "https://github.com/OmarHermannsson/mftp/releases/latest/download/mftp-macos-aarch64"
+        );
     }
 
     #[test]

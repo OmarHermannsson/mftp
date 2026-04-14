@@ -117,6 +117,16 @@ enum Command {
         /// port must be in a firewall allow-list.
         #[arg(long)]
         port: Option<u16>,
+        /// When the remote platform differs from local, automatically download
+        /// the correct mftp binary from GitHub releases without prompting.
+        /// Mutually exclusive with --no-download.
+        #[arg(long, conflicts_with = "no_download")]
+        download: bool,
+        /// When the remote platform differs from local, skip the download
+        /// attempt and fall back to SFTP immediately (no prompt).
+        /// Mutually exclusive with --download.
+        #[arg(long, conflicts_with = "download")]
+        no_download: bool,
     },
     /// Receive files (run as server)
     Receive {
@@ -160,6 +170,8 @@ async fn main() -> Result<()> {
             trust,
             remote_mftp,
             port,
+            download,
+            no_download,
         } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
             let forced_transport = match (cli.transport, cli.tcp) {
@@ -199,8 +211,14 @@ async fn main() -> Result<()> {
                 tcp_rtt_threshold,
                 fec,
             };
-            if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination) {
-                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port).await
+            let download_policy = match (download, no_download) {
+                (true, _) => mftp::ssh::DownloadPolicy::Always,
+                (_, true) => mftp::ssh::DownloadPolicy::Never,
+                _ => mftp::ssh::DownloadPolicy::Ask,
+            };
+            if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
+                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port, download_policy)
+                    .await
             } else {
                 let addr = destination
                     .parse()
