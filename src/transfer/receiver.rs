@@ -910,7 +910,10 @@ fn prepare_transfer(
     // On resume, some chunks are already on disk and will never be fed to the
     // hasher, so we skip inline collection and do a full-file hash at the end.
     let hasher = if bytes_already_received == 0 {
-        Some(Arc::new(ChunkHasher::new(manifest.total_chunks)))
+        Some(Arc::new(ChunkHasher::new(
+            manifest.total_chunks,
+            manifest.num_streams,
+        )))
     } else {
         None
     };

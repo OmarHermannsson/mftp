@@ -18,6 +18,59 @@ use anyhow::Result;
 /// ~128× cheaper to encode than an 8 MiB LAN chunk.
 const SAMPLE_SIZE: usize = 64 * 1024;
 
+/// Per-worker adaptive compression level tracker.
+///
+/// Maintains an exponential moving average (α = 0.15) of the compression
+/// ratio seen across recent chunks and adjusts the zstd level accordingly:
+///
+/// - ratio < 8 %  → level 1 (near-incompressible data; spend minimal CPU)
+/// - ratio > 35 % → level 6 (highly compressible; worth the extra CPU)
+/// - otherwise    → level 3 (default mid-range)
+///
+/// The level is held constant for the first 4 chunks so the EMA has time to
+/// warm up before any adjustment.  Each worker owns its own instance, so
+/// there is no shared state or locking.
+pub struct AdaptiveLevel {
+    /// Current zstd compression level (updated after every chunk).
+    pub level: i32,
+    /// EMA of compression ratio: 0.0 = no gain, 1.0 = perfect compression.
+    ema_ratio: f32,
+    chunks_seen: u32,
+}
+
+impl AdaptiveLevel {
+    pub fn new(initial: i32) -> Self {
+        Self {
+            level: initial,
+            // Initialise the EMA to a neutral mid-range value so the first
+            // few chunks don't trigger a premature level change.
+            ema_ratio: 0.20,
+            chunks_seen: 0,
+        }
+    }
+
+    /// Update the EMA with the outcome of one chunk and possibly adjust the
+    /// level.  `raw_len` is the uncompressed size; `wire_len` is the size
+    /// actually sent (compressed or raw if compression was skipped).
+    pub fn update(&mut self, raw_len: usize, wire_len: usize) {
+        if raw_len == 0 {
+            return;
+        }
+        let ratio = 1.0 - (wire_len as f32 / raw_len as f32);
+        self.ema_ratio = self.ema_ratio * 0.85 + ratio * 0.15;
+        self.chunks_seen += 1;
+        if self.chunks_seen >= 4 {
+            self.level = if self.ema_ratio < 0.08 {
+                1 // Near-incompressible — use the fastest level to save CPU.
+            } else if self.ema_ratio > 0.35 {
+                6 // Highly compressible — invest more CPU for better ratio.
+            } else {
+                3 // Default mid-range.
+            };
+        }
+    }
+}
+
 pub fn compress_chunk(data: &[u8], level: i32) -> Result<Option<Vec<u8>>> {
     if detect::is_already_compressed(data) {
         return Ok(None);

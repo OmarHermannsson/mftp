@@ -41,22 +41,28 @@ fn install_crypto_provider() {
 
 // ── Transport config ──────────────────────────────────────────────────────────
 
-// Set QUIC flow control windows to match the OS socket buffer size.
-// Quinn's defaults are sized for 100 ms RTT @ 100 Mbps (≈ 1.25 MiB per stream),
-// which throttles throughput at high latency:
+// QUIC flow-control windows are sized independently of the OS socket buffers.
 //
-//   150 ms: 1.25 MiB / 0.15 s = 8.3 MiB/s per stream × 8 = 67 MiB/s max
-//   400 ms: 1.25 MiB / 0.40 s = 3.1 MiB/s per stream × 8 = 25 MiB/s max
+// Quinn's defaults target 100 ms RTT @ 100 Mbps (≈ 1.25 MiB per stream),
+// which throttles throughput on any fast or high-latency link:
 //
-// Per-stream window is 32 MiB (matching SO_RCVBUF) so each stream is never
-// flow-control limited.  The connection-level window must be larger: it caps
-// the *total* in-flight bytes across all streams.  Setting it equal to the
-// per-stream window (the prior bug) meant at most one stream could have a
-// full window at a time, capping aggregate throughput to ~320 MiB/s at 100ms
-// even with 16 streams.  256 MiB covers 8 streams × 32 MiB each.
-const STREAM_RECEIVE_WINDOW: u32 = super::SOCKET_BUFFER_SIZE as u32; // 32 MiB per stream
-const CONNECTION_RECEIVE_WINDOW: u32 = 8 * super::SOCKET_BUFFER_SIZE as u32; // 256 MiB total
-const SEND_WINDOW: u64 = 8 * super::SOCKET_BUFFER_SIZE as u64; // 256 MiB
+//   150 ms: 1.25 MiB / 0.15 s =  8 MiB/s per stream
+//   400 ms: 1.25 MiB / 0.40 s =  3 MiB/s per stream  ← satellite ceiling
+//
+// Window formula:  window ≥ bandwidth × RTT  (bandwidth-delay product).
+// Target: 1 Gbps at up to 500 ms RTT → 64 MiB per stream.
+//
+//   500 ms: 64 MiB / 0.50 s = 128 MiB/s per stream  (no longer the bottleneck)
+//   150 ms: 64 MiB / 0.15 s = 427 MiB/s per stream  (well above wire speed)
+//
+// Connection-level window covers 8 streams at full speed simultaneously.
+// These are decoupled from SO_RCVBUF (still 32 MiB) because the OS socket
+// buffer and the QUIC application window serve different purposes: the kernel
+// buffer absorbs burst UDP datagrams; the QUIC window controls how much the
+// *sender* is allowed to have in flight before the receiver must grant credit.
+const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024; // 64 MiB per stream
+const CONNECTION_RECEIVE_WINDOW: u32 = 8 * 64 * 1024 * 1024; // 512 MiB total
+const SEND_WINDOW: u64 = 8 * 64 * 1024 * 1024; // 512 MiB
 
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();

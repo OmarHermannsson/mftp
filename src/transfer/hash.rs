@@ -29,14 +29,6 @@ use std::sync::Mutex;
 
 use anyhow::{bail, Result};
 
-/// Maximum number of out-of-order chunk hashes held in the pending buffer.
-///
-/// With `MAX_IN_FLIGHT=4` per stream and `MAX_STREAMS=1024`, a legitimate
-/// transfer can have at most 4096 chunks ahead of the in-order cursor at
-/// once.  Exceeding this indicates a malicious sender deliberately withholding
-/// early chunks to exhaust receiver memory.
-const MAX_HASHER_PENDING: usize = 4096;
-
 #[derive(Debug)]
 pub struct ChunkHasher {
     inner: Mutex<Inner>,
@@ -51,16 +43,30 @@ struct Inner {
     total: u64,
     /// Chunk hashes that arrived before their turn.
     pending: HashMap<u64, [u8; 32]>,
+    /// Maximum out-of-order hashes we hold before treating the situation as
+    /// an error.  Derived from stream count so legitimate high-stream
+    /// transfers never hit the cap.
+    max_pending: usize,
 }
 
 impl ChunkHasher {
-    pub fn new(total_chunks: u64) -> Self {
+    /// Create a hasher for `total_chunks` chunks arriving across `stream_count`
+    /// parallel streams.
+    ///
+    /// The pending buffer limit is `stream_count × 8`, which is 2× the
+    /// theoretical maximum of `stream_count × MAX_IN_FLIGHT(4)` out-of-order
+    /// chunks that can accumulate when one slow stream holds back the in-order
+    /// cursor while all others run ahead.  The floor of 64 handles tiny files
+    /// or single-stream transfers gracefully.
+    pub fn new(total_chunks: u64, stream_count: usize) -> Self {
+        let max_pending = (stream_count * 8).max(64);
         Self {
             inner: Mutex::new(Inner {
                 collected: Vec::with_capacity(total_chunks as usize),
                 next: 0,
                 total: total_chunks,
                 pending: HashMap::new(),
+                max_pending,
             }),
         }
     }
@@ -89,10 +95,11 @@ impl ChunkHasher {
                 }
             }
         } else {
-            if g.pending.len() >= MAX_HASHER_PENDING && !g.pending.contains_key(&chunk_index) {
+            let limit = g.max_pending;
+            if g.pending.len() >= limit && !g.pending.contains_key(&chunk_index) {
                 bail!(
-                    "hasher pending buffer full ({MAX_HASHER_PENDING} out-of-order chunks) \
-                     — possible malicious sender withholding early chunks"
+                    "hasher pending buffer full ({limit} out-of-order chunks buffered) — \
+                     one stream is far behind the others; the transfer may be stalled"
                 );
             }
             g.pending.insert(chunk_index, hash);
@@ -158,7 +165,7 @@ mod tests {
     #[test]
     fn in_order_matches_reference() {
         let data: Vec<Vec<u8>> = (0u8..4).map(|i| vec![i; 1024]).collect();
-        let hasher = ChunkHasher::new(4);
+        let hasher = ChunkHasher::new(4, 1);
         for (i, d) in data.iter().enumerate() {
             hasher.feed(i as u64, *blake3::hash(d).as_bytes()).unwrap();
         }
@@ -169,7 +176,7 @@ mod tests {
     #[test]
     fn out_of_order_matches_reference() {
         let data: Vec<Vec<u8>> = (0u8..4).map(|i| vec![i; 1024]).collect();
-        let hasher = ChunkHasher::new(4);
+        let hasher = ChunkHasher::new(4, 1);
         for (i, d) in data.iter().enumerate().rev() {
             hasher.feed(i as u64, *blake3::hash(d).as_bytes()).unwrap();
         }
@@ -179,18 +186,31 @@ mod tests {
 
     #[test]
     fn finish_errors_if_incomplete() {
-        let hasher = ChunkHasher::new(4);
+        let hasher = ChunkHasher::new(4, 1);
         hasher.feed(0, [1u8; 32]).unwrap();
         assert!(hasher.finish().is_err());
     }
 
     #[test]
     fn pending_cap_triggers_error() {
-        let hasher = ChunkHasher::new(MAX_HASHER_PENDING as u64 + 2);
-        for i in 1..=MAX_HASHER_PENDING as u64 {
+        // stream_count=1 → max_pending = max(1*8, 64) = 64
+        let limit: u64 = 64;
+        let hasher = ChunkHasher::new(limit + 2, 1);
+        // Feed chunks 1..=limit out of order (chunk 0 never arrives, so all go pending).
+        for i in 1..=limit {
             hasher.feed(i, [0u8; 32]).unwrap();
         }
-        let result = hasher.feed(MAX_HASHER_PENDING as u64 + 1, [0u8; 32]);
+        // One more beyond the limit should error.
+        let result = hasher.feed(limit + 1, [0u8; 32]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn high_stream_count_raises_pending_cap() {
+        // 16 streams → max_pending = 16 * 8 = 128; should not error at 100 pending.
+        let hasher = ChunkHasher::new(200, 16);
+        for i in 1..=100u64 {
+            hasher.feed(i, [0u8; 32]).unwrap();
+        }
     }
 }

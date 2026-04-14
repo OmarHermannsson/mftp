@@ -438,7 +438,7 @@ where
     // chunk — no second disk pass.  For a resume, we must also hash skipped
     // chunks, so fall back to a concurrent full-file read instead.
     let file_hasher: Option<Arc<ChunkHasher>> = if have.is_empty() {
-        Some(Arc::new(ChunkHasher::new(total_chunks)))
+        Some(Arc::new(ChunkHasher::new(total_chunks, num_streams)))
     } else {
         None
     };
@@ -649,10 +649,30 @@ async fn send_from_channel<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    // (chunk_index, payload, wire_hash, compressed)
-    type Ready = (u64, Vec<u8>, [u8; 32], bool);
+    // (chunk_index, payload, wire_hash, compressed, raw_len)
+    // raw_len is fed back to the adaptive level tracker after each chunk.
+    type Ready = (u64, Vec<u8>, [u8; 32], bool, usize);
 
-    let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, compression: Compression| {
+    // Per-worker adaptive compression level.  Starts at the negotiated level
+    // and adjusts based on observed compression ratios across recent chunks.
+    // None when compression is disabled entirely.
+    let mut adaptive = if let Compression::Zstd { level } = compression {
+        Some(compress::AdaptiveLevel::new(*level))
+    } else {
+        None
+    };
+
+    // Return the Compression variant to use for the next chunk, reflecting the
+    // current adaptive level.
+    let current_compression = |adaptive: &Option<compress::AdaptiveLevel>| -> Compression {
+        match (compression, adaptive) {
+            (Compression::None, _) => Compression::None,
+            (Compression::Zstd { .. }, Some(al)) => Compression::Zstd { level: al.level },
+            (Compression::Zstd { level }, None) => Compression::Zstd { level: *level },
+        }
+    };
+
+    let spawn_prepare = |chunk_index: u64, raw: Vec<u8>, comp: Compression| {
         // Cheap Arc clone — one per chunk, just increments a reference count.
         let hasher = file_hasher.clone();
         tokio::task::spawn_blocking(move || -> Result<Ready> {
@@ -661,17 +681,18 @@ where
             //   2. File integrity (fed into ChunkHasher for end-to-end verification)
             // Previously we hashed raw for file integrity AND payload for wire, doing
             // BLAKE3 twice on the same data for incompressible inputs (~40% CPU waste).
+            let raw_len = raw.len();
             let chunk_hash: [u8; 32] = *blake3::hash(&raw).as_bytes();
             if let Some(h) = hasher {
                 h.feed(chunk_index, chunk_hash)?;
             }
-            let (payload, compressed) = maybe_compress(raw, &compression)?;
-            Ok((chunk_index, payload, chunk_hash, compressed))
+            let (payload, compressed) = maybe_compress(raw, &comp)?;
+            Ok((chunk_index, payload, chunk_hash, compressed, raw_len))
         })
     };
 
     while let Some((idx, raw)) = rx.recv().await {
-        let mut task = spawn_prepare(idx, raw, compression.clone());
+        let mut task = spawn_prepare(idx, raw, current_compression(&adaptive));
 
         loop {
             // Try to prefetch the next raw chunk and start its prepare task
@@ -681,10 +702,18 @@ where
             let next_task = rx
                 .try_recv()
                 .ok()
-                .map(|(ni, nr)| spawn_prepare(ni, nr, compression.clone()));
+                .map(|(ni, nr)| spawn_prepare(ni, nr, current_compression(&adaptive)));
 
-            let (chunk_index, payload, chunk_hash, compressed) =
+            let (chunk_index, payload, chunk_hash, compressed, raw_len) =
                 task.await.context("prepare task panicked")??;
+
+            // Update the adaptive level with the ratio just observed.
+            // The next prefetch task (next_task above) already captured the
+            // current level, so the adaptation takes effect one chunk later —
+            // a one-chunk latency that is acceptable.
+            if let Some(ref mut al) = adaptive {
+                al.update(raw_len, payload.len());
+            }
 
             framing::send_chunk_data(
                 writer,
@@ -1112,7 +1141,7 @@ where
     }
 
     // Inline per-chunk hashing via the stripe encoder — no extra disk pass.
-    let file_hasher = Arc::new(ChunkHasher::new(total_chunks));
+    let file_hasher = Arc::new(ChunkHasher::new(total_chunks, num_streams));
 
     let pb = make_progress_bar(&file_name, file_size);
     let transfer_start = Instant::now();
