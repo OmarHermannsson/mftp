@@ -650,11 +650,14 @@ where
                                     target,
                                     "adaptive: scaling {direction} streams"
                                 );
-                                pb_for_reader
-                                    .set_message(format!("scaling {current}→{target} streams"));
-                                flash_until = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(5),
-                                );
+                                if tracing::enabled!(tracing::Level::INFO) {
+                                    pb_for_reader
+                                        .set_message(format!("scaling {current}→{target} streams"));
+                                    flash_until = Some(
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_secs(5),
+                                    );
+                                }
                                 if scale_tx_for_reader
                                     .send(ScaleMsg::Target(target))
                                     .await
