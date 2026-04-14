@@ -86,6 +86,14 @@ struct Cli {
     #[arg(long, global = true, default_value = "5", value_name = "MS")]
     tcp_below_rtt: f64,
 
+    /// Use multiple parallel file readers instead of a single sequential reader.
+    ///
+    /// Splits the file into one range per stream and reads them concurrently.
+    /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
+    /// effect on network-bound transfers or spinning disks.
+    #[arg(long, global = true)]
+    parallel_reads: bool,
+
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -220,6 +228,7 @@ async fn main() -> Result<()> {
                 tcp_rtt_threshold,
                 fec,
                 adaptive_streams: cli.adaptive_streams,
+                parallel_reads: cli.parallel_reads,
             };
             let download_policy = match (download, no_download) {
                 (true, _) => mftp::ssh::DownloadPolicy::Always,

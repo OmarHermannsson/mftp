@@ -71,6 +71,10 @@ pub struct SendConfig {
     /// When true, the sender adjusts stream count mid-transfer based on measured
     /// throughput and receiver congestion signals.
     pub adaptive_streams: bool,
+    /// Use multiple parallel file readers instead of a single sequential reader.
+    /// Only measurable on local NVMe with queue-depth ≥ 32; no benefit on
+    /// network-bound transfers or spinning disks.
+    pub parallel_reads: bool,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
@@ -715,15 +719,49 @@ where
     // each chunk send.  Zero means no pending scale-down.
     let excess_stop = Arc::new(AtomicUsize::new(0));
 
-    // Feeder: sequential file read — pushes all chunks into the shared channel.
-    // Runs entirely in a blocking thread — no async executor involved.
-    let feeder = {
-        let path = file.to_owned();
-        let skip = have.clone();
-        tokio::task::spawn_blocking(move || {
-            feed_chunks(&path, file_size, chunk_size, &skip, work_tx)
-        })
-    };
+    // Feeder(s): read file chunks and push to the shared MPMC channel.
+    //
+    // With --parallel-reads, spawn multiple blocking tasks covering disjoint
+    // chunk ranges — useful on high-queue-depth NVMe where a single sequential
+    // reader is the bottleneck.  Each task holds one work_tx clone; the channel
+    // closes when all clones are dropped (i.e., all readers finish), signalling
+    // workers to drain and exit.
+    //
+    // Without --parallel-reads, a single sequential reader is used, which is
+    // optimal for spinning disks, network mounts, and all network-bound transfers.
+    let total_chunks = file_size.div_ceil(chunk_size as u64);
+    let feeders: Vec<tokio::task::JoinHandle<Result<()>>> =
+        if config.parallel_reads && actual_streams > 1 {
+            let p = actual_streams.min(8); // cap at 8 parallel readers
+            let chunks_per_reader = total_chunks.div_ceil(p as u64);
+            let mut handles = Vec::with_capacity(p);
+            for reader_id in 0..p {
+                let path = file.to_owned();
+                let skip = have.clone();
+                let tx = work_tx.clone();
+                let range_start = reader_id as u64 * chunks_per_reader;
+                let range_end = (range_start + chunks_per_reader).min(total_chunks);
+                handles.push(tokio::task::spawn_blocking(move || {
+                    feed_chunks_range(
+                        &path,
+                        file_size,
+                        chunk_size,
+                        &skip,
+                        tx,
+                        range_start,
+                        range_end,
+                    )
+                }));
+            }
+            drop(work_tx); // close the sender side; channel empties when readers finish
+            handles
+        } else {
+            let path = file.to_owned();
+            let skip = have.clone();
+            vec![tokio::task::spawn_blocking(move || {
+                feed_chunks(&path, file_size, chunk_size, &skip, work_tx)
+            })]
+        };
 
     // Spawn N stream workers.  Each worker gets a clone of the shared receiver
     // (MPMC — all clones drain the same queue) and an Arc of the file hasher.
@@ -819,8 +857,10 @@ where
         }
     }
 
-    // Workers done; feeder should have finished by now (channel closed).
-    feeder.await.context("feeder task panicked")??;
+    // Workers done; all feeders should have finished by now (channel closed).
+    for feeder in feeders {
+        feeder.await.context("feeder task panicked")??;
+    }
 
     pb.set_message("verifying…");
 
@@ -1141,6 +1181,78 @@ fn bits_to_chunk_set(bits: &[u64], total_chunks: u64) -> HashSet<u64> {
         .collect()
 }
 
+/// Return the set of FEC stripe indices where every real data chunk is already
+/// present at the receiver.  Only complete stripes can safely be skipped —
+/// partial stripes must be resent because the receiver may have discarded
+/// incomplete stripe buffers on restart.
+fn complete_fec_stripes(bits: &[u64], total_chunks: u64, data_shards: usize) -> HashSet<u32> {
+    let total_stripes = total_chunks.div_ceil(data_shards as u64) as u32;
+    let mut skip = HashSet::new();
+    for s in 0..total_stripes {
+        let start = s as u64 * data_shards as u64;
+        let end = (start + data_shards as u64).min(total_chunks);
+        let complete = (start..end).all(|idx| {
+            let word = (idx / 64) as usize;
+            let bit = idx % 64;
+            word < bits.len() && (bits[word] >> bit) & 1 != 0
+        });
+        if complete {
+            skip.insert(s);
+        }
+    }
+    skip
+}
+
+/// Read a contiguous range of chunks [range_start, range_end) from disk and
+/// push them to the shared MPMC work channel.
+///
+/// Designed to run in `spawn_blocking`.  Multiple instances cover disjoint
+/// ranges in parallel — useful on high-queue-depth NVMe where a single
+/// sequential reader cannot saturate the drive.  Uses `POSIX_FADV_SEQUENTIAL`
+/// scoped to each reader's byte range so the kernel pre-fetches only the
+/// relevant region.
+fn feed_chunks_range(
+    path: &Path,
+    file_size: u64,
+    chunk_size: usize,
+    skip: &HashSet<u64>,
+    tx: ac::Sender<(u64, Vec<u8>)>,
+    range_start: u64,
+    range_end: u64,
+) -> Result<()> {
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let byte_start = range_start * chunk_size as u64;
+        let byte_len = (range_end * chunk_size as u64).min(file_size) - byte_start;
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                byte_start as i64,
+                byte_len as i64,
+                libc::POSIX_FADV_SEQUENTIAL,
+            );
+        }
+    }
+
+    for idx in range_start..range_end {
+        if skip.contains(&idx) {
+            continue;
+        }
+        let offset = idx * chunk_size as u64;
+        let len = (chunk_size as u64).min(file_size - offset) as usize;
+        let mut raw = vec![0u8; len];
+        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
+            .with_context(|| format!("read chunk {idx}"))?;
+        if tx.send_blocking((idx, raw)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, bool)> {
     match compression {
         Compression::None => Ok((data, false)),
@@ -1178,10 +1290,17 @@ where
 ///
 /// Sends all chunks (no resume skipping) to a single channel that feeds the
 /// `stripe_encode_chunks` blocking task.  Designed to run in `spawn_blocking`.
+///
+/// `skip_stripes` is the set of stripe indices whose real data chunks are
+/// fully present at the receiver — those chunks are skipped here and the
+/// stripe encoder derives the correct stripe index from the first chunk index
+/// in each batch rather than relying on a local counter.
 fn feed_chunks_single(
     path: &Path,
     file_size: u64,
     chunk_size: usize,
+    data_shards: usize,
+    skip_stripes: &HashSet<u32>,
     tx: tokio::sync::mpsc::Sender<(u64, Vec<u8>)>,
 ) -> Result<()> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -1196,6 +1315,12 @@ fn feed_chunks_single(
 
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     for idx in 0..total_chunks {
+        if !skip_stripes.is_empty() {
+            let stripe = (idx / data_shards as u64) as u32;
+            if skip_stripes.contains(&stripe) {
+                continue;
+            }
+        }
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
         let mut raw = vec![0u8; len];
@@ -1225,7 +1350,7 @@ fn encode_and_dispatch(
     worker_txs: &[tokio::sync::mpsc::Sender<FecChunkData>],
     worker_i: &mut usize,
     n: usize,
-    file_hasher: &Arc<ChunkHasher>,
+    file_hasher: Option<&Arc<ChunkHasher>>,
 ) -> Result<()> {
     let data_shards = encoder.data_shards;
     let parity_shards = encoder.parity_shards;
@@ -1237,9 +1362,12 @@ fn encode_and_dispatch(
 
     for (i, (chunk_idx, raw)) in buf.iter().enumerate() {
         let hash = *blake3::hash(raw).as_bytes();
-        // Feed real chunk hashes into the file hasher inline.
+        // Feed real chunk hashes into the file hasher inline (fresh transfers only;
+        // on resume the full-file hash is computed by a separate concurrent task).
         if i < real_count {
-            file_hasher.feed(*chunk_idx, hash)?;
+            if let Some(h) = file_hasher {
+                h.feed(*chunk_idx, hash)?;
+            }
         }
         let (payload, comp) = maybe_compress(raw.clone(), compression)?;
         hashes.push(hash);
@@ -1308,14 +1436,13 @@ fn stripe_encode_chunks(
     fec_params: FecParams,
     compression: Compression,
     transfer_id: [u8; 16],
-    file_hasher: Arc<ChunkHasher>,
+    file_hasher: Option<Arc<ChunkHasher>>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<FecChunkData>>,
 ) -> Result<()> {
     let encoder = FecEncoder::new(fec_params.data_shards, fec_params.parity_shards)?;
     let data_shards = fec_params.data_shards;
     let n = worker_txs.len();
     let mut worker_i = 0usize;
-    let mut stripe_index = 0u32;
 
     // Accumulate `data_shards` chunks per stripe before encoding.
     let mut buf: Vec<(u64, Vec<u8>)> = Vec::with_capacity(data_shards);
@@ -1323,6 +1450,10 @@ fn stripe_encode_chunks(
     while let Some(item) = chunk_rx.blocking_recv() {
         buf.push(item);
         if buf.len() == data_shards {
+            // Derive the stripe index from the first chunk index in the batch.
+            // This is correct even when preceding stripes were skipped on resume —
+            // a sequential counter would give wrong indices in that case.
+            let stripe_index = (buf[0].0 / data_shards as u64) as u32;
             encode_and_dispatch(
                 &buf,
                 data_shards, // all real
@@ -1333,16 +1464,16 @@ fn stripe_encode_chunks(
                 &worker_txs,
                 &mut worker_i,
                 n,
-                &file_hasher,
+                file_hasher.as_ref(),
             )?;
             buf.clear();
-            stripe_index += 1;
         }
     }
 
     // Flush the last partial stripe (file size not a multiple of data_shards * chunk_size).
     if !buf.is_empty() {
         let real_count = buf.len();
+        let stripe_index = (buf[0].0 / data_shards as u64) as u32;
         // Pad with synthetic zero-length entries so RS sees `data_shards` shards.
         // The encoder pads empty payloads to stripe_max with zeros — identical to
         // what the receiver will pre-fill for these virtual shard positions.
@@ -1359,7 +1490,7 @@ fn stripe_encode_chunks(
             &worker_txs,
             &mut worker_i,
             n,
-            &file_hasher,
+            file_hasher.as_ref(),
         )?;
     }
 
@@ -1451,29 +1582,46 @@ where
     };
     framing::send_message(ctrl_send, &manifest).await?;
 
-    // Receive Ready.  FEC v1 ignores the resume bitvec and sends all chunks.
+    // Receive Ready — check which stripes the receiver already has complete.
     let ready: ReceiverMessage = framing::recv_data_message(&mut ctrl_recv)
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
-    match ready {
+    let skip_stripes: HashSet<u32> = match ready {
         ReceiverMessage::Ready {
             received_bits,
             total_chunks: tc,
         } => {
-            let skip_count = bits_to_chunk_set(&received_bits, tc).len();
-            if skip_count > 0 {
-                info!(
-                    "{skip_count} chunks already at receiver — FEC v1 resends everything; \
-                     receiver will skip duplicate writes"
-                );
-            }
+            let s = complete_fec_stripes(&received_bits, tc, fec_params.data_shards);
+            let skipped_chunks = s.len() as u64 * fec_params.data_shards as u64;
+            let remaining_chunks = total_chunks.saturating_sub(skipped_chunks);
+            info!(
+                "{} complete stripes ({skipped_chunks} chunks) already at receiver, \
+                 {} chunks to send",
+                s.len(),
+                remaining_chunks
+            );
+            s
         }
         ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
         other => bail!("unexpected message from receiver: {other:?}"),
-    }
+    };
 
-    // Inline per-chunk hashing via the stripe encoder — no extra disk pass.
-    let file_hasher = Arc::new(ChunkHasher::new(total_chunks, num_streams));
+    // For a fresh transfer hash inline via the stripe encoder — no extra disk pass.
+    // On resume we must also hash skipped chunks, so fall back to a concurrent
+    // full-file read (same strategy as the non-FEC path).
+    let file_hasher: Option<Arc<ChunkHasher>> = if skip_stripes.is_empty() {
+        Some(Arc::new(ChunkHasher::new(total_chunks, num_streams)))
+    } else {
+        None
+    };
+    let hash_task = if skip_stripes.is_empty() {
+        None
+    } else {
+        let path = file.to_owned();
+        Some(tokio::task::spawn_blocking(move || {
+            hash_file_sync(&path, chunk_size)
+        }))
+    };
 
     let chunk_mib = chunk_size / (1024 * 1024);
     let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib);
@@ -1567,8 +1715,10 @@ where
     // Feeder: sequential file read → feeder channel.
     let feeder = {
         let path = file.to_owned();
+        let data_shards = fec_params.data_shards;
+        let skip = skip_stripes.clone();
         tokio::task::spawn_blocking(move || {
-            feed_chunks_single(&path, file_size, chunk_size, feeder_tx)
+            feed_chunks_single(&path, file_size, chunk_size, data_shards, &skip, feeder_tx)
         })
     };
 
@@ -1604,9 +1754,15 @@ where
 
     pb.set_message("verifying…");
 
-    let file_hash = Arc::try_unwrap(file_hasher)
-        .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain")
-        .finish()?;
+    let file_hash: [u8; 32] = match file_hasher {
+        Some(h) => Arc::try_unwrap(h)
+            .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain")
+            .finish()?,
+        None => hash_task
+            .expect("resume path always spawns hash_task")
+            .await
+            .context("hash task panicked")??,
+    };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     let msg = completion_rx
