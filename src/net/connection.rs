@@ -458,13 +458,20 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
     }
     use std::io::Write;
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .mode(0o600)
-        .open(&path)
-    {
+        .open(&path);
+    if let Ok(mut f) = file {
         let _ = writeln!(f, "{addr} {fp}");
     }
 }
