@@ -14,6 +14,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
+use async_channel as ac;
+
 use crate::compress;
 use crate::fec::codec::FecEncoder;
 use crate::net::connection::make_client_endpoint;
@@ -215,7 +217,7 @@ async fn send_quic_with_conn(
 
 async fn quic_stream_worker(
     mut stream: quinn::SendStream,
-    rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    rx: ac::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
@@ -299,7 +301,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
 
 async fn tcp_stream_worker(
     mut stream: crate::net::tcp::ClientTlsStream<tokio::net::TcpStream>,
-    rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    rx: ac::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
@@ -347,12 +349,7 @@ async fn run_transfer<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(
-        tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
-        [u8; 16],
-        Compression,
-        Option<Arc<ChunkHasher>>,
-    ) -> Fut,
+    F: Fn(ac::Receiver<(u64, Vec<u8>)>, [u8; 16], Compression, Option<Arc<ChunkHasher>>) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let file_name = file
@@ -530,55 +527,52 @@ where
     //
     // The feeder reads the source file sequentially in one blocking thread,
     // matching scp's I/O pattern and achieving full sequential disk bandwidth.
-    // It distributes raw chunks round-robin to N per-worker channels via
-    // blocking_send.  Workers compress+hash and send in parallel.
+    // It pushes raw chunks into a single bounded MPMC channel; all workers
+    // pull from the same channel.
     //
-    // There is NO async dispatcher layer.  Having the feeder (a true OS thread
-    // from tokio's blocking pool) write directly into worker channels means each
-    // worker's channel is pre-filled by the time the worker calls try_recv()
-    // in send_from_channel.  An async dispatcher would only run when the event
-    // loop yields, which is too late — the worker has already called try_recv
-    // and found an empty channel, breaking the compress/send pipeline.
+    // Using MPMC (instead of N per-worker SPSC channels) means:
+    //   - Workers that finish a chunk faster naturally pull more work (implicit
+    //     load balancing, no head-of-line blocking behind a slow worker).
+    //   - Dynamic stream count changes (Task 5 scaling) can add or remove
+    //     workers without restructuring the feeder.
     //
-    // Per-worker capacity: 2 chunks (one being compress+hashed, one queued).
-    // With N workers the feeder may block on blocking_send when all channels are
-    // full, providing natural backpressure to the disk read loop.
+    // Total channel capacity = WORKER_CHAN_DEPTH × stream_count so the feeder
+    // can buffer the same amount as with per-worker channels, preserving the
+    // backpressure characteristics.
     const WORKER_CHAN_DEPTH: usize = 4;
 
     let actual_streams = num_streams.min(remaining.max(1) as usize);
 
-    // Build per-worker channels.
-    let mut worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>> = Vec::new();
-    let mut worker_rxs: Vec<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>> = Vec::new();
-    for _ in 0..actual_streams {
-        let (tx, rx) = tokio::sync::mpsc::channel(WORKER_CHAN_DEPTH);
-        worker_txs.push(tx);
-        worker_rxs.push(rx);
-    }
+    // Single shared MPMC work channel.
+    let (work_tx, work_rx) = ac::bounded::<(u64, Vec<u8>)>(WORKER_CHAN_DEPTH * actual_streams);
 
-    // Feeder: sequential file read + round-robin dispatch to worker channels.
+    // Feeder: sequential file read — pushes all chunks into the shared channel.
     // Runs entirely in a blocking thread — no async executor involved.
     let feeder = {
         let path = file.to_owned();
         let skip = have.clone();
         tokio::task::spawn_blocking(move || {
-            feed_chunks(&path, file_size, chunk_size, &skip, worker_txs)
+            feed_chunks(&path, file_size, chunk_size, &skip, work_tx)
         })
     };
 
-    // Spawn N stream workers.  Each worker gets an Arc clone of the file hasher
-    // (Some on fresh transfers, None on resumes) so it can hash its own chunks
-    // concurrently with the other workers in spawn_blocking — no feeder serialisation.
+    // Spawn N stream workers.  Each worker gets a clone of the shared receiver
+    // (MPMC — all clones drain the same queue) and an Arc of the file hasher.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    for rx in worker_rxs {
+    for _ in 0..actual_streams {
         let h = file_hasher.clone();
-        tasks.spawn(spawn_worker(rx, transfer_id, compression.clone(), h));
+        tasks.spawn(spawn_worker(
+            work_rx.clone(),
+            transfer_id,
+            compression.clone(),
+            h,
+        ));
     }
     while let Some(res) = tasks.join_next().await {
         res??;
     }
 
-    // Workers done; feeder should have finished by now (all channels closed).
+    // Workers done; feeder should have finished by now (channel closed).
     feeder.await.context("feeder task panicked")??;
 
     pb.set_message("verifying…");
@@ -627,7 +621,7 @@ fn feed_chunks(
     file_size: u64,
     chunk_size: usize,
     skip: &HashSet<u64>,
-    worker_txs: Vec<tokio::sync::mpsc::Sender<(u64, Vec<u8>)>>,
+    tx: ac::Sender<(u64, Vec<u8>)>,
 ) -> Result<()> {
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
 
@@ -640,8 +634,6 @@ fn feed_chunks(
     }
 
     let total_chunks = file_size.div_ceil(chunk_size as u64);
-    let n = worker_txs.len();
-    let mut worker_i = 0usize;
 
     for idx in 0..total_chunks {
         if skip.contains(&idx) {
@@ -654,14 +646,12 @@ fn feed_chunks(
         crate::fs_ext::read_exact_at(&file, &mut raw, offset)
             .with_context(|| format!("read chunk {idx}"))?;
 
-        // blocking_send provides backpressure: if this worker's channel is
-        // full the feeder waits here, naturally throttling disk reads to
-        // the network send rate.
-        if worker_txs[worker_i].blocking_send((idx, raw)).is_err() {
-            // Worker failed; all remaining workers will also fail.
+        // send_blocking provides backpressure: if the channel is full the
+        // feeder waits here, naturally throttling disk reads to the network
+        // send rate.  An Err means all receivers (workers) have closed.
+        if tx.send_blocking((idx, raw)).is_err() {
             break;
         }
-        worker_i = (worker_i + 1) % n;
     }
 
     Ok(())
@@ -684,7 +674,7 @@ fn feed_chunks(
 /// hashing work across N threads instead of serialising it on the feeder.
 async fn send_from_channel<W>(
     writer: &mut W,
-    mut rx: tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    rx: ac::Receiver<(u64, Vec<u8>)>,
     transfer_id: [u8; 16],
     compression: &Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
@@ -734,7 +724,7 @@ where
         })
     };
 
-    while let Some((idx, raw)) = rx.recv().await {
+    while let Ok((idx, raw)) = rx.recv().await {
         let mut task = spawn_prepare(idx, raw, current_compression(&adaptive));
 
         loop {

@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.59"
+version = "0.1.60"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -74,6 +74,7 @@ hmac = "0.12"
 sha1 = "0.10"
 
 # Misc
+async-channel = "2"
 bytes = "1"
 futures = "0.3"
 libc = "0.2"
