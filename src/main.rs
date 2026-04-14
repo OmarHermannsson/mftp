@@ -46,7 +46,7 @@ struct Cli {
 
     /// Enable Reed-Solomon forward error correction.
     ///
-    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 20% bandwidth overhead but
+    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead but
     /// tolerates up to 2 lost chunks per 8-chunk stripe without retransmission).
     /// Most useful on high-latency lossy links (satellite, intercontinental).
     /// Automatically disabled when the transport falls back to TCP (reliable delivery).

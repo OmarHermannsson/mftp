@@ -20,7 +20,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **BBR congestion control** | Measures bandwidth and RTT directly; avoids CUBIC's sawtooth pattern on lossy/high-latency links |
 | **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 5 ms) where kernel TCP beats QUIC |
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
-| **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH |
+| **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH. **Significantly slower** (~22–32 MiB/s cap) due to SSH SFTP protocol overhead |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
 | **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`) for lossy links; tolerates burst loss without retransmission |
 | **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
@@ -112,7 +112,7 @@ Options:
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
       --fec <DATA:PARITY>  Enable Reed-Solomon forward error correction.
-                           e.g. --fec 8:2 adds 20% overhead but tolerates up to 2
+                           e.g. --fec 8:2 adds 25% overhead but tolerates up to 2
                            lost chunks per stripe without retransmission.
                            Automatically disabled when the transport falls back to
                            TCP (reliable delivery).
@@ -122,10 +122,26 @@ Options:
                                   (no TCP+TLS or SFTP fallback).
                            tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
                            sftp — parallel SFTP through port 22 (SSH mode only;
-                                  ~22 MiB/s cap; skips remote server launch).
+                                  significantly slower, ~22 MiB/s cap; skips remote
+                                  server launch).
                            Omit for auto: QUIC → TCP+TLS → SFTP (SSH mode only).
       --tcp-below-rtt <MS> In auto mode, switch to TCP+TLS when measured RTT ≤ this
                            value. Ignored when --transport is set [default: 5.0].
+      --adaptive-streams   Dynamically scale stream count during transfer.
+                           The sender measures throughput and receiver congestion
+                           every 100 ms and adjusts stream count to maximise
+                           utilisation. Bounded by [2, 2 × min(cores)].
+                           Requires both endpoints to be protocol version ≥ 2.
+      --parallel-reads     Use multiple parallel file readers instead of one
+                           sequential reader. Only beneficial on local NVMe with
+                           queue depth ≥ 32; no measurable effect on spinning
+                           disks or network-bound transfers.
+      --download           When the remote platform differs from local, automatically
+                           download the correct mftp binary from GitHub releases
+                           without prompting. Mutually exclusive with --no-download.
+      --no-download        When the remote platform differs from local, skip the
+                           download attempt and fall back to SFTP immediately.
+                           Mutually exclusive with --download.
   -v, --verbose            Increase log verbosity (-v / -vv / -vvv).
 ```
 
@@ -140,9 +156,9 @@ mftp receive [OPTIONS] [BIND]
 ```
 Options:
   -o, --output-dir <DIR>   Directory to write received files into (default: .).
-      --fec <DATA:PARITY>  Must match the sender's --fec value (passed automatically
-                           in SSH mode via the TransferManifest).
 ```
+
+FEC parameters are negotiated automatically via the `TransferManifest` — no `--fec` flag needed on the receiver.
 
 ### `mftp --version`
 
@@ -187,6 +203,31 @@ When you write `mftp send file.bin user@host:/path`, the sender:
 4. If the direct connection fails (firewall blocks the port), the sender falls back to **parallel SFTP** — N independent SSH/SFTP connections each writing a non-overlapping segment of the file directly to the remote. No mftp process is needed on the remote for this leg; it talks to the sshd sftp-server subsystem.
 
 The remote `mftp server` exits as soon as the transfer completes (or is killed when SFTP takes over).
+
+### Firewall configuration
+
+The QUIC and TCP+TLS paths both require a port to be open on the receiver — UDP for QUIC, TCP for TCP+TLS (or both, since the auto-fallback tries both). In SSH mode a random port is picked by default, which will almost certainly be blocked by a firewall; use `--port <N>` to pick a specific port you control.
+
+**Opening a port temporarily (Linux)**
+
+```sh
+# iptables (most distributions)
+sudo iptables -A INPUT -p udp --dport 7777 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 7777 -j ACCEPT
+
+# firewalld (RHEL/Fedora/Rocky/AlmaLinux)
+sudo firewall-cmd --add-port=7777/udp --add-port=7777/tcp
+
+# ufw (Ubuntu/Debian)
+sudo ufw allow 7777/udp
+sudo ufw allow 7777/tcp
+```
+
+These rules are not persistent across reboots. To persist them, add `--permanent` to `firewall-cmd` (then `sudo firewall-cmd --reload`), use `iptables-save`, or add a `ufw` allow rule before enabling ufw persistence.
+
+**Cloud providers**: security group or VPC firewall rules (AWS, GCP, Azure, etc.) must also permit the port — kernel-level rules alone are not enough on cloud instances. The rule must allow inbound traffic from the sender's public IP on the chosen port (UDP and TCP).
+
+**If you cannot open a port**: the automatic SFTP fallback (port 22 only) requires no additional firewall changes. It is slower — typically 22–32 MiB/s versus the full QUIC/TCP throughput — but works through any firewall that allows SSH.
 
 ### SFTP fallback
 
@@ -340,9 +381,10 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 
 ## Known limitations
 
-- **Firewall**: the QUIC and TCP+TLS paths both require an open port on the receiver. In SSH mode a random port is used by default — likely to be blocked. Use `--port <N>` with a known-open port, or rely on the automatic SFTP fallback (port 22 only, but capped at ~22–32 MiB/s).
+- **Firewall**: the QUIC and TCP+TLS paths both require an open port on the receiver. In SSH mode a random port is used by default — likely to be blocked. Use `--port <N>` with a known-open port, or rely on the automatic SFTP fallback (port 22 only, but capped at ~22–32 MiB/s). See [Firewall configuration](#firewall-configuration) above.
+- **SFTP fallback is significantly slower**: the SFTP path is capped at ~3 MiB/s per stream (a fundamental SSH SFTP protocol limitation — synchronous write acknowledgments). At the default of 8 streams that is ~22 MiB/s; 12 streams gives ~32 MiB/s. This is several times slower than the QUIC or TCP+TLS paths, which saturate the link. If transfers are consistently falling back to SFTP, open a port and use `--port <N>`.
+- **macOS: not tested**: mftp is developed and tested on Linux. It may compile and work on macOS, but this is not verified. Issues specific to macOS are welcome but may not be promptly fixed.
 - **TOFU fingerprint persistence**: `--trust` fingerprints are not stored between sessions. You must pass `--trust` on every non-interactive invocation, or accept the prompt each time.
-- **SFTP throughput ceiling**: ~3 MiB/s per stream due to synchronous SSH SFTP write acknowledgments (a protocol limitation, not an implementation one).
 - **Single file**: recursive directory transfer is not yet supported.
 
 ---
@@ -370,6 +412,8 @@ cargo build --release
 ```
 
 Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu). On Windows, OpenSSL is vendored automatically — no extra setup needed.
+
+> **Platform support**: Linux (x86_64, arm64) is the primary supported platform. macOS may compile and work, but is not tested — proceed with caution and report issues. Windows builds are supported for the receiver-less SFTP path; the full QUIC/TCP stack is untested on Windows.
 
 ```sh
 # Check only (fast)
