@@ -60,6 +60,7 @@ async fn roundtrip(
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
+            adaptive_streams: false,
         },
     )
     .await?;
@@ -152,6 +153,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
+            adaptive_streams: false,
         },
     )
     .await?;
@@ -216,6 +218,7 @@ async fn roundtrip_tcp(
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
+            adaptive_streams: false,
         },
     )
     .await;
@@ -350,6 +353,7 @@ async fn roundtrip_fec(
                 data_shards,
                 parity_shards,
             }),
+            adaptive_streams: false,
         },
     )
     .await?;
@@ -446,6 +450,7 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
                 data_shards: 4,
                 parity_shards: 1,
             }),
+            adaptive_streams: false,
         },
     )
     .await;

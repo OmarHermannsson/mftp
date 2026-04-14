@@ -53,6 +53,15 @@ struct Cli {
     #[arg(long, global = true, value_name = "DATA:PARITY")]
     fec: Option<String>,
 
+    /// Dynamically scale the number of parallel streams during transfer.
+    ///
+    /// Requires both sender and receiver to be protocol version ≥ 2.
+    /// The sender measures throughput and receiver congestion every 100 ms and
+    /// adjusts the stream count to maximise utilisation without saturating the
+    /// receiver.  Stream count is bounded by [2, 2 × min(cores)].
+    #[arg(long, global = true)]
+    adaptive_streams: bool,
+
     /// Force a specific transport path.
     ///
     /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
@@ -210,6 +219,7 @@ async fn main() -> Result<()> {
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,
+                adaptive_streams: cli.adaptive_streams,
             };
             let download_policy = match (download, no_download) {
                 (true, _) => mftp::ssh::DownloadPolicy::Always,

@@ -2,11 +2,22 @@ use serde::{Deserialize, Serialize};
 
 // ── Parameter negotiation (first round-trip on the control stream) ────────────
 
+/// Current protocol version.  Both sides include this in NegotiateRequest /
+/// NegotiateResponse so each peer knows whether the other supports newer
+/// control messages (e.g. AdjustStreams / AdjustStreamsAck).
+///
+/// Version history:
+///   1 — initial release (no version field; old binaries implicitly version 1)
+///   2 — adds protocol_version field + AdjustStreams / AdjustStreamsAck messages
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegotiateRequest {
     /// Logical CPU cores available on the sender.
     pub cpu_cores: u32,
+    /// Wire protocol version this sender supports.  See [`PROTOCOL_VERSION`].
+    pub protocol_version: u32,
 }
 
 /// Receiver's reply to `NegotiateRequest`.
@@ -14,6 +25,8 @@ pub struct NegotiateRequest {
 pub struct NegotiateResponse {
     /// Logical CPU cores available on the receiver.
     pub cpu_cores: u32,
+    /// Wire protocol version this receiver supports.  See [`PROTOCOL_VERSION`].
+    pub protocol_version: u32,
 }
 
 /// Sent by the sender on the control stream before data transfer begins.
@@ -105,6 +118,15 @@ pub enum SenderMessage {
     /// Computed concurrently with the transfer; delivered here so it doesn't
     /// block connection setup.
     Complete { file_hash: [u8; 32] },
+    /// Request the receiver to adjust the number of active data streams.
+    ///
+    /// Sent by the sender during the data-transfer phase when adaptive stream
+    /// scaling is enabled (both peers protocol_version >= 2).
+    /// - Scale-up: receiver should accept `target_count - current_count` new
+    ///   streams and reply with `AdjustStreamsAck`.
+    /// - Scale-down: sender closes excess streams (QUIC FIN / TLS shutdown);
+    ///   receiver workers on those streams see EOF and exit normally.
+    AdjustStreams { target_count: u8 },
 }
 
 /// Sent by the receiver on the control stream.
@@ -139,4 +161,10 @@ pub enum ReceiverMessage {
     Complete { file_hash: [u8; 32] },
     /// Receiver encountered a fatal error.
     Error { message: String },
+    /// Acknowledgement of a `SenderMessage::AdjustStreams` request.
+    ///
+    /// `accepted_count` is the actual new total stream count after the
+    /// adjustment.  It may differ from `target_count` if the receiver could
+    /// not open/accept all requested streams.
+    AdjustStreamsAck { accepted_count: u8 },
 }

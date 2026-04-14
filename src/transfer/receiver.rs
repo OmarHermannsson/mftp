@@ -27,7 +27,7 @@ use crate::protocol::{
     framing,
     messages::{
         ChunkData, FecChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage,
-        SenderMessage, TransferManifest,
+        SenderMessage, TransferManifest, PROTOCOL_VERSION,
     },
 };
 use crate::transfer::hash::ChunkHasher;
@@ -694,6 +694,7 @@ where
         &mut ctrl_send,
         &NegotiateResponse {
             cpu_cores: receiver_cores,
+            protocol_version: PROTOCOL_VERSION,
         },
     )
     .await?;
@@ -1088,6 +1089,11 @@ where
 
     let expected_hash = match framing::recv_message_required(ctrl_recv).await? {
         SenderMessage::Complete { file_hash } => file_hash,
+        // AdjustStreams is handled during data transfer (Commit 3); if we see
+        // it here the sender is misbehaving — treat it as a protocol error.
+        SenderMessage::AdjustStreams { target_count } => {
+            anyhow::bail!("unexpected AdjustStreams({target_count}) in finish phase");
+        }
     };
 
     if file_hash != expected_hash {

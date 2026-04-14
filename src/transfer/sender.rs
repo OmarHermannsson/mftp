@@ -28,7 +28,7 @@ use crate::protocol::{
     },
 };
 use crate::transfer::hash::{hash_file_sync, ChunkHasher};
-use crate::transfer::negotiate::compute_params;
+use crate::transfer::negotiate::{compute_params, compute_target_streams, ProgressSample};
 
 /// Which transport path to use for the transfer.
 ///
@@ -65,6 +65,10 @@ pub struct SendConfig {
     /// Automatically forced to `None` when the transport falls back to TCP+TLS
     /// (TCP already provides reliable delivery; FEC would only add overhead).
     pub fec: Option<FecParams>,
+    /// Enable adaptive stream scaling (requires both peers protocol_version ≥ 2).
+    /// When true, the sender adjusts stream count mid-transfer based on measured
+    /// throughput and receiver congestion signals.
+    pub adaptive_streams: bool,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
@@ -161,6 +165,7 @@ async fn send_quic_with_conn(
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
+            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
         },
     )
     .await?;
@@ -168,6 +173,7 @@ async fn send_quic_with_conn(
     let rtt = conn.stats().path.rtt;
 
     let conn_for_workers = conn.clone();
+    let peer_version = neg_resp.protocol_version;
 
     if let Some(fec_params) = config.fec.clone() {
         run_transfer_fec(
@@ -198,6 +204,7 @@ async fn send_quic_with_conn(
             rtt,
             sender_cores,
             neg_resp.cpu_cores,
+            peer_version,
             &config,
             move |rx, transfer_id, compression, file_hasher| {
                 let conn = conn_for_workers.clone();
@@ -268,6 +275,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
+            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
         },
     )
     .await?;
@@ -275,6 +283,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
     let rtt = rtt_start.elapsed();
 
     let trusted_fp = config.trusted_fingerprint.clone();
+    let peer_version = neg_resp.protocol_version;
 
     run_transfer(
         &file,
@@ -284,6 +293,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
         rtt,
         sender_cores,
         neg_resp.cpu_cores,
+        peer_version,
         &config,
         move |rx, transfer_id, compression, file_hasher| {
             let fp = trusted_fp.clone();
@@ -343,6 +353,7 @@ async fn run_transfer<CW, CR, F, Fut>(
     rtt: Duration,
     sender_cores: u32,
     receiver_cores: u32,
+    peer_protocol_version: u32,
     config: &SendConfig,
     spawn_worker: F,
 ) -> Result<()>
@@ -468,15 +479,29 @@ where
     // receiver.  If the receiver is consistently saturated (in-flight near its
     // maximum across 3+ consecutive samples) or if writes are stalling, a
     // tracing warning is emitted so operators can diagnose bottlenecks.
+    //
+    // When --adaptive-streams is enabled and both peers are protocol_version ≥ 2,
+    // the task also maintains a sliding window of progress samples and calls
+    // compute_target_streams() to log scaling recommendations.
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
     // MAX_IN_FLIGHT on the receiver is 4 per stream worker.
     let max_in_flight = num_streams as u32 * 4;
+    // cpu_cap mirrors the same formula used in compute_params().
+    let cpu_cap = (receiver_cores.min(sender_cores) as usize).max(1) * 2;
+    let adaptive_enabled = config.adaptive_streams
+        && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
     let reader = tokio::spawn(async move {
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(30))
             .unwrap_or_else(std::time::Instant::now);
+
+        // Sliding window of progress samples for throughput estimation.
+        const SAMPLE_WINDOW: usize = 10;
+        let mut samples: Vec<ProgressSample> = Vec::with_capacity(SAMPLE_WINDOW + 1);
+        let mut last_scale_at: Option<std::time::Instant> = None;
+
         loop {
             match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
                 Ok(Some(ReceiverMessage::Progress {
@@ -512,6 +537,46 @@ where
                             "receiver disk stall: writes are taking longer than 50 ms"
                         );
                         last_disk_warn = std::time::Instant::now();
+                    }
+
+                    // Adaptive stream scaling: maintain sample window and log
+                    // recommendations.  Actual scaling is performed in Commit 3;
+                    // here we only measure and log.
+                    if adaptive_enabled {
+                        samples.push(ProgressSample {
+                            bytes_written,
+                            in_flight_chunks,
+                            disk_stall_ms,
+                            timestamp: std::time::Instant::now(),
+                        });
+                        if samples.len() > SAMPLE_WINDOW {
+                            samples.remove(0);
+                        }
+                        if let Some(target) = compute_target_streams(
+                            &samples,
+                            num_streams,
+                            cpu_cap,
+                            file_size,
+                            last_scale_at,
+                        ) {
+                            if target as usize > num_streams {
+                                tracing::info!(
+                                    current = num_streams,
+                                    target,
+                                    "adaptive: would scale up streams"
+                                );
+                            } else {
+                                tracing::info!(
+                                    current = num_streams,
+                                    target,
+                                    "adaptive: would scale down streams"
+                                );
+                            }
+                            // Record the "last scale" time even though we're not
+                            // actually scaling yet — keeps the recommendation rate
+                            // consistent with what the real cooldown will enforce.
+                            last_scale_at = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 Ok(Some(other)) => {
