@@ -426,13 +426,13 @@ where
         config.streams,
         config.chunk_size,
     );
-    println!(
-        "Negotiated: {} streams, {} MiB chunks (RTT {:.1} ms, sender {} cores, receiver {} cores)",
-        params.streams,
-        params.chunk_size / (1024 * 1024),
-        rtt.as_secs_f64() * 1000.0,
+    tracing::info!(
+        streams = params.streams,
+        chunk_mib = params.chunk_size / (1024 * 1024),
+        rtt_ms = rtt.as_secs_f64() * 1000.0,
         sender_cores,
         receiver_cores,
+        "negotiated transfer parameters"
     );
 
     let chunk_size = params.chunk_size;
@@ -500,7 +500,8 @@ where
         }))
     };
 
-    let pb = make_progress_bar(&file_name, file_size);
+    let chunk_mib = chunk_size / (1024 * 1024);
+    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib);
     // Seed the bar with bytes the receiver already confirmed (resume).
     let resume_bytes: u64 = have
         .iter()
@@ -546,7 +547,11 @@ where
     let adaptive_enabled = config.adaptive_streams
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
     let scale_tx_for_reader = scale_tx.clone();
+    let file_name_for_reader = file_name.clone();
     let reader = tokio::spawn(async move {
+        let mut normal_msg =
+            format!("{file_name_for_reader} · {num_streams} streams · {chunk_mib} MiB");
+        let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(30))
@@ -568,6 +573,12 @@ where
                 })) => {
                     pb_for_reader.set_position(bytes_written);
 
+                    // Revert flash message if its display window has elapsed.
+                    if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
+                        pb_for_reader.set_message(normal_msg.clone());
+                        flash_until = None;
+                    }
+
                     let current = current_streams_for_reader.load(AtomicOrd::Relaxed);
                     let max_in_flight = current as u32 * 4;
 
@@ -575,27 +586,36 @@ where
                     if in_flight_chunks >= max_in_flight * 3 / 4 {
                         saturated_run += 1;
                         if saturated_run == 3 {
-                            tracing::warn!(
+                            tracing::info!(
                                 in_flight = in_flight_chunks,
                                 max = max_in_flight,
                                 "receiver saturated: chunk processing cannot keep up with network"
                             );
+                            pb_for_reader.set_message("⚠ receiver saturated".to_string());
+                            flash_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         }
                     } else {
                         if saturated_run >= 3 {
                             tracing::info!("receiver saturation cleared");
+                            pb_for_reader.set_message("✓ saturation cleared".to_string());
+                            flash_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         }
                         saturated_run = 0;
                     }
 
-                    // Disk stall: warn at most once per 10 s to avoid log spam.
+                    // Disk stall: flash in bar, log at info, throttle to once per 10 s.
                     if disk_stall_ms > 50
                         && last_disk_warn.elapsed() >= std::time::Duration::from_secs(10)
                     {
-                        tracing::warn!(
+                        tracing::info!(
                             disk_stall_ms,
                             "receiver disk stall: writes are taking longer than 50 ms"
                         );
+                        pb_for_reader.set_message(format!("⚠ disk stall {disk_stall_ms}ms"));
+                        flash_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         last_disk_warn = std::time::Instant::now();
                     }
 
@@ -628,6 +648,11 @@ where
                                     target,
                                     "adaptive: scaling {direction} streams"
                                 );
+                                pb_for_reader
+                                    .set_message(format!("scaling {current}→{target} streams"));
+                                flash_until = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                                );
                                 if scale_tx_for_reader
                                     .send(ScaleMsg::Target(target))
                                     .await
@@ -644,6 +669,11 @@ where
                 Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
                     tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
                     pending_scale = false;
+                    normal_msg = format!(
+                        "{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB"
+                    );
+                    pb_for_reader.set_message(normal_msg.clone());
+                    flash_until = None;
                     let _ = scale_tx_for_reader
                         .send(ScaleMsg::Ack(accepted_count))
                         .await;
@@ -1040,7 +1070,12 @@ where
     Ok(())
 }
 
-fn make_progress_bar(file_name: &str, file_size: u64) -> Arc<ProgressBar> {
+fn make_progress_bar(
+    file_name: &str,
+    file_size: u64,
+    streams: usize,
+    chunk_mib: usize,
+) -> Arc<ProgressBar> {
     Arc::new({
         let pb = ProgressBar::new(file_size);
         pb.set_style(
@@ -1051,7 +1086,7 @@ fn make_progress_bar(file_name: &str, file_size: u64) -> Arc<ProgressBar> {
             .unwrap(),
         );
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_message(file_name.to_owned());
+        pb.set_message(format!("{file_name} · {streams} streams · {chunk_mib} MiB"));
         pb
     })
 }
@@ -1380,16 +1415,15 @@ where
         config.streams,
         config.chunk_size,
     );
-    println!(
-        "Negotiated: {} streams, {} MiB chunks, FEC {}/{} \
-         (RTT {:.1} ms, sender {} cores, receiver {} cores)",
-        params.streams,
-        params.chunk_size / (1024 * 1024),
-        fec_params.data_shards,
-        fec_params.parity_shards,
-        rtt.as_secs_f64() * 1000.0,
+    tracing::info!(
+        streams = params.streams,
+        chunk_mib = params.chunk_size / (1024 * 1024),
+        fec_data = fec_params.data_shards,
+        fec_parity = fec_params.parity_shards,
+        rtt_ms = rtt.as_secs_f64() * 1000.0,
         sender_cores,
         receiver_cores,
+        "negotiated transfer parameters"
     );
 
     let chunk_size = params.chunk_size;
@@ -1441,12 +1475,17 @@ where
     // Inline per-chunk hashing via the stripe encoder — no extra disk pass.
     let file_hasher = Arc::new(ChunkHasher::new(total_chunks, num_streams));
 
-    let pb = make_progress_bar(&file_name, file_size);
+    let chunk_mib = chunk_size / (1024 * 1024);
+    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib);
     let transfer_start = Instant::now();
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
     let max_in_flight = num_streams as u32 * 4;
+    let file_name_for_reader = file_name.clone();
     let reader = tokio::spawn(async move {
+        let normal_msg =
+            format!("{file_name_for_reader} · {num_streams} streams · {chunk_mib} MiB");
+        let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
         let mut last_disk_warn = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(30))
@@ -1460,18 +1499,30 @@ where
                 })) => {
                     pb_for_reader.set_position(bytes_written);
 
+                    // Revert flash message if its display window has elapsed.
+                    if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
+                        pb_for_reader.set_message(normal_msg.clone());
+                        flash_until = None;
+                    }
+
                     if in_flight_chunks >= max_in_flight * 3 / 4 {
                         saturated_run += 1;
                         if saturated_run == 3 {
-                            tracing::warn!(
+                            tracing::info!(
                                 in_flight = in_flight_chunks,
                                 max = max_in_flight,
                                 "receiver saturated: chunk processing cannot keep up with network"
                             );
+                            pb_for_reader.set_message("⚠ receiver saturated".to_string());
+                            flash_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         }
                     } else {
                         if saturated_run >= 3 {
                             tracing::info!("receiver saturation cleared");
+                            pb_for_reader.set_message("✓ saturation cleared".to_string());
+                            flash_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         }
                         saturated_run = 0;
                     }
@@ -1479,10 +1530,13 @@ where
                     if disk_stall_ms > 50
                         && last_disk_warn.elapsed() >= std::time::Duration::from_secs(10)
                     {
-                        tracing::warn!(
+                        tracing::info!(
                             disk_stall_ms,
                             "receiver disk stall: writes are taking longer than 50 ms"
                         );
+                        pb_for_reader.set_message(format!("⚠ disk stall {disk_stall_ms}ms"));
+                        flash_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         last_disk_warn = std::time::Instant::now();
                     }
                 }
