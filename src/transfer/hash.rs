@@ -53,15 +53,19 @@ impl ChunkHasher {
     /// Create a hasher for `total_chunks` chunks arriving across `stream_count`
     /// parallel streams.
     ///
-    /// The pending buffer limit is `stream_count × 16`, which is 4× the
-    /// theoretical maximum of `stream_count × MAX_IN_FLIGHT(4)` out-of-order
-    /// chunks that can accumulate when one slow stream holds back the in-order
-    /// cursor while all others run ahead.  The extra headroom absorbs transient
-    /// stream skew during adaptive scaling (scale-down workers exiting mid-flight)
-    /// without triggering a fatal receiver error.  The floor of 64 handles tiny
-    /// files or single-stream transfers gracefully.
+    /// The pending buffer limit is `stream_count × 64`, providing a 16× safety
+    /// margin over the theoretical maximum of `stream_count × MAX_IN_FLIGHT(4)`
+    /// out-of-order chunks.  The extra headroom is needed because the receiver's
+    /// write semaphore (8 permits) can force the stream carrying chunk `next` to
+    /// wait behind disk stalls (50–250 ms each), while the other streams continue
+    /// feeding the hasher.  Repeated stall events accumulate: at 30 chunks/s with
+    /// 15 streams running ahead, the 4× margin (256) saturated in ~9 s of stall
+    /// exposure; 16× (1024) requires ~34 s of sustained disk-stall exposure before
+    /// an overflow is triggered.  Each pending entry is 40 bytes (u64 key + 32-byte
+    /// hash), so 1024 entries is 40 KiB — negligible memory.
+    /// The floor of 256 handles tiny files or single-stream transfers gracefully.
     pub fn new(total_chunks: u64, stream_count: usize) -> Self {
-        let max_pending = (stream_count * 16).max(64);
+        let max_pending = (stream_count * 64).max(256);
         Self {
             inner: Mutex::new(Inner {
                 collected: Vec::with_capacity(total_chunks as usize),
@@ -291,8 +295,8 @@ mod tests {
 
     #[test]
     fn pending_cap_triggers_error() {
-        // stream_count=1 → max_pending = max(1*8, 64) = 64
-        let limit: u64 = 64;
+        // stream_count=1 → max_pending = max(1*64, 256) = 256
+        let limit: u64 = 256;
         let hasher = ChunkHasher::new(limit + 2, 1);
         // Feed chunks 1..=limit out of order (chunk 0 never arrives, so all go pending).
         for i in 1..=limit {
@@ -305,9 +309,9 @@ mod tests {
 
     #[test]
     fn high_stream_count_raises_pending_cap() {
-        // 16 streams → max_pending = 16 * 16 = 256; should not error at 200 pending.
-        let hasher = ChunkHasher::new(300, 16);
-        for i in 1..=200u64 {
+        // 16 streams → max_pending = 16 * 64 = 1024; should not error at 500 pending.
+        let hasher = ChunkHasher::new(600, 16);
+        for i in 1..=500u64 {
             hasher.feed(i, [0u8; 32]).unwrap();
         }
     }

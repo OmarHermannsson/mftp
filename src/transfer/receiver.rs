@@ -309,10 +309,12 @@ pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<(
     // Machine-readable handshake — the SSH launcher reads exactly this line.
     println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\"}}");
 
-    // Race QUIC and TCP.  If the QUIC connection is immediately closed by the
-    // sender with the "switching to tcp" sentinel (RTT-based LAN detection),
-    // fall through to accept the follow-up TCP+TLS connection instead of
-    // exiting — the TCP listener is still bound and waiting.
+    // Accept up to 2 connections: the initial transfer and one resume retry.
+    //
+    // The sender's retry logic (ssh.rs) keeps the SSH session alive after a
+    // mid-flight failure and immediately reconnects to the same port.  By
+    // looping here instead of exiting we keep both endpoints bound so the
+    // retry can succeed without relaunching the receiver.
     //
     // No overall timeout here: in SSH mode the server is launched by the
     // sender and inherits the SSH session.  If the sender is killed, the SSH
@@ -320,15 +322,35 @@ pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<(
     // causing it to exit.  The DATA_STREAM_ACCEPT_TIMEOUT inside run_receive
     // handles the case where the sender dies after connecting the control
     // stream but before all data streams are established.
+    for attempt in 0_u8..=1 {
+        let result = accept_one_quic_or_tcp(&quic_server, &tcp_server).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt == 0 => {
+                // First transfer failed; stay alive so the sender's automatic
+                // resume retry can reconnect to the same port.
+                warn!("transfer failed (attempt 1), waiting for resume retry: {e:#}");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Race QUIC and TCP for one complete transfer.  If the QUIC connection is
+/// immediately closed by the sender with the "switching to tcp" sentinel
+/// (RTT-based LAN detection), fall through to accept the follow-up TCP+TLS
+/// connection instead.
+async fn accept_one_quic_or_tcp(quic: &Server, tcp: &TcpServer) -> Result<()> {
     tokio::select! {
-        res = quic_server.accept_one() => {
+        res = quic.accept_one() => {
             match res {
                 Ok(()) => Ok(()),
-                Err(e) if e.is::<SwitchToTcp>() => tcp_server.accept_one().await,
+                Err(e) if e.is::<SwitchToTcp>() => tcp.accept_one().await,
                 Err(e) => Err(e),
             }
         }
-        res = tcp_server.accept_one() => res,
+        res = tcp.accept_one() => res,
     }
 }
 
