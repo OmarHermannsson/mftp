@@ -148,21 +148,31 @@ pub fn write_all_at_deferred(
 
 // ── DeferredDontneed ──────────────────────────────────────────────────────────
 
-/// How many writes to buffer before issuing `FADV_DONTNEED` for the oldest
-/// entry.  At ~120 MiB/s with 4 MiB chunks and 8 concurrent writers, each
-/// write slot is ~34 ms; 32 slots ≈ 136 ms of lookahead — enough for the
-/// block device to start draining the earlier submission.
+/// Maximum bytes of write ranges to hold in the deferred DONTNEED queue.
+///
+/// This matches the peak dirty-page budget enforced by the write semaphore
+/// (8 concurrent writers × 4 MiB chunks = 32 MiB), which is a known-safe
+/// ceiling for the receiver's page-cache footprint.  Using a bytes-based cap
+/// rather than a count-based one means the budget is independent of chunk size.
+///
+/// At 120 MiB/s the queue holds ~270 ms of writes before the oldest entry is
+/// evicted — ample time for the block layer to have dispatched the earlier I/O.
+/// Under degraded throughput the queue stays proportionally smaller, preventing
+/// the dirty-page blowup that a fixed count (e.g. 32 chunks × 4 MiB = 128 MiB)
+/// would allow when write rate is low.
 #[cfg(target_os = "linux")]
-const DONTNEED_LOOKAHEAD: usize = 32;
+const DONTNEED_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Deferred `posix_fadvise(FADV_DONTNEED)` tracker.
 ///
 /// Calling `FADV_DONTNEED` immediately after `sync_file_range(WRITE)` can
 /// stall briefly when the block layer hasn't yet dispatched the submitted I/O;
 /// the kernel then has to flush those pages synchronously before it can drop
-/// them.  By buffering recent write ranges and issuing DONTNEED only after
-/// [`DONTNEED_LOOKAHEAD`] newer writes have been recorded, we ensure the
-/// earlier writeback is reliably in flight before eviction is requested.
+/// them.  By buffering pending write ranges and issuing DONTNEED only once the
+/// total buffered bytes exceeds [`DONTNEED_MAX_BYTES`], we ensure the earlier
+/// writeback is reliably in flight before eviction is requested — while
+/// bounding the dirty-page footprint to the same ceiling the write semaphore
+/// already guarantees.
 ///
 /// `DeferredDontneed` is `Clone` — clones share the same underlying queue so
 /// multiple `spawn_blocking` tasks writing to the same file participate in the
@@ -178,19 +188,28 @@ pub struct DeferredDontneed {
 #[cfg(target_os = "linux")]
 struct DeferredInner {
     fd: std::os::unix::io::RawFd,
-    pending: std::sync::Mutex<std::collections::VecDeque<(i64, i64)>>,
+    state: std::sync::Mutex<DeferredState>,
+}
+
+#[cfg(target_os = "linux")]
+struct DeferredState {
+    pending: std::collections::VecDeque<(i64, i64)>,
+    pending_bytes: u64,
 }
 
 impl DeferredDontneed {
     /// Create a tracker bound to `file`.  All clones of this value share the
-    /// same lookahead queue and issue DONTNEED on `file`'s fd.
+    /// same queue and issue DONTNEED on `file`'s fd.
     pub fn new(_file: &File) -> Self {
         #[cfg(target_os = "linux")]
         {
             Self {
                 inner: Some(std::sync::Arc::new(DeferredInner {
                     fd: _file.as_raw_fd(),
-                    pending: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                    state: std::sync::Mutex::new(DeferredState {
+                        pending: std::collections::VecDeque::new(),
+                        pending_bytes: 0,
+                    }),
                 })),
             }
         }
@@ -210,23 +229,31 @@ impl DeferredDontneed {
     }
 
     /// Record that `(offset, len)` has been written and `sync_file_range`'d.
-    /// If the lookahead queue is full, evicts the oldest entry with
-    /// `FADV_DONTNEED` (outside the lock, so it never serialises other callers).
+    ///
+    /// Ranges are held in the queue until the total pending bytes exceeds
+    /// [`DONTNEED_MAX_BYTES`], at which point the oldest entries are evicted
+    /// with `FADV_DONTNEED` (outside the lock, so eviction never serialises
+    /// other callers).  At least one entry is always kept in the queue so the
+    /// most-recent write is still deferred past its own `sync_file_range`.
     #[cfg(target_os = "linux")]
     pub fn push(&self, offset: i64, len: i64) {
         let Some(ref inner) = self.inner else {
             return;
         };
-        let evict = {
-            let mut q = inner.pending.lock().unwrap();
-            q.push_back((offset, len));
-            if q.len() > DONTNEED_LOOKAHEAD {
-                q.pop_front()
-            } else {
-                None
+        let evict: Vec<(i64, i64)> = {
+            let mut s = inner.state.lock().unwrap();
+            s.pending.push_back((offset, len));
+            s.pending_bytes += len as u64;
+            let mut out = Vec::new();
+            while s.pending_bytes > DONTNEED_MAX_BYTES && s.pending.len() > 1 {
+                if let Some((off, l)) = s.pending.pop_front() {
+                    s.pending_bytes -= l as u64;
+                    out.push((off, l));
+                }
             }
+            out
         };
-        if let Some((off, l)) = evict {
+        for (off, l) in evict {
             unsafe {
                 libc::posix_fadvise(inner.fd, off, l, libc::POSIX_FADV_DONTNEED);
             }
@@ -234,14 +261,18 @@ impl DeferredDontneed {
     }
 
     /// Flush all remaining pending DONTNEED calls.  Call once after the last
-    /// write to ensure no ranges are left in the page cache indefinitely.
+    /// write to ensure no ranges linger in the page cache.
     pub fn flush(&self) {
         #[cfg(target_os = "linux")]
         {
             let Some(ref inner) = self.inner else {
                 return;
             };
-            let entries: Vec<(i64, i64)> = inner.pending.lock().unwrap().drain(..).collect();
+            let entries: Vec<(i64, i64)> = {
+                let mut s = inner.state.lock().unwrap();
+                s.pending_bytes = 0;
+                s.pending.drain(..).collect()
+            };
             for (off, len) in entries {
                 unsafe {
                     libc::posix_fadvise(inner.fd, off, len, libc::POSIX_FADV_DONTNEED);

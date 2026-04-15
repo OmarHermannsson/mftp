@@ -570,6 +570,7 @@ fn write_fec_chunk(
 /// RS reconstruction for any missing ones.
 ///
 /// Designed to run in `spawn_blocking`; all I/O is synchronous.
+#[allow(clippy::too_many_arguments)]
 fn process_stripe(
     stripe: StripeBuffer,
     chunk_size: usize,
