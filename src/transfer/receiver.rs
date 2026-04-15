@@ -521,6 +521,7 @@ fn write_fec_chunk(
     hasher: &Option<Arc<ChunkHasher>>,
     pb: &ProgressBar,
     progress_tx: &tokio::sync::mpsc::Sender<u64>,
+    deferred: &crate::fs_ext::DeferredDontneed,
 ) -> Result<()> {
     let data = if compressed {
         compress::decompress_chunk(payload, chunk_size)
@@ -537,7 +538,7 @@ fn write_fec_chunk(
     }
 
     let offset = chunk_index * chunk_size as u64;
-    crate::fs_ext::write_all_at_advise(out_file, &data, offset)
+    crate::fs_ext::write_all_at_deferred(out_file, &data, offset, deferred)
         .with_context(|| format!("write FEC chunk {chunk_index} at offset {offset}"))?;
 
     if let Some(h) = hasher {
@@ -577,6 +578,7 @@ fn process_stripe(
     hasher: Option<Arc<ChunkHasher>>,
     pb: Arc<ProgressBar>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
+    deferred: crate::fs_ext::DeferredDontneed,
 ) -> Result<()> {
     let data_shards = stripe.data_shards;
     let parity_shards = stripe.parity_shards;
@@ -598,6 +600,7 @@ fn process_stripe(
                 &hasher,
                 &pb,
                 &progress_tx,
+                &deferred,
             )?;
         }
         return Ok(());
@@ -658,6 +661,7 @@ fn process_stripe(
             &hasher,
             &pb,
             &progress_tx,
+            &deferred,
         )?;
     }
 
@@ -787,6 +791,16 @@ where
     // kernel's dirty_ratio threshold on typical systems.
     let write_sem = Arc::new(tokio::sync::Semaphore::new(8));
 
+    // Deferred FADV_DONTNEED tracker: shared by all stream workers writing to
+    // the same output file.  Issuing DONTNEED immediately after sync_file_range
+    // can stall if the block layer hasn't dispatched the submitted I/O yet;
+    // the deferred tracker waits for a lookahead of later writes before evicting
+    // each range from the page cache.
+    let deferred_dontneed = match &pt.out_file {
+        Some(f) => crate::fs_ext::DeferredDontneed::new(f),
+        None => crate::fs_ext::DeferredDontneed::noop(), // directory mode: no single fd
+    };
+
     // Accept all N data streams concurrently.
     //
     // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
@@ -830,6 +844,7 @@ where
         let ptx = progress_tx.clone();
         let st = Arc::clone(&stats);
         let wsem = Arc::clone(&write_sem);
+        let dd = deferred_dontneed.clone();
         if let Some(ref bufs_arc) = fec_stripe_bufs {
             // FEC path: always single-file (directory+FEC rejected at sender).
             let fec_file = out_file.expect("FEC requires single-file output");
@@ -846,13 +861,14 @@ where
                     stripe_bufs,
                     st,
                     wsem,
+                    dd,
                 )
                 .await
             });
         } else {
             tasks.spawn(async move {
                 recv_stream_worker(
-                    stream, out_file, layout, resume, manifest_c, pb, hasher, ptx, st, wsem,
+                    stream, out_file, layout, resume, manifest_c, pb, hasher, ptx, st, wsem, dd,
                 )
                 .await
             });
@@ -921,10 +937,11 @@ where
                                 let ptx = scale_progress_tx.clone();
                                 let st = Arc::clone(&stats);
                                 let wsem = Arc::clone(&write_sem);
+                                let dd = deferred_dontneed.clone();
                                 tasks.spawn(async move {
                                     recv_stream_worker(
                                         stream, out_file, layout, resume, manifest_c, pb, hasher,
-                                        ptx, st, wsem,
+                                        ptx, st, wsem, dd,
                                     )
                                     .await
                                 });
@@ -957,6 +974,10 @@ where
     // Let the reporter know no more workers will be added (closes channel).
     drop(scale_progress_tx);
     pt.pb.finish();
+
+    // Flush any ranges still in the deferred DONTNEED queue now that all
+    // writes have completed and the block device has had time to drain them.
+    deferred_dontneed.flush();
 
     // FEC: after all stream workers finish, any remaining stripes in the map
     // did not receive enough shards for reconstruction — warn and let the
@@ -1531,6 +1552,7 @@ async fn recv_stream_worker<R>(
     progress_tx: tokio::sync::mpsc::Sender<u64>,
     stats: Arc<ReceiverStats>,
     write_sem: Arc<tokio::sync::Semaphore>,
+    deferred: crate::fs_ext::DeferredDontneed,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1589,6 +1611,7 @@ where
         let pb = Arc::clone(&pb);
         let progress_tx = progress_tx.clone();
         let stats = Arc::clone(&stats);
+        let deferred_c = deferred.clone();
 
         // Acquire the global write semaphore before spawning.  This limits peak
         // concurrent pwrite calls across all streams to 8, capping dirty-page
@@ -1634,7 +1657,7 @@ where
                 let f = out_file
                     .as_ref()
                     .expect("single-file mode must have out_file");
-                crate::fs_ext::write_all_at_advise(f, &data, offset)
+                crate::fs_ext::write_all_at_deferred(f, &data, offset, &deferred_c)
                     .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
             }
             // Release the write semaphore now that all pwrite calls for this chunk
@@ -1715,6 +1738,7 @@ async fn recv_fec_stream_worker<R>(
     stripe_bufs: Arc<Mutex<HashMap<u32, StripeBuffer>>>,
     stats: Arc<ReceiverStats>,
     write_sem: Arc<tokio::sync::Semaphore>,
+    deferred: crate::fs_ext::DeferredDontneed,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1801,6 +1825,7 @@ where
             let pb = Arc::clone(&pb);
             let ptx = progress_tx.clone();
             let stats = Arc::clone(&stats);
+            let deferred_c = deferred.clone();
             let write_permit = write_sem
                 .clone()
                 .acquire_owned()
@@ -1809,7 +1834,9 @@ where
             stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
             processing.spawn_blocking(move || {
                 let write_start = std::time::Instant::now();
-                let result = process_stripe(stripe, chunk_size, out_file, resume, hasher, pb, ptx);
+                let result = process_stripe(
+                    stripe, chunk_size, out_file, resume, hasher, pb, ptx, deferred_c,
+                );
                 drop(write_permit);
                 let write_us = write_start.elapsed().as_micros() as u32;
                 stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
