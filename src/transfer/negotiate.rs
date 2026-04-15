@@ -114,6 +114,9 @@ pub struct ProgressSample {
 /// - `cpu_cap`: maximum stream count (`2 × min(sender_cores, receiver_cores)`).
 /// - `bytes_total`: total file size in bytes (used to gate the 5%-sent check).
 /// - `last_scale_at`: when the last scaling action occurred (`None` = never).
+/// - `last_scale_down_at`: when the last **scale-down** occurred (`None` = never).
+///   Used to enforce a longer post-downscale cooldown before allowing scale-up,
+///   preventing the 16↔14 oscillation seen when disk stalls are transient.
 ///
 /// # Heuristics
 /// **Scale-up** (all of the following must hold):
@@ -123,6 +126,7 @@ pub struct ProgressSample {
 ///   - `disk_stall_ms < 50` — receiver disk is not the bottleneck.
 ///   - `current_streams < cpu_cap`.
 ///   - 2-second cooldown since last scale action has elapsed.
+///   - 10-second post-downscale cooldown since last scale-down has elapsed.
 ///
 /// **Scale-down** (one of the following):
 ///   - Receiver saturated for ≥5 consecutive samples.
@@ -134,8 +138,12 @@ pub fn compute_target_streams(
     cpu_cap: usize,
     bytes_total: u64,
     last_scale_at: Option<std::time::Instant>,
+    last_scale_down_at: Option<std::time::Instant>,
 ) -> Option<u8> {
     const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+    /// After a scale-down, suppress scale-up for this long to prevent
+    /// immediate oscillation when disk stalls are transient.
+    const POST_DOWNSCALE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
     const MAX_IN_FLIGHT_PER_STREAM: u32 = 4;
 
     if samples.len() < 3 {
@@ -184,6 +192,12 @@ pub fn compute_target_streams(
 
     // ── Scale-up check ────────────────────────────────────────────────────
     if current_streams >= cpu_cap {
+        return None;
+    }
+
+    // Suppress scale-up for POST_DOWNSCALE_COOLDOWN after any scale-down.
+    // This prevents immediate re-oscillation when disk stalls are transient.
+    if last_scale_down_at.is_some_and(|t| t.elapsed() < POST_DOWNSCALE_COOLDOWN) {
         return None;
     }
 
@@ -341,6 +355,7 @@ mod tests {
             16,                     // cpu_cap
             5 * 1024 * 1024 * 1024, // 5 GiB total — 5*1024 bytes is way under 5%
             None,
+            None,
         );
         assert_eq!(result, None);
     }
@@ -349,7 +364,7 @@ mod tests {
     fn no_change_during_cooldown() {
         let samples: Vec<_> = (0..6).map(|i| make_sample(i * 10_000_000, 0, 0)).collect();
         let last_scale = Some(std::time::Instant::now()); // just happened
-        let result = compute_target_streams(&samples, 4, 16, 100_000_000, last_scale);
+        let result = compute_target_streams(&samples, 4, 16, 100_000_000, last_scale, None);
         assert_eq!(result, None, "cooldown should suppress scaling");
     }
 
@@ -358,7 +373,7 @@ mod tests {
         let max_in_flight = 4 * 4; // current_streams * 4 = 16
                                    // All 5 trailing samples saturated at ≥75% of 16 = 12+
         let samples: Vec<_> = (0..7).map(|i| make_sample(i * 10_000_000, 13, 0)).collect();
-        let result = compute_target_streams(&samples, 4, 16, 100_000_000, None);
+        let result = compute_target_streams(&samples, 4, 16, 100_000_000, None, None);
         assert_eq!(result, Some(2), "should scale down by 2");
         let _ = max_in_flight;
     }
@@ -368,7 +383,7 @@ mod tests {
         let samples: Vec<_> = (0..5)
             .map(|i| make_sample(i * 10_000_000, 0, 150)) // stall > 100ms
             .collect();
-        let result = compute_target_streams(&samples, 6, 16, 100_000_000, None);
+        let result = compute_target_streams(&samples, 6, 16, 100_000_000, None, None);
         assert_eq!(result, Some(4), "should scale down by 2");
     }
 
@@ -378,7 +393,7 @@ mod tests {
         let samples: Vec<_> = (0..7)
             .map(|i| make_sample(i * 10_000_000, 7, 0)) // 7 of 8 in-flight = 87.5% saturated
             .collect();
-        let result = compute_target_streams(&samples, 2, 16, 100_000_000, None);
+        let result = compute_target_streams(&samples, 2, 16, 100_000_000, None, None);
         assert_eq!(result, None, "cannot go below 2 streams");
     }
 
@@ -400,7 +415,7 @@ mod tests {
                 .unwrap_or_else(std::time::Instant::now);
             samples.push(s);
         }
-        let result = compute_target_streams(&samples, 2, 16, 100_000_000, None);
+        let result = compute_target_streams(&samples, 2, 16, 100_000_000, None, None);
         assert_eq!(result, Some(4), "should scale up by 2 (2+2)");
     }
 
@@ -410,7 +425,31 @@ mod tests {
             .map(|i| make_sample(5_000_000 + i * 100, 0, 0))
             .collect();
         // current_streams == cpu_cap
-        let result = compute_target_streams(&samples, 8, 8, 100_000_000, None);
+        let result = compute_target_streams(&samples, 8, 8, 100_000_000, None, None);
         assert_eq!(result, None, "already at cpu_cap");
+    }
+
+    #[test]
+    fn no_scale_up_immediately_after_scale_down() {
+        // Clean samples (no stall, low in-flight, slow throughput) that would
+        // normally trigger a scale-up — but last_scale_down_at was 3 seconds ago,
+        // which is within the 10-second POST_DOWNSCALE_COOLDOWN.
+        let mut samples = Vec::new();
+        for i in 0..5u64 {
+            let mut s = make_sample(5_000_000 + i * 1_000, 1, 0);
+            s.timestamp = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis((400 - i * 100) as u64))
+                .unwrap_or_else(std::time::Instant::now);
+            samples.push(s);
+        }
+        // Scale-down happened 3 seconds ago — well within the 10-second cooldown.
+        let last_down = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .unwrap();
+        let result = compute_target_streams(&samples, 2, 16, 100_000_000, None, Some(last_down));
+        assert_eq!(
+            result, None,
+            "post-downscale cooldown should suppress scale-up"
+        );
     }
 }

@@ -699,6 +699,7 @@ where
         const SAMPLE_WINDOW: usize = 10;
         let mut samples: Vec<ProgressSample> = Vec::with_capacity(SAMPLE_WINDOW + 1);
         let mut last_scale_at: Option<std::time::Instant> = None;
+        let mut last_scale_down_at: Option<std::time::Instant> = None;
         // Suppress sending another Target while a pending Ack is expected.
         let mut pending_scale = false;
 
@@ -774,6 +775,7 @@ where
                             cpu_cap,
                             file_size,
                             last_scale_at,
+                            last_scale_down_at,
                         ) {
                             if (target as usize) != current {
                                 let direction = if (target as usize) > current {
@@ -802,7 +804,11 @@ where
                                     return; // main loop dropped receiver
                                 }
                                 pending_scale = true;
-                                last_scale_at = Some(std::time::Instant::now());
+                                let now = std::time::Instant::now();
+                                last_scale_at = Some(now);
+                                if (target as usize) < current {
+                                    last_scale_down_at = Some(now);
+                                }
                             }
                         }
                     }

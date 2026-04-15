@@ -53,13 +53,15 @@ impl ChunkHasher {
     /// Create a hasher for `total_chunks` chunks arriving across `stream_count`
     /// parallel streams.
     ///
-    /// The pending buffer limit is `stream_count × 8`, which is 2× the
+    /// The pending buffer limit is `stream_count × 16`, which is 4× the
     /// theoretical maximum of `stream_count × MAX_IN_FLIGHT(4)` out-of-order
     /// chunks that can accumulate when one slow stream holds back the in-order
-    /// cursor while all others run ahead.  The floor of 64 handles tiny files
-    /// or single-stream transfers gracefully.
+    /// cursor while all others run ahead.  The extra headroom absorbs transient
+    /// stream skew during adaptive scaling (scale-down workers exiting mid-flight)
+    /// without triggering a fatal receiver error.  The floor of 64 handles tiny
+    /// files or single-stream transfers gracefully.
     pub fn new(total_chunks: u64, stream_count: usize) -> Self {
-        let max_pending = (stream_count * 8).max(64);
+        let max_pending = (stream_count * 16).max(64);
         Self {
             inner: Mutex::new(Inner {
                 collected: Vec::with_capacity(total_chunks as usize),
@@ -113,7 +115,7 @@ impl ChunkHasher {
     /// The limit only ever increases (decreasing would risk spurious errors
     /// while buffered hashes are still in flight).
     pub fn update_stream_count(&self, new_count: usize) {
-        let new_limit = (new_count * 8).max(64);
+        let new_limit = (new_count * 16).max(64);
         let mut g = self.inner.lock().unwrap();
         if new_limit > g.max_pending {
             g.max_pending = new_limit;
@@ -303,9 +305,9 @@ mod tests {
 
     #[test]
     fn high_stream_count_raises_pending_cap() {
-        // 16 streams → max_pending = 16 * 8 = 128; should not error at 100 pending.
-        let hasher = ChunkHasher::new(200, 16);
-        for i in 1..=100u64 {
+        // 16 streams → max_pending = 16 * 16 = 256; should not error at 200 pending.
+        let hasher = ChunkHasher::new(300, 16);
+        for i in 1..=200u64 {
             hasher.feed(i, [0u8; 32]).unwrap();
         }
     }
