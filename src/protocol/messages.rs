@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Version history:
 ///   1 — initial release (no version field; old binaries implicitly version 1)
 ///   2 — adds protocol_version field + AdjustStreams / AdjustStreamsAck messages
-pub const PROTOCOL_VERSION: u32 = 2;
+///   3 — adds recursive directory transfer: DirEntries message sent by sender
+///       after TransferManifest when peer_version >= 3.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +62,53 @@ pub struct FecParams {
     pub data_shards: usize,
     /// Number of parity shards per group.
     pub parity_shards: usize,
+}
+
+// ── Directory transfer types (protocol version ≥ 3) ─────────────────────────
+
+/// Kind of entry in a recursive directory transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileKind {
+    /// A regular file with data bytes in the concat stream.
+    File,
+    /// An empty directory (no data bytes; materialised before data transfer).
+    Directory,
+    /// A symbolic link (no data bytes; target is preserved as-is).
+    Symlink { target: String },
+}
+
+/// One entry in a recursive directory manifest.
+///
+/// `path` is a relative path using forward-slash separators and no leading `/`.
+/// Only `FileKind::File` entries contribute bytes to the concat stream;
+/// `Directory` and `Symlink` entries have `size == 0`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Relative path within the transfer root (e.g. `"docs/readme.txt"`).
+    pub path: String,
+    /// Size in bytes; 0 for `Directory` and `Symlink`.
+    pub size: u64,
+    pub kind: FileKind,
+    /// Unix permission bits from the source.  0 if unavailable (e.g. Windows).
+    pub mode: u32,
+    /// Modification time as seconds since the Unix epoch.  0 if unavailable.
+    pub mtime: i64,
+}
+
+/// Sent by a protocol-version-3+ sender immediately after `TransferManifest`.
+///
+/// `entries == None` → single-file transfer (same semantics as version 2,
+/// just with the handshake extended to v3).
+///
+/// `entries == Some(vec)` → directory transfer; `vec` is ordered by path and
+/// describes the layout of the virtual concatenated byte stream (all
+/// `FileKind::File` sizes sum to `TransferManifest.file_size`).
+///
+/// Not sent by version-2 senders.  The receiver must check
+/// `peer_protocol_version < 3` and skip this read when talking to an old peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntries {
+    pub entries: Option<Vec<FileEntry>>,
 }
 
 /// One chunk of file data, sent on a data stream.

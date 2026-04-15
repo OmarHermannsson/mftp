@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 #[derive(Debug)]
 pub struct ChunkHasher {
@@ -159,6 +159,89 @@ pub(crate) fn hash_file_sync(path: &Path, chunk_size: usize) -> Result<[u8; 32]>
         let h = blake3::hash(&buf[..len]);
         chunk_hashes.extend_from_slice(h.as_bytes());
     }
+    Ok(*blake3::hash(&chunk_hashes).as_bytes())
+}
+
+/// Compute the transfer hash over a directory's virtual concat stream using the
+/// same formula as `hash_file_sync` but reading multiple files in order.
+///
+/// Used on the resume path for directory transfers when some chunks were already
+/// on disk before the restart and therefore never fed to a live `ChunkHasher`.
+pub(crate) fn hash_concat_sync(
+    entries: &[crate::protocol::messages::FileEntry],
+    base_dir: &Path,
+    chunk_size: usize,
+) -> Result<[u8; 32]> {
+    use crate::protocol::messages::FileKind;
+
+    // Build an in-order flat list of (file_path, size) for File entries only.
+    let file_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, FileKind::File))
+        .filter(|e| e.size > 0)
+        .collect();
+
+    let total_bytes: u64 = file_entries.iter().map(|e| e.size).sum();
+    if total_bytes == 0 {
+        // Empty transfer: hash of zero chunks = blake3(empty) from an empty chunk-hash list.
+        return Ok(*blake3::hash(&[]).as_bytes());
+    }
+    let total_chunks = total_bytes.div_ceil(chunk_size as u64);
+
+    // Build prefix sums: prefix_sums[i] = global offset where file i starts.
+    let mut prefix_sums: Vec<u64> = Vec::with_capacity(file_entries.len() + 1);
+    let mut acc = 0u64;
+    for e in &file_entries {
+        prefix_sums.push(acc);
+        acc += e.size;
+    }
+    prefix_sums.push(acc); // sentinel
+
+    let mut chunk_hashes: Vec<u8> = Vec::with_capacity(total_chunks as usize * 32);
+    let mut buf = vec![0u8; chunk_size];
+
+    for chunk_idx in 0..total_chunks {
+        let global_start = chunk_idx * chunk_size as u64;
+        let global_end = (global_start + chunk_size as u64).min(total_bytes);
+        let chunk_len = (global_end - global_start) as usize;
+        let chunk_buf = &mut buf[..chunk_len];
+
+        // Fill chunk_buf from potentially multiple files.
+        let mut written = 0usize;
+        let mut fi = prefix_sums
+            .partition_point(|&ps| ps <= global_start)
+            .saturating_sub(1);
+        let mut pos = global_start;
+
+        while written < chunk_len && fi < file_entries.len() {
+            let file_start = prefix_sums[fi];
+            let file_end = prefix_sums[fi + 1];
+            let offset_in_file = pos - file_start;
+            let remaining_in_file = file_end - pos;
+            let needed = chunk_len - written;
+            let take = remaining_in_file.min(needed as u64) as usize;
+
+            let file_path = base_dir.join(&file_entries[fi].path);
+            let file = std::fs::File::open(&file_path)
+                .with_context(|| format!("open {}", file_path.display()))?;
+            crate::fs_ext::read_exact_at(
+                &file,
+                &mut chunk_buf[written..written + take],
+                offset_in_file,
+            )
+            .with_context(|| {
+                format!("read {} at offset {}", file_path.display(), offset_in_file)
+            })?;
+
+            written += take;
+            pos += take as u64;
+            fi += 1;
+        }
+
+        let h = blake3::hash(&chunk_buf[..written]);
+        chunk_hashes.extend_from_slice(h.as_bytes());
+    }
+
     Ok(*blake3::hash(&chunk_hashes).as_bytes())
 }
 

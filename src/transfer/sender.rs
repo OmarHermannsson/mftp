@@ -25,8 +25,8 @@ use crate::net::tcp::connect_tls;
 use crate::protocol::{
     framing,
     messages::{
-        ChunkData, Compression, FecChunkData, FecParams, NegotiateRequest, NegotiateResponse,
-        ReceiverMessage, SenderMessage, TransferManifest,
+        ChunkData, Compression, DirEntries, FecChunkData, FecParams, FileEntry, FileKind,
+        NegotiateRequest, NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest,
     },
 };
 use crate::transfer::hash::{hash_file_sync, ChunkHasher};
@@ -75,6 +75,15 @@ pub struct SendConfig {
     /// Only measurable on local NVMe with queue-depth ≥ 32; no benefit on
     /// network-bound transfers or spinning disks.
     pub parallel_reads: bool,
+    /// Transfer directories recursively.  When true and `file` is a directory,
+    /// the sender scans the tree, builds a `DirEntries` manifest, and feeds the
+    /// virtual concatenated byte stream.  Silently accepted (no-op) for regular
+    /// files.
+    pub recursive: bool,
+    /// Preserve source file permissions and modification time on the receiver.
+    /// Sent as metadata in `FileEntry`; the receiver applies them in a final
+    /// pass after all data is written.
+    pub preserve: bool,
 }
 
 /// How long to wait for a QUIC connection before falling back to TCP+TLS.
@@ -86,8 +95,13 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(5);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
+    // Scan directory before connecting so errors are surfaced early.
+    let dir_entries = resolve_source(&file, &config)?;
+
     match &config.forced_transport {
-        Some(ForcedTransport::Tcp) => return send_tcp(file, destination, config).await,
+        Some(ForcedTransport::Tcp) => {
+            return send_tcp(file, destination, config, dir_entries).await
+        }
         Some(ForcedTransport::Sftp) => bail!(
             "--transport sftp is only available in SSH mode \
              ([user@]host:/path); it is not valid for a direct host:port destination"
@@ -122,13 +136,13 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
                     threshold.as_secs_f64() * 1000.0,
                 );
                 conn.close(0u32.into(), b"switching to tcp");
-                send_tcp(file, destination, config).await
+                send_tcp(file, destination, config, dir_entries).await
             } else {
                 info!(
                     "connected via QUIC (RTT {:.1} ms)",
                     rtt.as_secs_f64() * 1000.0
                 );
-                send_quic_with_conn(file, config, conn).await
+                send_quic_with_conn(file, config, conn, dir_entries).await
             }
         }
         Ok(Err(e)) if forced_quic => {
@@ -136,7 +150,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         }
         Ok(Err(e)) => {
             eprintln!("[mftp] QUIC connect failed ({e:#}), retrying over TCP+TLS…");
-            send_tcp(file, destination, config).await
+            send_tcp(file, destination, config, dir_entries).await
         }
         Err(_) if forced_quic => bail!(
             "QUIC connect timed out after {QUIC_CONNECT_TIMEOUT:.1?} — \
@@ -144,8 +158,40 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
         ),
         Err(_timeout) => {
             eprintln!("[mftp] QUIC connect timed out (UDP may be blocked), retrying over TCP+TLS…");
-            send_tcp(file, destination, config).await
+            send_tcp(file, destination, config, dir_entries).await
         }
+    }
+}
+
+/// Resolve the source path: if it's a directory and `config.recursive` is set,
+/// scan it and return the entry list.  Returns `None` for single-file sources.
+fn resolve_source(file: &Path, config: &SendConfig) -> Result<Option<Vec<FileEntry>>> {
+    if file.is_dir() {
+        if !config.recursive {
+            bail!(
+                "{} is a directory — pass -r to transfer it recursively",
+                file.display()
+            );
+        }
+        if config.fec.is_some() {
+            bail!(
+                "directory transfer with FEC is not yet supported; \
+                 omit --fec or send a single file"
+            );
+        }
+        let entries = scan_directory(file, config.preserve)?;
+        info!(
+            "scanned {} ({} entries, {} files)",
+            file.display(),
+            entries.len(),
+            entries
+                .iter()
+                .filter(|e| matches!(e.kind, FileKind::File))
+                .count()
+        );
+        Ok(Some(entries))
+    } else {
+        Ok(None)
     }
 }
 
@@ -155,11 +201,16 @@ async fn send_quic_with_conn(
     file: PathBuf,
     config: SendConfig,
     conn: quinn::Connection,
+    dir_entries: Option<Vec<FileEntry>>,
 ) -> Result<()> {
-    let file_size = tokio::fs::metadata(&file)
-        .await
-        .with_context(|| format!("cannot stat {}", file.display()))?
-        .len();
+    let file_size = if let Some(ref entries) = dir_entries {
+        total_file_bytes(entries)
+    } else {
+        tokio::fs::metadata(&file)
+            .await
+            .with_context(|| format!("cannot stat {}", file.display()))?
+            .len()
+    };
 
     let sender_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -185,6 +236,7 @@ async fn send_quic_with_conn(
         run_transfer_fec(
             &file,
             file_size,
+            peer_version,
             &mut ctrl_send,
             ctrl_recv,
             rtt,
@@ -205,6 +257,7 @@ async fn send_quic_with_conn(
         run_transfer(
             &file,
             file_size,
+            dir_entries.as_deref(),
             &mut ctrl_send,
             ctrl_recv,
             rtt,
@@ -269,7 +322,12 @@ async fn quic_fec_stream_worker(
 
 // ── TCP path ──────────────────────────────────────────────────────────────────
 
-async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig) -> Result<()> {
+async fn send_tcp(
+    file: PathBuf,
+    destination: SocketAddr,
+    mut config: SendConfig,
+    dir_entries: Option<Vec<FileEntry>>,
+) -> Result<()> {
     if config.fec.is_some() {
         eprintln!(
             "[mftp] FEC is not used over TCP+TLS (reliable transport provides equivalent \
@@ -277,10 +335,14 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
         );
         config.fec = None;
     }
-    let file_size = tokio::fs::metadata(&file)
-        .await
-        .with_context(|| format!("cannot stat {}", file.display()))?
-        .len();
+    let file_size = if let Some(ref entries) = dir_entries {
+        total_file_bytes(entries)
+    } else {
+        tokio::fs::metadata(&file)
+            .await
+            .with_context(|| format!("cannot stat {}", file.display()))?
+            .len()
+    };
 
     let sender_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -311,6 +373,7 @@ async fn send_tcp(file: PathBuf, destination: SocketAddr, mut config: SendConfig
     run_transfer(
         &file,
         file_size,
+        dir_entries.as_deref(),
         &mut ctrl_send,
         ctrl_recv,
         rtt,
@@ -387,6 +450,7 @@ async fn tcp_stream_worker(
 async fn run_transfer<CW, CR, F, Fut>(
     file: &Path,
     file_size: u64,
+    entries: Option<&[FileEntry]>,
     ctrl_send: &mut CW,
     mut ctrl_recv: CR,
     rtt: Duration,
@@ -408,6 +472,14 @@ where
     ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    // For directory transfers, check that receiver supports v3.
+    if entries.is_some() && peer_protocol_version < 3 {
+        bail!(
+            "the receiver is running an older version of mftp (protocol version {peer_protocol_version}) \
+             that does not support directory transfers — please upgrade the receiver to v3+"
+        );
+    }
+
     let file_name = file
         .file_name()
         .context("file has no name")?
@@ -441,11 +513,13 @@ where
 
     let chunk_size = params.chunk_size;
 
-    // Derive a deterministic transfer_id so that re-sending the same file
-    // (same name, size, and chunk_size) resumes an interrupted transfer.
-    // Including chunk_size ensures stale resume state from a prior negotiation
-    // with different parameters is never reused (different chunk boundaries).
-    let transfer_id: [u8; 16] = {
+    // Derive a deterministic transfer_id so that re-sending the same source
+    // (same name, size, chunk_size, and tree shape for directories) resumes
+    // an interrupted transfer.  Including chunk_size ensures stale resume state
+    // from a prior negotiation with different parameters is never reused.
+    let transfer_id: [u8; 16] = if let Some(ents) = entries {
+        directory_transfer_id(&file_name, file_size, chunk_size, ents)
+    } else {
         let mut h = blake3::Hasher::new();
         h.update(file_name.as_bytes());
         h.update(&file_size.to_le_bytes());
@@ -468,6 +542,15 @@ where
         fec: None,
     };
     framing::send_message(ctrl_send, &manifest).await?;
+
+    // v3+: send DirEntries immediately after the manifest.
+    // The receiver reads this before replying with Ready, so ordering is strict.
+    if peer_protocol_version >= 3 {
+        let dir_entries_msg = DirEntries {
+            entries: entries.map(|e| e.to_vec()),
+        };
+        framing::send_message(ctrl_send, &dir_entries_msg).await?;
+    }
 
     // Receive Ready — receiver sends a packed bitvector of already-on-disk chunks.
     // Uses the data-frame limit (128 MiB) because the bitvector can be large for
@@ -497,6 +580,12 @@ where
     };
     let hash_task = if have.is_empty() {
         None
+    } else if let Some(ents) = entries {
+        let path = file.to_owned();
+        let ents_owned = ents.to_vec();
+        Some(tokio::task::spawn_blocking(move || {
+            crate::transfer::hash::hash_concat_sync(&ents_owned, &path, chunk_size)
+        }))
     } else {
         let path = file.to_owned();
         Some(tokio::task::spawn_blocking(move || {
@@ -505,7 +594,12 @@ where
     };
 
     let chunk_mib = chunk_size / (1024 * 1024);
-    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib);
+    let file_count = entries.map(|e| {
+        e.iter()
+            .filter(|en| matches!(en.kind, FileKind::File))
+            .count()
+    });
+    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib, file_count);
     // Seed the bar with bytes the receiver already confirmed (resume).
     let resume_bytes: u64 = have
         .iter()
@@ -552,6 +646,7 @@ where
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
     let scale_tx_for_reader = scale_tx.clone();
     let file_name_for_reader = file_name.clone();
+    let file_count_for_reader = file_count;
     let reader = tokio::spawn(async move {
         let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
@@ -674,9 +769,14 @@ where
                 Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
                     tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
                     pending_scale = false;
-                    pb_for_reader.set_prefix(format!(
-                        "{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB"
-                    ));
+                    let new_prefix = if let Some(n) = file_count_for_reader {
+                        format!("{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB · {n} files")
+                    } else {
+                        format!(
+                            "{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB"
+                        )
+                    };
+                    pb_for_reader.set_prefix(new_prefix);
                     pb_for_reader.set_message("");
                     flash_until = None;
                     let _ = scale_tx_for_reader
@@ -731,38 +831,48 @@ where
     // Without --parallel-reads, a single sequential reader is used, which is
     // optimal for spinning disks, network mounts, and all network-bound transfers.
     let total_chunks = file_size.div_ceil(chunk_size as u64);
-    let feeders: Vec<tokio::task::JoinHandle<Result<()>>> =
-        if config.parallel_reads && actual_streams > 1 {
-            let p = actual_streams.min(8); // cap at 8 parallel readers
-            let chunks_per_reader = total_chunks.div_ceil(p as u64);
-            let mut handles = Vec::with_capacity(p);
-            for reader_id in 0..p {
-                let path = file.to_owned();
-                let skip = have.clone();
-                let tx = work_tx.clone();
-                let range_start = reader_id as u64 * chunks_per_reader;
-                let range_end = (range_start + chunks_per_reader).min(total_chunks);
-                handles.push(tokio::task::spawn_blocking(move || {
-                    feed_chunks_range(
-                        &path,
-                        file_size,
-                        chunk_size,
-                        &skip,
-                        tx,
-                        range_start,
-                        range_end,
-                    )
-                }));
-            }
-            drop(work_tx); // close the sender side; channel empties when readers finish
-            handles
-        } else {
+    let feeders: Vec<tokio::task::JoinHandle<Result<()>>> = if let Some(ents) = entries {
+        // Directory path: always use a single sequential feeder over the concat
+        // stream.  The pre-reading optimisation in feed_chunks_concat already
+        // handles NVMe efficiently; parallel-reads is not useful for the
+        // scatter-gather read pattern needed here.
+        let root = file.to_owned();
+        let ents_owned = ents.to_vec();
+        let skip = have.clone();
+        vec![tokio::task::spawn_blocking(move || {
+            feed_chunks_concat(&root, &ents_owned, file_size, chunk_size, &skip, work_tx)
+        })]
+    } else if config.parallel_reads && actual_streams > 1 {
+        let p = actual_streams.min(8); // cap at 8 parallel readers
+        let chunks_per_reader = total_chunks.div_ceil(p as u64);
+        let mut handles = Vec::with_capacity(p);
+        for reader_id in 0..p {
             let path = file.to_owned();
             let skip = have.clone();
-            vec![tokio::task::spawn_blocking(move || {
-                feed_chunks(&path, file_size, chunk_size, &skip, work_tx)
-            })]
-        };
+            let tx = work_tx.clone();
+            let range_start = reader_id as u64 * chunks_per_reader;
+            let range_end = (range_start + chunks_per_reader).min(total_chunks);
+            handles.push(tokio::task::spawn_blocking(move || {
+                feed_chunks_range(
+                    &path,
+                    file_size,
+                    chunk_size,
+                    &skip,
+                    tx,
+                    range_start,
+                    range_end,
+                )
+            }));
+        }
+        drop(work_tx); // close the sender side; channel empties when readers finish
+        handles
+    } else {
+        let path = file.to_owned();
+        let skip = have.clone();
+        vec![tokio::task::spawn_blocking(move || {
+            feed_chunks(&path, file_size, chunk_size, &skip, work_tx)
+        })]
+    };
 
     // Spawn N stream workers.  Each worker gets a clone of the shared receiver
     // (MPMC — all clones drain the same queue) and an Arc of the file hasher.
@@ -1128,6 +1238,7 @@ fn make_progress_bar(
     file_size: u64,
     streams: usize,
     chunk_mib: usize,
+    file_count: Option<usize>,
 ) -> Arc<ProgressBar> {
     let term_width = console::Term::stdout().size().1 as usize;
     let template = if term_width >= 140 {
@@ -1141,7 +1252,12 @@ fn make_progress_bar(
         let pb = ProgressBar::new(file_size);
         pb.set_style(ProgressStyle::with_template(template).unwrap());
         pb.enable_steady_tick(Duration::from_millis(100));
-        pb.set_prefix(format!("{file_name} · {streams} streams · {chunk_mib} MiB"));
+        let prefix = if let Some(n) = file_count {
+            format!("{file_name} · {streams} streams · {chunk_mib} MiB · {n} files")
+        } else {
+            format!("{file_name} · {streams} streams · {chunk_mib} MiB")
+        };
+        pb.set_prefix(prefix);
         pb
     })
 }
@@ -1265,6 +1381,261 @@ fn feed_chunks_range(
             break;
         }
     }
+    Ok(())
+}
+
+// ── Recursive directory support ───────────────────────────────────────────────
+
+/// Threshold below which a file's contents are pre-read into memory during
+/// directory scan.  Pre-reading small files avoids `open()`/`close()` overhead
+/// for every chunk that spans many tiny files.
+const PREREAD_THRESHOLD: u64 = 256 * 1024; // 256 KiB
+
+/// Walk `root` and return a sorted list of `FileEntry` items representing the
+/// complete directory tree.  Symlinks are preserved (not followed).
+/// Files ≥ 1 entry and ≤ PREREAD_THRESHOLD are flagged for pre-reading by the
+/// caller.
+pub(crate) fn scan_directory(root: &Path, preserve: bool) -> Result<Vec<FileEntry>> {
+    use std::os::unix::fs::MetadataExt;
+    use walkdir::WalkDir;
+
+    let mut entries: Vec<FileEntry> = Vec::new();
+
+    for dent in WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+    {
+        let dent = dent.with_context(|| format!("walk {}", root.display()))?;
+        let rel = dent
+            .path()
+            .strip_prefix(root)
+            .context("walkdir path prefix strip")?;
+
+        if rel.as_os_str().is_empty() {
+            // skip the root itself
+            continue;
+        }
+
+        // Build relative path with forward slashes (relative to the transfer root,
+        // no root-name prefix — the receiver joins output_dir/file_name/path).
+        let path = rel.to_string_lossy().replace('\\', "/");
+
+        let ft = dent.file_type();
+        let meta = dent
+            .metadata()
+            .with_context(|| format!("stat {}", dent.path().display()))?;
+
+        let (mode, mtime) = if preserve {
+            #[cfg(unix)]
+            let m = (meta.mode(), meta.mtime());
+            #[cfg(not(unix))]
+            let m = (0u32, 0i64);
+            m
+        } else {
+            (0u32, 0i64)
+        };
+
+        if ft.is_symlink() {
+            let target = std::fs::read_link(dent.path())
+                .with_context(|| format!("readlink {}", dent.path().display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            entries.push(FileEntry {
+                path,
+                size: 0,
+                kind: FileKind::Symlink { target },
+                mode,
+                mtime,
+            });
+        } else if ft.is_dir() {
+            entries.push(FileEntry {
+                path,
+                size: 0,
+                kind: FileKind::Directory,
+                mode,
+                mtime,
+            });
+        } else if ft.is_file() {
+            entries.push(FileEntry {
+                path,
+                size: meta.len(),
+                kind: FileKind::File,
+                mode,
+                mtime,
+            });
+        }
+        // other file types (devices, sockets, …) are silently skipped
+    }
+
+    // Stable sort: walkdir already sorts within each directory level, but a
+    // re-sort at the top level ensures fully deterministic ordering across
+    // platforms regardless of walkdir version behaviour.
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(entries)
+}
+
+/// Compute the total bytes contributed by `FileKind::File` entries.
+pub(crate) fn total_file_bytes(entries: &[FileEntry]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| matches!(e.kind, FileKind::File))
+        .map(|e| e.size)
+        .sum()
+}
+
+/// Derive a deterministic `transfer_id` for a directory transfer.
+///
+/// Hashes the root name, total bytes, chunk_size, and the full path+size list
+/// of all `FileKind::File` entries so that resume keys off the exact tree shape.
+fn directory_transfer_id(
+    root_name: &str,
+    total_bytes: u64,
+    chunk_size: usize,
+    entries: &[FileEntry],
+) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(root_name.as_bytes());
+    h.update(&total_bytes.to_le_bytes());
+    h.update(&(chunk_size as u64).to_le_bytes());
+    for e in entries {
+        if matches!(e.kind, FileKind::File) {
+            h.update(e.path.as_bytes());
+            h.update(&e.size.to_le_bytes());
+        }
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
+/// Read file entries into the per-chunk feeder channel, treating all File
+/// entries as a single virtual concatenated byte stream.
+///
+/// Small files (≤ PREREAD_THRESHOLD) are pre-read into memory up front so the
+/// inner loop only does memory copies for them, avoiding repeated `open()`
+/// overhead when a single chunk spans many tiny files.
+///
+/// Designed to run in `tokio::task::spawn_blocking`.
+fn feed_chunks_concat(
+    root: &Path,
+    entries: &[FileEntry],
+    total_bytes: u64,
+    chunk_size: usize,
+    skip: &HashSet<u64>,
+    tx: ac::Sender<(u64, Vec<u8>)>,
+) -> Result<()> {
+    // Collect only File entries that have size > 0.
+    let file_entries: Vec<&FileEntry> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, FileKind::File) && e.size > 0)
+        .collect();
+
+    // Pre-read small files into memory.
+    let preread: Vec<Option<Vec<u8>>> = file_entries
+        .iter()
+        .map(|e| {
+            if e.size <= PREREAD_THRESHOLD {
+                let path = root.join(&e.path);
+                std::fs::read(&path)
+                    .with_context(|| format!("pre-read {}", path.display()))
+                    .ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Build prefix sums over file sizes.
+    let mut prefix_sums: Vec<u64> = Vec::with_capacity(file_entries.len() + 1);
+    let mut acc = 0u64;
+    for e in &file_entries {
+        prefix_sums.push(acc);
+        acc += e.size;
+    }
+    prefix_sums.push(acc); // sentinel = total_bytes
+
+    let total_chunks = total_bytes.div_ceil(chunk_size as u64);
+
+    // Keep one open large-file handle to avoid repeated open/close when
+    // many consecutive chunks land in the same large file.
+    let mut cur_large: Option<(usize, std::fs::File)> = None;
+
+    for idx in 0..total_chunks {
+        if skip.contains(&idx) {
+            continue;
+        }
+
+        let global_start = idx * chunk_size as u64;
+        let global_end = (global_start + chunk_size as u64).min(total_bytes);
+        let chunk_len = (global_end - global_start) as usize;
+        let mut buf = vec![0u8; chunk_len];
+
+        let mut written = 0usize;
+        // Find the first file index whose range overlaps [global_start, global_end).
+        let mut fi = prefix_sums
+            .partition_point(|&ps| ps <= global_start)
+            .saturating_sub(1);
+        let mut pos = global_start;
+
+        while written < chunk_len && fi < file_entries.len() {
+            let file_start = prefix_sums[fi];
+            let file_end = prefix_sums[fi + 1];
+            let offset_in_file = pos - file_start;
+            let remaining_in_file = (file_end - pos) as usize;
+            let take = remaining_in_file.min(chunk_len - written);
+
+            if let Some(ref data) = preread[fi] {
+                // Small file: copy from pre-read buffer.
+                let src_start = offset_in_file as usize;
+                buf[written..written + take].copy_from_slice(&data[src_start..src_start + take]);
+            } else {
+                // Large file: use cached handle or open new one.
+                let file = match &cur_large {
+                    Some((open_fi, _)) if *open_fi == fi => {
+                        cur_large.as_ref().map(|(_, f)| f).unwrap()
+                    }
+                    _ => {
+                        let path = root.join(&file_entries[fi].path);
+                        let f = std::fs::File::open(&path)
+                            .with_context(|| format!("open {}", path.display()))?;
+
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            unsafe {
+                                libc::posix_fadvise(
+                                    f.as_raw_fd(),
+                                    0,
+                                    0,
+                                    libc::POSIX_FADV_SEQUENTIAL,
+                                );
+                            }
+                        }
+
+                        cur_large = Some((fi, f));
+                        cur_large.as_ref().map(|(_, f)| f).unwrap()
+                    }
+                };
+                crate::fs_ext::read_exact_at(
+                    file,
+                    &mut buf[written..written + take],
+                    offset_in_file,
+                )
+                .with_context(|| format!("read file[{fi}] at {offset_in_file}"))?;
+            }
+
+            written += take;
+            pos += take as u64;
+            fi += 1;
+        }
+
+        if tx.send_blocking((idx, buf)).is_err() {
+            break; // workers closed — abort cleanly
+        }
+    }
+
     Ok(())
 }
 
@@ -1525,6 +1896,7 @@ fn stripe_encode_chunks(
 async fn run_transfer_fec<CW, CR, F, Fut>(
     file: &Path,
     file_size: u64,
+    peer_protocol_version: u32,
     ctrl_send: &mut CW,
     mut ctrl_recv: CR,
     rtt: Duration,
@@ -1597,6 +1969,11 @@ where
     };
     framing::send_message(ctrl_send, &manifest).await?;
 
+    // v3+: always send DirEntries (entries: None for single-file FEC transfers).
+    if peer_protocol_version >= 3 {
+        framing::send_message(ctrl_send, &DirEntries { entries: None }).await?;
+    }
+
     // Receive Ready — check which stripes the receiver already has complete.
     let ready: ReceiverMessage = framing::recv_data_message(&mut ctrl_recv)
         .await?
@@ -1639,7 +2016,7 @@ where
     };
 
     let chunk_mib = chunk_size / (1024 * 1024);
-    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib);
+    let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib, None);
     let transfer_start = Instant::now();
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();

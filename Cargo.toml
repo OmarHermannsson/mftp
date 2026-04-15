@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.71"
+version = "0.1.72"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -79,6 +79,7 @@ async-channel = "2"
 bytes = "1"
 futures = "0.3"
 libc = "0.2"
+walkdir = "2"
 
 openssl = { version = "0.10.77", features = ["vendored"] }
 

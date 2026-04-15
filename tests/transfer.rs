@@ -62,6 +62,8 @@ async fn roundtrip(
             fec: None,
             adaptive_streams: false,
             parallel_reads: false,
+            recursive: false,
+            preserve: false,
         },
     )
     .await?;
@@ -156,6 +158,8 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             fec: None,
             adaptive_streams: false,
             parallel_reads: false,
+            recursive: false,
+            preserve: false,
         },
     )
     .await?;
@@ -222,6 +226,8 @@ async fn roundtrip_tcp(
             fec: None,
             adaptive_streams: false,
             parallel_reads: false,
+            recursive: false,
+            preserve: false,
         },
     )
     .await;
@@ -358,6 +364,8 @@ async fn roundtrip_fec(
             }),
             adaptive_streams: false,
             parallel_reads: false,
+            recursive: false,
+            preserve: false,
         },
     )
     .await?;
@@ -456,6 +464,8 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
             }),
             adaptive_streams: false,
             parallel_reads: false,
+            recursive: false,
+            preserve: false,
         },
     )
     .await;
@@ -474,4 +484,274 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
     let original = std::fs::read(&src)?;
     assert_eq!(received, original, "TCP+FEC-disabled: file mismatch");
     Ok(())
+}
+
+// ── Directory transfer tests ──────────────────────────────────────────────────
+
+/// Core helper for directory round-trips: sends `src_dir` with `-r` and verifies
+/// that the received tree matches the source byte-for-byte.
+async fn roundtrip_dir(
+    src_dir: std::path::PathBuf,
+    recv_dir: &TempDir,
+    streams: usize,
+    chunk_size: usize,
+    compress: bool,
+    preserve: bool,
+) -> anyhow::Result<()> {
+    let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+    let addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    sender::send(
+        src_dir.clone(),
+        addr,
+        SendConfig {
+            streams: Some(streams),
+            chunk_size: Some(chunk_size),
+            compress,
+            compress_level: 3,
+            trusted_fingerprint: Some(fingerprint),
+            forced_transport: None,
+            tcp_rtt_threshold: std::time::Duration::ZERO,
+            fec: None,
+            adaptive_streams: false,
+            parallel_reads: false,
+            recursive: true,
+            preserve,
+        },
+    )
+    .await?;
+    recv_task.await??;
+    Ok(())
+}
+
+/// Walk `dir` and collect all files as (relative_path, content) pairs.
+fn collect_files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
+        let entry = entry.expect("walkdir entry");
+        if entry.file_type().is_file() {
+            let rel = entry
+                .path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let data = std::fs::read(entry.path()).expect("read file");
+            out.insert(rel, data);
+        }
+    }
+    out
+}
+
+/// Three regular files in a flat directory.
+#[tokio::test]
+async fn test_directory_basic() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("mytree");
+    std::fs::create_dir_all(&src)?;
+    std::fs::write(src.join("a.txt"), b"hello")?;
+    std::fs::write(src.join("b.txt"), b"world")?;
+    std::fs::write(src.join("c.bin"), vec![0u8; 1024])?;
+
+    roundtrip_dir(src.clone(), &recv_dir, 2, 256 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("mytree");
+    assert_eq!(std::fs::read(received.join("a.txt"))?, b"hello");
+    assert_eq!(std::fs::read(received.join("b.txt"))?, b"world");
+    assert_eq!(std::fs::read(received.join("c.bin"))?, vec![0u8; 1024]);
+    Ok(())
+}
+
+/// Nested directories are recreated on the receiver.
+#[tokio::test]
+async fn test_directory_nested() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("nested");
+    std::fs::create_dir_all(src.join("a/b"))?;
+    std::fs::write(src.join("root.txt"), b"root")?;
+    std::fs::write(src.join("a/mid.txt"), b"mid")?;
+    std::fs::write(src.join("a/b/deep.txt"), b"deep")?;
+
+    roundtrip_dir(src.clone(), &recv_dir, 2, 256 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("nested");
+    assert_eq!(std::fs::read(received.join("root.txt"))?, b"root");
+    assert_eq!(std::fs::read(received.join("a/mid.txt"))?, b"mid");
+    assert_eq!(std::fs::read(received.join("a/b/deep.txt"))?, b"deep");
+    Ok(())
+}
+
+/// Zero-byte files are created on the receiver even though they produce no chunks.
+#[tokio::test]
+async fn test_directory_empty_files() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("empties");
+    std::fs::create_dir_all(&src)?;
+    std::fs::write(src.join("empty1.bin"), b"")?;
+    std::fs::write(src.join("empty2.bin"), b"")?;
+    // One non-empty file to ensure there are some chunks.
+    std::fs::write(src.join("data.bin"), vec![42u8; 1024])?;
+
+    roundtrip_dir(src.clone(), &recv_dir, 1, 256 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("empties");
+    assert_eq!(std::fs::read(received.join("empty1.bin"))?, b"");
+    assert_eq!(std::fs::read(received.join("empty2.bin"))?, b"");
+    assert_eq!(std::fs::read(received.join("data.bin"))?, vec![42u8; 1024]);
+    Ok(())
+}
+
+/// Empty subdirectories are materialised on the receiver.
+#[tokio::test]
+async fn test_directory_empty_dirs() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("emptydirs");
+    std::fs::create_dir_all(src.join("sub/leaf"))?;
+    // At least one file so there's something to transfer.
+    std::fs::write(src.join("data.bin"), b"x")?;
+
+    roundtrip_dir(src.clone(), &recv_dir, 1, 256 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("emptydirs");
+    assert!(received.join("sub/leaf").is_dir());
+    assert_eq!(std::fs::read(received.join("data.bin"))?, b"x");
+    Ok(())
+}
+
+/// Many small files packed into fewer chunks — verifies scatter-pwrite correctness.
+#[tokio::test]
+async fn test_directory_many_small() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("manysmall");
+    std::fs::create_dir_all(&src)?;
+    let file_count = 500usize;
+    for i in 0..file_count {
+        let data: Vec<u8> = (0..100).map(|b| (i as u8).wrapping_add(b)).collect();
+        std::fs::write(src.join(format!("f{i:04}.bin")), &data)?;
+    }
+
+    roundtrip_dir(src.clone(), &recv_dir, 4, 64 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("manysmall");
+    for i in 0..file_count {
+        let expected: Vec<u8> = (0..100).map(|b| (i as u8).wrapping_add(b)).collect();
+        let got = std::fs::read(received.join(format!("f{i:04}.bin")))?;
+        assert_eq!(got, expected, "mismatch for file f{i:04}.bin");
+    }
+    Ok(())
+}
+
+/// One large file plus many small files — mixed sizes in the concat stream.
+#[tokio::test]
+async fn test_directory_mixed_sizes() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("mixed");
+    std::fs::create_dir_all(src.join("smalls"))?;
+    // 4 MiB big file
+    let big_data = make_test_file(send_dir.path(), "big.bin", 4 * 1024 * 1024);
+    std::fs::rename(&big_data, src.join("big.bin"))?;
+    // 50 small files × 1 KiB
+    for i in 0..50usize {
+        std::fs::write(
+            src.join("smalls").join(format!("s{i:03}.bin")),
+            vec![i as u8; 1024],
+        )?;
+    }
+
+    roundtrip_dir(src.clone(), &recv_dir, 4, 512 * 1024, true, false).await?;
+
+    let orig_files = collect_files(&src);
+    let recv_files = collect_files(&recv_dir.path().join("mixed"));
+    assert_eq!(orig_files, recv_files, "file set or content mismatch");
+    Ok(())
+}
+
+/// Relative symlink inside the tree survives the round-trip.
+#[tokio::test]
+#[cfg(unix)]
+async fn test_directory_symlink_preserved() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("symtree");
+    std::fs::create_dir_all(src.join("a"))?;
+    std::fs::write(src.join("real.txt"), b"real content")?;
+    // Symlink inside a subdir pointing to the parent file.
+    std::os::unix::fs::symlink("../real.txt", src.join("a/link.txt"))?;
+
+    roundtrip_dir(src.clone(), &recv_dir, 1, 256 * 1024, false, false).await?;
+
+    let received = recv_dir.path().join("symtree");
+    // The symlink itself must exist.
+    assert!(
+        received
+            .join("a/link.txt")
+            .symlink_metadata()?
+            .file_type()
+            .is_symlink(),
+        "expected a symlink"
+    );
+    // The target string must be preserved.
+    let target = std::fs::read_link(received.join("a/link.txt"))?;
+    assert_eq!(target.to_string_lossy(), "../real.txt");
+    Ok(())
+}
+
+/// Sending a directory without -r must fail with a clear error.
+#[tokio::test]
+async fn test_require_recursive_flag() {
+    let send_dir = TempDir::new().unwrap();
+    let src = send_dir.path().join("mydir");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // Use a dummy address — the error should happen before any connection attempt.
+    let result = sender::send(
+        src,
+        "127.0.0.1:1".parse().unwrap(),
+        SendConfig {
+            streams: Some(1),
+            chunk_size: Some(256 * 1024),
+            compress: false,
+            compress_level: 3,
+            trusted_fingerprint: None,
+            forced_transport: None,
+            tcp_rtt_threshold: std::time::Duration::ZERO,
+            fec: None,
+            adaptive_streams: false,
+            parallel_reads: false,
+            recursive: false, // <-- not set
+            preserve: false,
+        },
+    )
+    .await;
+    let err = result.expect_err("should have failed without -r");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("-r") || msg.contains("recursive") || msg.contains("directory"),
+        "unexpected error message: {msg}"
+    );
+}
+
+/// Single-file transfer via a v3 sender produces entries: None in the manifest.
+#[tokio::test]
+async fn test_single_file_v3_no_entries() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "solo.bin", 512 * 1024);
+    // Use the standard roundtrip — the test just ensures no regression.
+    roundtrip(src, &recv_dir, 2, 256 * 1024, false).await
 }

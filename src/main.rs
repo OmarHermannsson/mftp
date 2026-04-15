@@ -101,9 +101,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a file to a remote host
+    /// Send a file or directory to a remote host
     Send {
-        /// File to send
+        /// File or directory to send
         file: std::path::PathBuf,
         /// Where to send the file.
         ///
@@ -144,6 +144,21 @@ enum Command {
         /// Mutually exclusive with --download.
         #[arg(long, conflicts_with = "download")]
         no_download: bool,
+        /// Transfer directories recursively.
+        ///
+        /// Required when the source is a directory; silently accepted (no-op) when
+        /// the source is a regular file.  The receiver recreates the directory tree
+        /// under its --output-dir using the source directory's basename.
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// Preserve source file permissions and modification time on the receiver.
+        ///
+        /// By default the receiver writes files with default umask permissions and
+        /// the current time as mtime.  With --preserve, the source mode bits and
+        /// mtime are applied in a final pass after all data is written.
+        /// Has no effect when the receiver runs on Windows.
+        #[arg(long)]
+        preserve: bool,
     },
     /// Receive files (run as server)
     Receive {
@@ -189,6 +204,8 @@ async fn main() -> Result<()> {
             port,
             download,
             no_download,
+            recursive,
+            preserve,
         } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
             let forced_transport = match (cli.transport, cli.tcp) {
@@ -218,6 +235,13 @@ async fn main() -> Result<()> {
                     }
                 }
             });
+            // Validate -r / directory combination early to give a clear error.
+            if file.is_dir() && !recursive {
+                anyhow::bail!(
+                    "{} is a directory — pass -r to transfer it recursively",
+                    file.display()
+                );
+            }
             let config = sender::SendConfig {
                 streams: cli.streams,
                 chunk_size: cli.chunk_size,
@@ -229,6 +253,8 @@ async fn main() -> Result<()> {
                 fec,
                 adaptive_streams: cli.adaptive_streams,
                 parallel_reads: cli.parallel_reads,
+                recursive,
+                preserve,
             };
             let download_policy = match (download, no_download) {
                 (true, _) => mftp::ssh::DownloadPolicy::Always,

@@ -26,8 +26,8 @@ use crate::net::tcp::{make_tls_acceptor, ServerTlsStream};
 use crate::protocol::{
     framing,
     messages::{
-        ChunkData, FecChunkData, NegotiateRequest, NegotiateResponse, ReceiverMessage,
-        SenderMessage, TransferManifest, PROTOCOL_VERSION,
+        ChunkData, DirEntries, FecChunkData, FileEntry, FileKind, NegotiateRequest,
+        NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest, PROTOCOL_VERSION,
     },
 };
 use crate::transfer::hash::ChunkHasher;
@@ -703,17 +703,40 @@ where
         receiver_cores, "negotiation complete"
     );
 
-    let manifest: TransferManifest = framing::recv_message_required(&mut ctrl_recv).await?;
+    // Use the data-frame limit (128 MiB) for the manifest so that large
+    // directories (many entries serialized) don't hit the 1 MiB control cap.
+    let manifest: TransferManifest = framing::recv_data_message(&mut ctrl_recv)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("stream closed before TransferManifest"))?;
     validate_manifest(&manifest)?;
+
+    // Protocol version 3+: read DirEntries immediately after the manifest.
+    // v2 senders don't send this message; skip the read for them.
+    let dir_entries: Option<Vec<FileEntry>> = if neg_req.protocol_version >= 3 {
+        let de: DirEntries = framing::recv_data_message(&mut ctrl_recv)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stream closed before DirEntries"))?;
+        validate_dir_entries(&manifest, &de)?;
+        de.entries
+    } else {
+        None
+    };
+
+    let entry_count = dir_entries.as_deref().map(|e| {
+        e.iter()
+            .filter(|en| matches!(en.kind, FileKind::File))
+            .count()
+    });
     info!(
         file = %manifest.file_name,
         size = manifest.file_size,
         chunks = manifest.total_chunks,
         streams = manifest.num_streams,
+        files = ?entry_count,
         "transfer started"
     );
 
-    let pt = match prepare_transfer(&manifest, &output_dir) {
+    let pt = match prepare_transfer(&manifest, dir_entries.as_deref(), &output_dir) {
         Ok(pt) => pt,
         Err(e) => {
             // Send the error to the sender before closing so the sender shows
@@ -798,6 +821,7 @@ where
     while let Some(accept_res) = accept_tasks.join_next().await {
         let stream = accept_res.context("accept task panicked")??;
         let out_file = pt.out_file.clone();
+        let layout = pt.layout.clone();
         let resume = pt.resume.clone();
         let manifest_c = manifest.clone();
         let pb = pt.pb.clone();
@@ -806,11 +830,13 @@ where
         let st = Arc::clone(&stats);
         let wsem = Arc::clone(&write_sem);
         if let Some(ref bufs_arc) = fec_stripe_bufs {
+            // FEC path: always single-file (directory+FEC rejected at sender).
+            let fec_file = out_file.expect("FEC requires single-file output");
             let stripe_bufs = Arc::clone(bufs_arc);
             tasks.spawn(async move {
                 recv_fec_stream_worker(
                     stream,
-                    out_file,
+                    fec_file,
                     resume,
                     manifest_c,
                     pb,
@@ -825,7 +851,7 @@ where
         } else {
             tasks.spawn(async move {
                 recv_stream_worker(
-                    stream, out_file, resume, manifest_c, pb, hasher, ptx, st, wsem,
+                    stream, out_file, layout, resume, manifest_c, pb, hasher, ptx, st, wsem,
                 )
                 .await
             });
@@ -882,6 +908,7 @@ where
                         match tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut).await {
                             Ok(Ok(stream)) => {
                                 let out_file = pt.out_file.clone();
+                                let layout = pt.layout.clone();
                                 let resume = pt.resume.clone();
                                 let manifest_c = manifest.clone();
                                 let pb = pt.pb.clone();
@@ -891,8 +918,8 @@ where
                                 let wsem = Arc::clone(&write_sem);
                                 tasks.spawn(async move {
                                     recv_stream_worker(
-                                        stream, out_file, resume, manifest_c, pb, hasher, ptx, st,
-                                        wsem,
+                                        stream, out_file, layout, resume, manifest_c, pb, hasher,
+                                        ptx, st, wsem,
                                     )
                                     .await
                                 });
@@ -964,6 +991,7 @@ where
         &mut ctrl_send,
         pt.resume,
         pt.hasher,
+        pt.layout,
         &output_dir,
         &manifest,
         expected_hash,
@@ -973,16 +1001,113 @@ where
     Ok(ctrl_send)
 }
 
+// ── Directory layout helper ───────────────────────────────────────────────────
+
+/// Maps chunks of the virtual concatenated byte stream back to individual files.
+///
+/// Only `FileKind::File` entries with `size > 0` appear here; directories and
+/// symlinks are materialised during `prepare_transfer` and have no chunks.
+#[derive(Debug)]
+pub(crate) struct ConcatLayout {
+    /// File entries in concat-stream order (same order as sent in `DirEntries`).
+    file_entries: Vec<FileEntry>,
+    /// `prefix_sums[i]` = global byte offset where `file_entries[i]` starts.
+    /// `prefix_sums[n]` = total_bytes (sentinel).
+    prefix_sums: Vec<u64>,
+    /// Base directory for resolving relative paths.
+    base_dir: PathBuf,
+}
+
+impl ConcatLayout {
+    fn new(entries: &[FileEntry], base_dir: PathBuf) -> Self {
+        let file_entries: Vec<FileEntry> = entries
+            .iter()
+            .filter(|e| matches!(e.kind, FileKind::File) && e.size > 0)
+            .cloned()
+            .collect();
+
+        let mut prefix_sums = Vec::with_capacity(file_entries.len() + 1);
+        let mut acc = 0u64;
+        for e in &file_entries {
+            prefix_sums.push(acc);
+            acc += e.size;
+        }
+        prefix_sums.push(acc); // sentinel
+
+        Self {
+            file_entries,
+            prefix_sums,
+            base_dir,
+        }
+    }
+
+    /// Write `data` for `chunk_index` into the correct file(s).
+    ///
+    /// A chunk may span multiple files when many small files are packed into
+    /// one chunk.  Each portion is pwrite-d to its respective file.
+    fn scatter_write(&self, chunk_index: u64, chunk_size: usize, data: &[u8]) -> Result<()> {
+        let global_start = chunk_index * chunk_size as u64;
+
+        // Find first file whose range overlaps this chunk.
+        let mut fi = self
+            .prefix_sums
+            .partition_point(|&ps| ps <= global_start)
+            .saturating_sub(1);
+        let mut written = 0usize;
+
+        while written < data.len() && fi < self.file_entries.len() {
+            let file_start = self.prefix_sums[fi];
+            let file_end = self.prefix_sums[fi + 1];
+            let pos_in_stream = global_start + written as u64;
+            let offset_in_file = pos_in_stream - file_start;
+            let available_in_file = (file_end - pos_in_stream) as usize;
+            let take = available_in_file.min(data.len() - written);
+
+            let path = self.base_dir.join(&self.file_entries[fi].path);
+
+            #[cfg(unix)]
+            let file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .with_context(|| format!("open {}", path.display()))?
+            };
+            #[cfg(not(unix))]
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("open {}", path.display()))?;
+
+            crate::fs_ext::write_all_at_advise(
+                &file,
+                &data[written..written + take],
+                offset_in_file,
+            )
+            .with_context(|| format!("pwrite {} at offset {offset_in_file}", path.display()))?;
+
+            written += take;
+            fi += 1;
+        }
+
+        Ok(())
+    }
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Prepared state for a transfer: open output file, resume state, progress bar,
+/// Prepared state for a transfer: output target, resume state, progress bar,
 /// and the resume bitvector to include in the Ready message.
 struct PreparedTransfer {
-    out_file: Arc<std::fs::File>,
+    /// Single-file transfers: the pre-allocated output file handle.
+    out_file: Option<Arc<std::fs::File>>,
+    /// Directory transfers: the concat layout for scatter-pwrite.
+    layout: Option<Arc<ConcatLayout>>,
     resume: Arc<Mutex<ResumeState>>,
     pb: Arc<ProgressBar>,
     /// `Some` on a fresh transfer (hashes collected inline); `None` on resume
-    /// (the full file is re-hashed from disk in `finish_transfer` instead).
+    /// (the full stream is re-hashed from disk in `finish_transfer` instead).
     hasher: Option<Arc<ChunkHasher>>,
     bytes_already_received: u64,
     /// Packed bitvector of already-received chunks; sent in ReceiverMessage::Ready.
@@ -991,6 +1116,7 @@ struct PreparedTransfer {
 
 fn prepare_transfer(
     manifest: &TransferManifest,
+    dir_entries: Option<&[FileEntry]>,
     output_dir: &std::path::Path,
 ) -> Result<PreparedTransfer> {
     let resume = Arc::new(Mutex::new(ResumeState::load_or_new(
@@ -1012,36 +1138,23 @@ fn prepare_transfer(
         (bits, bytes)
     };
 
-    let out_path = output_dir.join(&manifest.file_name);
-    let out_file = Arc::new({
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false) // sized explicitly via fallocate/set_len below
-            .open(&out_path)
-            .with_context(|| format!("open output {}", out_path.display()))?;
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            let size =
-                i64::try_from(manifest.file_size).context("file too large for this platform")?;
-            let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size) };
-            if rc != 0 {
-                f.set_len(manifest.file_size)?;
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        f.set_len(manifest.file_size)?;
-        // On macOS, disable the page cache for this fd so writes bypass the
-        // unified buffer cache entirely.  This prevents dirty-page accumulation
-        // without needing per-write posix_fadvise (which macOS lacks).
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::io::AsRawFd;
-            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
-        }
-        f
-    });
+    // ── Output target: single file vs directory ───────────────────────────────
+
+    let (out_file, layout) = if let Some(entries) = dir_entries {
+        // Directory mode: create the directory tree, allocate all files, and
+        // materialise symlinks before data arrives.
+        let base_dir = output_dir.join(&manifest.file_name);
+        prepare_directory(entries, &base_dir)?;
+        let layout = Arc::new(ConcatLayout::new(entries, base_dir));
+        (None, Some(layout))
+    } else {
+        // Single-file mode: open and pre-allocate the output file.
+        let out_path = output_dir.join(&manifest.file_name);
+        let f = open_and_preallocate(&out_path, manifest.file_size)?;
+        (Some(Arc::new(f)), None)
+    };
+
+    // ── Progress bar ─────────────────────────────────────────────────────────
 
     let pb = Arc::new({
         let term_width = console::Term::stdout().size().1 as usize;
@@ -1056,16 +1169,29 @@ fn prepare_transfer(
         pb.set_style(ProgressStyle::with_template(template).unwrap());
         pb.enable_steady_tick(Duration::from_millis(100));
         let chunk_mib = manifest.chunk_size / (1024 * 1024);
-        pb.set_prefix(format!(
-            "{} · {} streams · {} MiB",
-            manifest.file_name, manifest.num_streams, chunk_mib
-        ));
+        let file_count = dir_entries.map(|e| {
+            e.iter()
+                .filter(|en| matches!(en.kind, FileKind::File))
+                .count()
+        });
+        let prefix = if let Some(n) = file_count {
+            format!(
+                "{} · {} streams · {} MiB · {n} files",
+                manifest.file_name, manifest.num_streams, chunk_mib
+            )
+        } else {
+            format!(
+                "{} · {} streams · {} MiB",
+                manifest.file_name, manifest.num_streams, chunk_mib
+            )
+        };
+        pb.set_prefix(prefix);
         pb
     });
 
     // On a fresh transfer, collect per-chunk hashes inline (no extra disk pass).
     // On resume, some chunks are already on disk and will never be fed to the
-    // hasher, so we skip inline collection and do a full-file hash at the end.
+    // hasher, so we skip inline collection and do a full-stream hash at the end.
     let hasher = if bytes_already_received == 0 {
         Some(Arc::new(ChunkHasher::new(
             manifest.total_chunks,
@@ -1077,12 +1203,112 @@ fn prepare_transfer(
 
     Ok(PreparedTransfer {
         out_file,
+        layout,
         resume,
         pb,
         hasher,
         bytes_already_received,
         received_bits,
     })
+}
+
+/// Open `path` for write, pre-allocate it to `size` bytes, and disable the
+/// page cache on macOS.
+fn open_and_preallocate(path: &std::path::Path, size: u64) -> Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false) // sized explicitly via fallocate/set_len below
+        .open(path)
+        .with_context(|| format!("open output {}", path.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let isize = i64::try_from(size).context("file too large for this platform")?;
+        let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, isize) };
+        if rc != 0 {
+            f.set_len(size)?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    f.set_len(size)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
+    }
+    Ok(f)
+}
+
+/// Create the directory tree, pre-allocate all files, and materialise symlinks
+/// described by `entries` under `base_dir`.
+fn prepare_directory(entries: &[FileEntry], base_dir: &std::path::Path) -> Result<()> {
+    // Create the root directory.
+    std::fs::create_dir_all(base_dir).with_context(|| format!("create {}", base_dir.display()))?;
+
+    for entry in entries {
+        let dest = base_dir.join(&entry.path);
+        match &entry.kind {
+            FileKind::Directory => {
+                std::fs::create_dir_all(&dest)
+                    .with_context(|| format!("create dir {}", dest.display()))?;
+            }
+            FileKind::Symlink { target } => {
+                // Create parent if needed.
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create parent {}", parent.display()))?;
+                }
+                // Remove existing symlink if present (resume-safe idempotency).
+                let _ = std::fs::remove_file(&dest);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &dest)
+                    .with_context(|| format!("symlink {} → {target}", dest.display()))?;
+                #[cfg(not(unix))]
+                warn!(
+                    "symlinks not supported on this platform; skipping {}",
+                    dest.display()
+                );
+            }
+            FileKind::File => {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create parent {}", parent.display()))?;
+                }
+                // Pre-allocate the file (0-byte files just create the file).
+                open_and_preallocate(&dest, entry.size)
+                    .with_context(|| format!("preallocate {}", dest.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply preserved mode and mtime to a single file.
+#[cfg(unix)]
+fn apply_metadata(path: &std::path::Path, mode: u32, mtime: i64) {
+    use std::os::unix::fs::PermissionsExt;
+    if mode != 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    if mtime != 0 {
+        let t = libc::timespec {
+            tv_sec: mtime,
+            tv_nsec: libc::UTIME_OMIT,
+        };
+        let times = [
+            t,
+            libc::timespec {
+                tv_sec: mtime,
+                tv_nsec: 0,
+            },
+        ];
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap_or_default();
+        if !c_path.as_bytes().is_empty() {
+            unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        }
+    }
 }
 
 /// Receives confirmed-written byte counts from data workers and sends
@@ -1211,6 +1437,7 @@ async fn finish_transfer<S>(
     ctrl_send: &mut S,
     resume: Arc<Mutex<ResumeState>>,
     hasher: Option<Arc<ChunkHasher>>,
+    layout: Option<Arc<ConcatLayout>>,
     output_dir: &std::path::Path,
     manifest: &TransferManifest,
     expected_hash: [u8; 32],
@@ -1224,14 +1451,26 @@ where
             .finish()?,
         None => {
             // Resume path: some chunks were already on disk and never fed to a
-            // ChunkHasher, so hash the complete file from disk instead.
-            let path = output_dir.join(&manifest.file_name);
+            // ChunkHasher, so hash the complete stream from disk instead.
             let chunk_size = manifest.chunk_size;
-            tokio::task::spawn_blocking(move || {
-                crate::transfer::hash::hash_file_sync(&path, chunk_size)
-            })
-            .await
-            .context("hash task panicked")??
+            if let Some(ref cl) = layout {
+                // Directory: hash the concat stream across all files in order.
+                let entries = cl.file_entries.clone();
+                let base_dir = cl.base_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::transfer::hash::hash_concat_sync(&entries, &base_dir, chunk_size)
+                })
+                .await
+                .context("hash task panicked")??
+            } else {
+                // Single file.
+                let path = output_dir.join(&manifest.file_name);
+                tokio::task::spawn_blocking(move || {
+                    crate::transfer::hash::hash_file_sync(&path, chunk_size)
+                })
+                .await
+                .context("hash task panicked")??
+            }
         }
     };
 
@@ -1242,11 +1481,23 @@ where
         framing::send_message(
             ctrl_send,
             &ReceiverMessage::Error {
-                message: "file hash mismatch".into(),
+                message: "transfer hash mismatch".into(),
             },
         )
         .await?;
-        bail!("file hash mismatch — file is corrupted");
+        bail!("transfer hash mismatch — received data is corrupted");
+    }
+
+    // Apply preserved permissions/mtime if any entries carry non-zero metadata.
+    // (The sender sets mode=0 and mtime=0 when --preserve is not requested.)
+    #[cfg(unix)]
+    if let Some(ref cl) = layout {
+        let root = output_dir.join(&manifest.file_name);
+        for entry in &cl.file_entries {
+            if entry.mode != 0 || entry.mtime != 0 {
+                apply_metadata(&root.join(&entry.path), entry.mode, entry.mtime);
+            }
+        }
     }
 
     framing::send_message(ctrl_send, &ReceiverMessage::Complete { file_hash }).await?;
@@ -1264,7 +1515,8 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn recv_stream_worker<R>(
     mut stream: R,
-    out_file: Arc<std::fs::File>,
+    out_file: Option<Arc<std::fs::File>>,
+    layout: Option<Arc<ConcatLayout>>,
     resume: Arc<Mutex<ResumeState>>,
     manifest: TransferManifest,
     pb: Arc<ProgressBar>,
@@ -1323,7 +1575,8 @@ where
 
         let chunk_index = chunk.chunk_index;
         let chunk_size = manifest.chunk_size;
-        let out_file = Arc::clone(&out_file);
+        let out_file = out_file.as_ref().map(Arc::clone);
+        let layout = layout.as_ref().map(Arc::clone);
         let hasher = hasher.as_ref().map(Arc::clone);
         let resume = Arc::clone(&resume);
         let pb = Arc::clone(&pb);
@@ -1357,12 +1610,23 @@ where
                 bail!("chunk {chunk_index} hash mismatch");
             }
 
-            let offset = chunk_index * chunk_size as u64;
             let write_start = std::time::Instant::now();
-            crate::fs_ext::write_all_at_advise(&out_file, &data, offset)
-                .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
-            // Release the write semaphore now that the pwrite (and its page-cache
-            // advisories) is done; the remaining work below is cheap.
+            if let Some(ref cl) = layout {
+                // Directory mode: scatter-pwrite across the files that overlap
+                // this chunk's byte range in the concat stream.
+                cl.scatter_write(chunk_index, chunk_size, &data)
+                    .with_context(|| format!("scatter write chunk {chunk_index}"))?;
+            } else {
+                // Single-file mode: direct pwrite to the pre-allocated file.
+                let offset = chunk_index * chunk_size as u64;
+                let f = out_file
+                    .as_ref()
+                    .expect("single-file mode must have out_file");
+                crate::fs_ext::write_all_at_advise(f, &data, offset)
+                    .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
+            }
+            // Release the write semaphore now that all pwrite calls for this chunk
+            // are done; the remaining work below is cheap.
             drop(write_permit);
 
             // Feed the already-verified hash (not the raw bytes) — ChunkHasher
@@ -1572,6 +1836,10 @@ const MIN_CHUNK_SIZE: usize = 4 * 1024;
 const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const MAX_STREAMS: usize = 1024;
 
+/// Maximum number of file entries in a `DirEntries` message.
+/// Limits memory usage and prevents degenerate manifests.
+const MAX_DIR_ENTRIES: usize = 500_000;
+
 fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<()> {
     if m.file_name.is_empty() {
         bail!("manifest: file_name is empty");
@@ -1621,4 +1889,147 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
         );
     }
     Ok(())
+}
+
+/// Validate a `DirEntries` payload received over the wire.
+///
+/// Security checks — path traversal, symlink escape, size consistency.
+fn validate_dir_entries(manifest: &TransferManifest, de: &DirEntries) -> Result<()> {
+    let entries = match &de.entries {
+        None => return Ok(()), // single-file v3 transfer; nothing to validate
+        Some(e) => e,
+    };
+
+    if entries.len() > MAX_DIR_ENTRIES {
+        bail!(
+            "DirEntries: too many entries ({}, limit {MAX_DIR_ENTRIES})",
+            entries.len()
+        );
+    }
+
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut total_file_bytes: u64 = 0;
+
+    for (i, entry) in entries.iter().enumerate() {
+        // Path must not be empty.
+        if entry.path.is_empty() {
+            bail!("DirEntries[{i}]: empty path");
+        }
+        // No null bytes.
+        if entry.path.contains('\0') {
+            bail!("DirEntries[{i}]: path contains null byte");
+        }
+        // Must not start with a path separator.
+        if entry.path.starts_with('/') || entry.path.starts_with('\\') {
+            bail!("DirEntries[{i}]: path is absolute: {:?}", entry.path);
+        }
+        // Validate every component.
+        for component in entry.path.split('/') {
+            if component.is_empty() {
+                bail!(
+                    "DirEntries[{i}]: path has empty component: {:?}",
+                    entry.path
+                );
+            }
+            if component == ".." || component == "." {
+                bail!(
+                    "DirEntries[{i}]: path contains traversal component: {:?}",
+                    entry.path
+                );
+            }
+            if component.contains('\0') {
+                bail!(
+                    "DirEntries[{i}]: path component contains null: {:?}",
+                    entry.path
+                );
+            }
+            // Reject Windows drive letters (e.g. "C:").
+            if component.len() >= 2
+                && component.as_bytes()[1] == b':'
+                && component.as_bytes()[0].is_ascii_alphabetic()
+            {
+                bail!(
+                    "DirEntries[{i}]: path contains drive letter: {:?}",
+                    entry.path
+                );
+            }
+        }
+
+        // No duplicate paths.
+        if !seen_paths.insert(&entry.path) {
+            bail!("DirEntries[{i}]: duplicate path {:?}", entry.path);
+        }
+
+        // Symlink targets must not be absolute and must not escape the root.
+        if let FileKind::Symlink { target } = &entry.kind {
+            if target.starts_with('/') || target.starts_with('\\') {
+                bail!(
+                    "DirEntries[{i}]: symlink {:?} has absolute target {:?}",
+                    entry.path,
+                    target
+                );
+            }
+            // Resolve the target lexically relative to the symlink's parent directory
+            // and ensure it doesn't escape via "..".
+            let parent = entry.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let resolved = resolve_relative_path(parent, target);
+            if resolved.starts_with("../") || resolved == ".." {
+                bail!(
+                    "DirEntries[{i}]: symlink {:?} target {:?} escapes transfer root",
+                    entry.path,
+                    target
+                );
+            }
+        }
+
+        // Accumulate File sizes for cross-check against manifest.file_size.
+        if matches!(entry.kind, FileKind::File) {
+            total_file_bytes = total_file_bytes.saturating_add(entry.size);
+        } else if entry.size != 0 {
+            bail!(
+                "DirEntries[{i}]: non-File entry {:?} has non-zero size {}",
+                entry.path,
+                entry.size
+            );
+        }
+    }
+
+    // Verify that the sum of File sizes matches the manifest's file_size.
+    if total_file_bytes != manifest.file_size {
+        bail!(
+            "DirEntries: sum of file sizes ({total_file_bytes}) \
+             does not match manifest.file_size ({})",
+            manifest.file_size
+        );
+    }
+
+    Ok(())
+}
+
+/// Lexically resolve `target` relative to `base_dir` (e.g. a symlink's parent
+/// directory within the transfer root).  Returns a normalised relative path
+/// that can be checked for `..` escape.
+fn resolve_relative_path(base_dir: &str, target: &str) -> String {
+    // Start with the base directory components.
+    let mut parts: Vec<&str> = if base_dir.is_empty() {
+        vec![]
+    } else {
+        base_dir.split('/').collect()
+    };
+
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
 }
