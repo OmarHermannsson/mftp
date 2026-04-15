@@ -515,9 +515,44 @@ pub async fn send_via_ssh(
         trusted_fingerprint: Some(hs.fingerprint.clone()),
         ..config.clone()
     };
-    let direct_result = crate::transfer::sender::send(file.clone(), direct_addr, direct_cfg).await;
 
-    if let Err(e) = direct_result {
+    // How many QUIC retries before falling back to SFTP.  Exactly one retry
+    // is enough: if the first attempt made progress, the resume bitmap on the
+    // receiver lets a second attempt skip already-written chunks cheaply.
+    const QUIC_RETRIES: u32 = 1;
+
+    let mut attempt = 0u32;
+    let first_result = loop {
+        let result =
+            crate::transfer::sender::send(file.clone(), direct_addr, direct_cfg.clone()).await;
+
+        match &result {
+            Ok(()) => break result,
+            Err(e) => {
+                // C2: if the transfer made progress (MidTransferFailure marker
+                // is present) and we have retries left, retry QUIC rather than
+                // falling back to SFTP.  The receiver's resume bitmap means the
+                // retry only re-sends missing chunks.
+                if attempt < QUIC_RETRIES
+                    && e.downcast_ref::<crate::transfer::sender::MidTransferFailure>()
+                        .is_some()
+                    && config.forced_transport.is_none()
+                {
+                    attempt += 1;
+                    eprintln!(
+                        "[mftp] QUIC transfer failed mid-flight ({e:#}); \
+                         retrying with resume (attempt {attempt}/{QUIC_RETRIES})…"
+                    );
+                    // C3: keep `ssh` alive — the remote mftp process is still
+                    // running and will accept the reconnect.
+                    continue;
+                }
+                break result;
+            }
+        }
+    };
+
+    if let Err(e) = first_result {
         // A forced transport means the user explicitly chose QUIC or TCP+TLS —
         // do not silently fall back to SFTP.
         if config.forced_transport.is_some() {

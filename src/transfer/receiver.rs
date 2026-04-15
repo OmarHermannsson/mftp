@@ -15,7 +15,7 @@ use tokio::io::AsyncRead;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::compress;
 use crate::fec::codec::FecDecoder;
@@ -745,6 +745,7 @@ where
                 &mut ctrl_send,
                 &ReceiverMessage::Error {
                     message: format!("{e:#}"),
+                    fatal: true,
                 },
             )
             .await;
@@ -888,6 +889,10 @@ where
             Some(join_res) = tasks.join_next() => {
                 let r = join_res.unwrap_or_else(|e| Err(anyhow!("stream worker panicked: {e}")));
                 if let Err(e) = r {
+                    // Log immediately so the operator sees which stream/chunk
+                    // failed even if the error is later superseded by the
+                    // cascade (e.g. "receiver closed without completing").
+                    error!(error = format!("{e:#}"), "receive worker failed");
                     if task_err.is_none() { task_err = Some(e); }
                 }
                 active_workers = active_workers.saturating_sub(1);
@@ -976,6 +981,7 @@ where
             &mut ctrl_send,
             &ReceiverMessage::Error {
                 message: e.to_string(),
+                fatal: true,
             },
         )
         .await;
@@ -1482,6 +1488,7 @@ where
             ctrl_send,
             &ReceiverMessage::Error {
                 message: "transfer hash mismatch".into(),
+                fatal: true,
             },
         )
         .await?;
@@ -1599,7 +1606,8 @@ where
             // Decompress first: chunk_hash is blake3(raw_bytes) on the sender,
             // so we must verify against the decompressed data, not the wire payload.
             let data = if chunk.compressed {
-                compress::decompress_chunk(&chunk.payload, chunk_size)?
+                compress::decompress_chunk(&chunk.payload, chunk_size)
+                    .with_context(|| format!("decompress chunk {chunk_index}"))?
             } else {
                 chunk.payload
             };
@@ -1607,7 +1615,11 @@ where
             let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
             if computed != chunk.chunk_hash {
                 stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
-                bail!("chunk {chunk_index} hash mismatch");
+                bail!(
+                    "chunk {chunk_index} hash mismatch: got {}, expected {}",
+                    hex::encode(computed),
+                    hex::encode(chunk.chunk_hash)
+                );
             }
 
             let write_start = std::time::Instant::now();

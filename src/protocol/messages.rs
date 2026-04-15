@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 ///   2 — adds protocol_version field + AdjustStreams / AdjustStreamsAck messages
 ///   3 — adds recursive directory transfer: DirEntries message sent by sender
 ///       after TransferManifest when peer_version >= 3.
-pub const PROTOCOL_VERSION: u32 = 3;
+///   4 — adds `fatal` field to ReceiverMessage::Error so the sender can
+///       distinguish fatal errors (hash mismatch, disk full) from transient
+///       stream errors and decide whether to retry or abort.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,8 +211,20 @@ pub enum ReceiverMessage {
     },
     /// All chunks received and verified; echoes the file hash.
     Complete { file_hash: [u8; 32] },
-    /// Receiver encountered a fatal error.
-    Error { message: String },
+    /// Receiver encountered an error.
+    ///
+    /// `fatal` is `true` for errors that make a retry pointless (hash mismatch,
+    /// disk full, permission denied).  `false` or absent (v3 receivers) means
+    /// the transfer may be resumed by reconnecting; the receiver's resume bitmap
+    /// already reflects which chunks were successfully written.
+    ///
+    /// Added in protocol v4; older receivers never set `fatal`, so the sender
+    /// MUST treat a missing field (serde default = false) as non-fatal.
+    Error {
+        message: String,
+        #[serde(default)]
+        fatal: bool,
+    },
     /// Acknowledgement of a `SenderMessage::AdjustStreams` request.
     ///
     /// `accepted_count` is the actual new total stream count after the

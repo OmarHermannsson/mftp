@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 
@@ -31,6 +31,38 @@ use crate::protocol::{
 };
 use crate::transfer::hash::{hash_file_sync, ChunkHasher};
 use crate::transfer::negotiate::{compute_params, compute_target_streams, ProgressSample};
+
+/// Marker attached to errors from [`run_transfer`] / [`run_transfer_fec`] so
+/// callers (e.g. the SSH wrapper in `ssh.rs`) can distinguish a mid-flight
+/// failure — where the receiver already has a partial resume state — from a
+/// failure that occurred before the transfer started.
+///
+/// When this marker is present the caller may retry the QUIC transfer and rely
+/// on the receiver's resume bitmap to skip already-written chunks.
+#[derive(Debug)]
+pub(crate) struct MidTransferFailure;
+
+impl std::fmt::Display for MidTransferFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transfer failed mid-flight (resume state preserved on receiver)"
+        )
+    }
+}
+
+impl std::error::Error for MidTransferFailure {}
+
+/// Returns `true` if any error in `e`'s source chain is a QUIC
+/// `WriteError::Stopped`, meaning the receiver called `STOP_SENDING` on the
+/// stream (usually because a receiver worker died and dropped its `RecvStream`).
+///
+/// This is distinct from a full connection failure and does not mean the whole
+/// transfer is unrecoverable.
+fn is_stream_stopped_by_peer(e: &anyhow::Error) -> bool {
+    // quinn renders WriteError::Stopped(code) as "sending stopped by peer: error {code}"
+    format!("{e:#}").contains("sending stopped by peer")
+}
 
 /// Which transport path to use for the transfer.
 ///
@@ -252,7 +284,10 @@ async fn send_quic_with_conn(
                 }
             },
         )
-        .await?;
+        // C1: tag mid-flight failures so ssh.rs can retry QUIC with resume
+        // instead of falling back to SFTP.
+        .await
+        .map_err(|e| e.context(MidTransferFailure))?;
     } else {
         run_transfer(
             &file,
@@ -281,7 +316,10 @@ async fn send_quic_with_conn(
                 }
             },
         )
-        .await?;
+        // C1: tag mid-flight failures so ssh.rs can retry QUIC with resume
+        // instead of falling back to SFTP.
+        .await
+        .map_err(|e| e.context(MidTransferFailure))?;
     }
 
     let _ = ctrl_send.finish();
@@ -563,7 +601,7 @@ where
             received_bits,
             total_chunks,
         } => bits_to_chunk_set(&received_bits, total_chunks),
-        ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
+        ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
         other => bail!("unexpected message from receiver: {other:?}"),
     };
     let skip_count = have.len() as u64;
@@ -633,6 +671,9 @@ where
 
     let pb_for_reader = pb.clone();
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    // B2: channel for the reader task to signal a fatal receiver error to the
+    // main loop without waiting for workers to drain first.
+    let (early_abort_tx, mut early_abort_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (scale_tx, mut scale_rx) = tokio::sync::mpsc::channel::<ScaleMsg>(8);
     // Shared current stream count: reader reads it for compute_target_streams;
     // main loop increments it when scale-up is accepted.
@@ -784,6 +825,15 @@ where
                         .await;
                 }
                 Ok(Some(other)) => {
+                    // B2: if receiver sent a fatal Error, wake the main loop
+                    // immediately — don't wait for all stream workers to drain.
+                    if let ReceiverMessage::Error {
+                        ref message,
+                        fatal: true,
+                    } = other
+                    {
+                        let _ = early_abort_tx.try_send(message.clone());
+                    }
                     let _ = completion_tx.send(other);
                     return;
                 }
@@ -899,9 +949,32 @@ where
         tokio::select! {
             biased;
 
+            // B2: receiver signalled a fatal error via the control stream.
+            // Abort immediately — no point sending more chunks.
+            Some(msg) = early_abort_rx.recv() => {
+                bail!("receiver fatal error: {msg}");
+            }
+
             // Drain completed workers first so active_workers stays accurate.
             Some(res) = tasks.join_next() => {
-                res??;
+                match res? {
+                    Ok(()) => {}
+                    // B1: a single stream was stopped by the receiver (QUIC
+                    // STOP_SENDING).  This happens when one receiver worker
+                    // dies (hash mismatch, disk error, etc.) and drops its
+                    // RecvStream with unread data.  The other streams are
+                    // still healthy — tolerate this and let resume fill the
+                    // gap rather than aborting the whole transfer.
+                    Err(e) if is_stream_stopped_by_peer(&e) && active_workers > 1 => {
+                        warn!(
+                            error = format!("{e:#}"),
+                            remaining = active_workers - 1,
+                            "QUIC stream stopped by receiver; \
+                             continuing on remaining streams (resume will fill gap)"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
                 active_workers -= 1;
                 if active_workers == 0 && pending_scale.is_none() {
                     break;
@@ -1000,9 +1073,13 @@ where
     };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    // The reader task keeps consuming Progress messages until Complete arrives.
-    let msg = completion_rx
+    // B3: bound the wait so the sender doesn't hang indefinitely if the
+    // receiver died without sending Complete/Error (e.g. all streams were
+    // stopped and the receiver exited before we got here).
+    let completion_timeout = rtt * 4 + Duration::from_secs(10);
+    let msg = tokio::time::timeout(completion_timeout, completion_rx)
         .await
+        .context("timed out waiting for receiver acknowledgement")?
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
@@ -1285,7 +1362,7 @@ fn print_completion(
                 elapsed.as_secs_f64(),
             );
         }
-        ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
+        ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
         other => bail!("unexpected final message: {other:?}"),
     }
     Ok(())
@@ -1994,7 +2071,7 @@ where
             );
             s
         }
-        ReceiverMessage::Error { message } => bail!("receiver error: {message}"),
+        ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
         other => bail!("unexpected message from receiver: {other:?}"),
     };
 
@@ -2132,7 +2209,18 @@ where
         tasks.spawn(spawn_worker(rx, transfer_id));
     }
     while let Some(res) = tasks.join_next().await {
-        res??;
+        match res? {
+            Ok(()) => {}
+            // B1 (FEC): a single stream stopped — receiver will use FEC parity
+            // to reconstruct any affected stripes.  Let remaining streams finish.
+            Err(e) if is_stream_stopped_by_peer(&e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "FEC stream stopped by receiver; receiver will attempt FEC recovery"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // Ensure encoder and feeder finished cleanly.
@@ -2154,8 +2242,12 @@ where
     };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    let msg = completion_rx
+    // B3: bound the wait so the sender doesn't hang if the receiver died
+    // without sending Complete/Error.
+    let completion_timeout = rtt * 4 + Duration::from_secs(10);
+    let msg = tokio::time::timeout(completion_timeout, completion_rx)
         .await
+        .context("timed out waiting for receiver acknowledgement")?
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
