@@ -743,9 +743,12 @@ where
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
 
     // Observability: shared atomics sampled by a background stats task (QUIC
-    // only) and read by the reader task to populate the progress bar {msg} slot.
+    // only) and by the reader task; make_diag() reads them for the {msg} slot.
+    // disk_stall_ms comes from the receiver's Progress messages, so only the
+    // reader owns that atomic (no stats-task clone needed).
     let rtt_ms_atom = Arc::new(AtomicU32::new(rtt.as_millis() as u32));
     let loss_atom = Arc::new(AtomicU64::new(0u64));
+    let stall_ms_for_reader = Arc::new(AtomicU32::new(0u32));
     let rtt_ms_for_reader = Arc::clone(&rtt_ms_atom);
     let loss_for_reader = Arc::clone(&loss_atom);
     let _stats_task = qconn.map(|c| {
@@ -784,11 +787,18 @@ where
             let streams = current_streams_for_reader.load(AtomicOrd::Relaxed);
             let rtt_ms = rtt_ms_for_reader.load(AtomicOrd::Relaxed);
             let loss = loss_for_reader.load(AtomicOrd::Relaxed);
+            let stall = stall_ms_for_reader.load(AtomicOrd::Relaxed);
+            let mut s = format!("streams={streams}");
             if rtt_ms > 0 {
-                format!("streams={streams} rtt={rtt_ms}ms loss={loss}")
-            } else {
-                format!("streams={streams}")
+                s.push_str(&format!(" rtt={rtt_ms}ms"));
             }
+            if loss > 0 {
+                s.push_str(&format!(" loss={loss}"));
+            }
+            if stall > 0 {
+                s.push_str(&format!(" stall={stall}ms"));
+            }
+            s
         };
 
         loop {
@@ -799,6 +809,7 @@ where
                     disk_stall_ms,
                 })) => {
                     pb_for_reader.set_position(bytes_written);
+                    stall_ms_for_reader.store(disk_stall_ms, AtomicOrd::Relaxed);
 
                     // Revert flash message if its display window has elapsed.
                     if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
