@@ -62,7 +62,8 @@ struct Cli {
     /// The sender measures throughput and receiver congestion every 100 ms and
     /// adjusts the stream count to maximise utilisation without saturating the
     /// receiver.  Stream count is bounded by [2, 2 × min(cores)].
-    #[arg(long, global = true)]
+    /// Silently disabled if the peer does not support protocol version ≥ 2.
+    #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
     adaptive_streams: bool,
 
     /// Force a specific transport path.
