@@ -20,7 +20,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: mftp-windows-x86_64.exe
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset: mftp-macos-x86_64
 
