@@ -119,7 +119,7 @@ pub struct DirEntries {
 pub struct ChunkData {
     pub transfer_id: [u8; 16],
     pub chunk_index: u64,
-    /// SHA-256 of the wire payload (post-compression).
+    /// BLAKE3 hash of the raw uncompressed chunk data.
     pub chunk_hash: [u8; 32],
     /// Whether the payload is zstd-compressed.
     /// Per-chunk flag because compression is skipped for incompressible chunks.
@@ -166,7 +166,7 @@ pub struct FecChunkData {
 /// Sent by the sender on the control stream after all data streams finish.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SenderMessage {
-    /// SHA-256 of the complete original file (pre-compression).
+    /// BLAKE3 hash of the complete original file.
     /// Computed concurrently with the transfer; delivered here so it doesn't
     /// block connection setup.
     Complete { file_hash: [u8; 32] },

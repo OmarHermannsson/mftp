@@ -123,8 +123,8 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// RTT at or below which the sender auto-switches to TCP+TLS even after a
 /// successful QUIC handshake.  QUIC+BBR reaches full congestion window slowly
-/// on LAN, consistently underperforming TCP+CUBIC at sub-5 ms RTT.
-pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(5);
+/// at low latency, consistently underperforming TCP+CUBIC at sub-15 ms RTT.
+pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(15);
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     // Scan directory before connecting so errors are surfaced early.
