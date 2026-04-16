@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use sha1::Sha1;
 use ssh2::{MethodType, OpenFlags, OpenType, Session};
 
@@ -367,13 +367,7 @@ fn authenticate(sess: &Session, user: &str) -> Result<()> {
 
 fn make_progress_bar(file_name: &str, file_size: u64) -> ProgressBar {
     let pb = ProgressBar::new(file_size);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[sftp] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}",
-        )
-        .unwrap(),
-    );
+    pb.set_style(crate::progress::transfer_style("↑", false));
     pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_prefix(file_name.to_owned());
     pb

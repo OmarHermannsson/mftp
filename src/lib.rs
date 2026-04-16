@@ -2,6 +2,7 @@ pub mod compress;
 pub mod fec;
 pub mod fs_ext;
 pub mod net;
+pub mod progress;
 pub mod protocol;
 pub mod sftp;
 pub mod ssh;
