@@ -107,6 +107,9 @@ Options:
                            transfer port must be in a firewall allow-list.
   -n, --streams <N>        Parallel streams.
                            Direct mode: default auto-negotiated from RTT + CPU cores.
+                           By default the sender adapts stream count mid-transfer
+                           based on measured throughput and receiver congestion —
+                           passing -n N pins the count and disables scaling.
                            SFTP: default 8 (each stream = one SSH connection;
                            raise to 12 if the remote sshd allows it).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
@@ -132,16 +135,6 @@ Options:
                            Omit for auto: QUIC → TCP+TLS → SFTP (SSH mode only).
       --tcp-below-rtt <MS> In auto mode, switch to TCP+TLS when measured RTT ≤ this
                            value. Ignored when --transport is set [default: 15].
-      --adaptive-streams   Enabled by default. The sender measures throughput and
-                           receiver congestion every 100 ms and adjusts stream
-                           count to maximise utilisation. Bounded by
-                           [2, 2 × min(cores)]. Pass -n N to pin streams and
-                           disable adaptive scaling. Requires both endpoints
-                           to be protocol version ≥ 2.
-      --parallel-reads     Use multiple parallel file readers instead of one
-                           sequential reader. Only beneficial on local NVMe with
-                           queue depth ≥ 32; no measurable effect on spinning
-                           disks or network-bound transfers.
       --download           When the remote platform differs from local, automatically
                            download the correct mftp binary from GitHub releases
                            without prompting. Mutually exclusive with --no-download.
@@ -169,7 +162,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.93
+mftp 0.1.100
 ```
 
 ---
@@ -365,7 +358,7 @@ For SSH-assisted transfers the fingerprint is obtained automatically over the ex
 
 The SFTP fallback path relies on SSH host key verification against `~/.ssh/known_hosts` (the same file used by the `ssh` command). Run `ssh <host>` once if the host is not yet in your known_hosts.
 
-Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. QUIC flow control windows are 32 MiB per stream and 256 MiB at the connection level.
+Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. QUIC flow control windows start at 64 MiB per stream and 512 MiB at the connection level; the connection-level window is scaled up dynamically after RTT is measured to match the bandwidth-delay product on high-latency links (e.g. ~1 GiB at 600 ms RTT on a 10 Gbps link).
 
 ---
 
@@ -409,6 +402,18 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
   sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432
   ```
 
+- **TCP BBR on the TCP+TLS path**: mftp requests BBR congestion control for TCP sockets on Linux (mirroring the QUIC path). If you see a warning about `TCP_CONGESTION=bbr`, the `tcp_bbr` kernel module is not loaded on that host. Load it manually or persist it across reboots:
+
+  ```sh
+  sudo modprobe tcp_bbr
+  # persist across reboots:
+  echo tcp_bbr | sudo tee /etc/modules-load.d/tcp_bbr.conf
+  ```
+
+  Failure to load the module is non-fatal — the transfer continues with the kernel default (usually CUBIC). BBR matters most on the TCP+TLS path (auto-switched on LAN, or forced with `--transport tcp`).
+
+- **Diagnosing slow transfers**: in a wide terminal (≥ 140 columns) the progress bar shows a live diagnostic: `streams=N rtt=Xms loss=N stall=Nms`. Fields only appear when non-zero. A persistent high `stall=` value means the receiver disk is the bottleneck; a non-zero `loss=` points to network packet loss.
+
 ---
 
 ## Building
@@ -441,12 +446,15 @@ cargo clippy -- -D warnings
 ### Shipped (not yet extracted to changelog)
 
 - Recursive directory transfer (`-r`) with optional metadata preservation (`--preserve`)
-- Adaptive stream scaling on by default (dynamic scale-up/scale-down, protocol v2)
+- Adaptive stream scaling on by default; pin with `-n N` (dynamic scale-up/scale-down, protocol v2)
 - SFTP fallback when the remote host cannot reach the mftp receive port
 - FEC resume support: resumes skip already-received parity stripes
-- NVMe parallel multi-reader (`--parallel-reads`)
-- BDP-aware QUIC window sizing from measured RTT
+- NVMe parallel multi-reader (`--parallel-reads`, advanced/hidden flag)
+- BDP-aware QUIC connection window sizing from measured RTT
 - Adaptive zstd compression level (per-worker EMA of ratio/CPU)
+- QUIC initial MTU raised to 1350 B (skips the lowest probe segment on Ethernet paths)
+- TCP+TLS BBR: `setsockopt(TCP_CONGESTION, "bbr")` on Linux for parity with QUIC path
+- Live progress diagnostics: `streams=N rtt=Xms loss=N stall=Nms` in wide-terminal mode
 
 ---
 
