@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrd};
 
 use async_channel as ac;
 
@@ -52,6 +52,17 @@ impl std::fmt::Display for MidTransferFailure {
 }
 
 impl std::error::Error for MidTransferFailure {}
+
+/// Aggregate compression statistics shared across all worker tasks.
+///
+/// `.0` — total raw (uncompressed) bytes processed.
+/// `.1` — total wire bytes sent (after compression; equals raw bytes when
+///         a chunk is sent uncompressed).
+type CompressionStats = (Arc<AtomicU64>, Arc<AtomicU64>);
+
+fn new_compression_stats() -> CompressionStats {
+    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+}
 
 /// Returns `true` if any error in `e`'s source chain is a QUIC
 /// `WriteError::Stopped`, meaning the receiver called `STOP_SENDING` on the
@@ -315,7 +326,7 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             peer_version,
             &config,
-            move |rx, transfer_id, compression, file_hasher, excess_stop| {
+            move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
                 let conn = conn_for_workers.clone();
                 async move {
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
@@ -326,6 +337,7 @@ async fn send_quic_with_conn(
                         compression,
                         file_hasher,
                         excess_stop,
+                        stats,
                     )
                     .await
                 }
@@ -349,6 +361,7 @@ async fn quic_stream_worker(
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
+    stats: CompressionStats,
 ) -> Result<()> {
     send_from_channel(
         &mut stream,
@@ -357,6 +370,7 @@ async fn quic_stream_worker(
         &compression,
         file_hasher,
         excess_stop,
+        stats,
     )
     .await?;
     stream.finish()?;
@@ -434,7 +448,7 @@ async fn send_tcp(
         neg_resp.cpu_cores,
         peer_version,
         &config,
-        move |rx, transfer_id, compression, file_hasher, excess_stop| {
+        move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
             let fp = trusted_fp.clone();
             async move {
                 let stream = connect_tls(destination, fp.as_deref())
@@ -447,6 +461,7 @@ async fn send_tcp(
                     compression,
                     file_hasher,
                     excess_stop,
+                    stats,
                 )
                 .await
             }
@@ -463,6 +478,7 @@ async fn tcp_stream_worker(
     compression: Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
+    stats: CompressionStats,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     send_from_channel(
@@ -472,6 +488,7 @@ async fn tcp_stream_worker(
         &compression,
         file_hasher,
         excess_stop,
+        stats,
     )
     .await
     .context("send_from_channel")?;
@@ -522,6 +539,7 @@ where
         Compression,
         Option<Arc<ChunkHasher>>,
         Arc<AtomicUsize>,
+        CompressionStats,
     ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
@@ -645,6 +663,8 @@ where
             hash_file_sync(&path, chunk_size)
         }))
     };
+
+    let compress_stats = new_compression_stats();
 
     let chunk_mib = chunk_size / (1024 * 1024);
     let file_count = entries.map(|e| {
@@ -957,6 +977,7 @@ where
             compression.clone(),
             h,
             excess_stop.clone(),
+            (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1)),
         ));
     }
 
@@ -1028,6 +1049,7 @@ where
                                     compression.clone(),
                                     h,
                                     excess_stop.clone(),
+                                    (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1)),
                                 ));
                                 active_workers += 1;
                             }
@@ -1104,7 +1126,14 @@ where
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
-    print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
+    print_completion(
+        msg,
+        &file_name,
+        file_size,
+        file_hash,
+        transfer_start,
+        &compress_stats,
+    )?;
 
     Ok(())
 }
@@ -1187,6 +1216,7 @@ async fn send_from_channel<W>(
     compression: &Compression,
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
+    stats: CompressionStats,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -1256,6 +1286,8 @@ where
             if let Some(ref mut al) = adaptive {
                 al.update(raw_len, payload.len());
             }
+            stats.0.fetch_add(raw_len as u64, AtomicOrd::Relaxed);
+            stats.1.fetch_add(payload.len() as u64, AtomicOrd::Relaxed);
 
             framing::send_chunk_data(
                 writer,
@@ -1366,6 +1398,7 @@ fn print_completion(
     file_size: u64,
     file_hash: [u8; 32],
     transfer_start: Instant,
+    stats: &CompressionStats,
 ) -> Result<()> {
     match msg {
         ReceiverMessage::Complete {
@@ -1377,11 +1410,24 @@ fn print_completion(
             let elapsed = transfer_start.elapsed();
             let mib = file_size as f64 / (1024.0 * 1024.0);
             let throughput = mib / elapsed.as_secs_f64();
-            println!(
-                "Transfer complete: {file_name} ({mib:.0} MiB) in {:.1}s \
-                 ({throughput:.0} MiB/s end-to-end). Hash verified.",
-                elapsed.as_secs_f64(),
-            );
+            let raw = stats.0.load(AtomicOrd::Relaxed);
+            let wire = stats.1.load(AtomicOrd::Relaxed);
+            if raw > 0 && wire < raw {
+                let saved_pct = (1.0 - wire as f64 / raw as f64) * 100.0;
+                let wire_mib = wire as f64 / (1024.0 * 1024.0);
+                println!(
+                    "Transfer complete: {file_name} ({mib:.0} MiB) in {:.1}s \
+                     ({throughput:.0} MiB/s end-to-end). Hash verified. \
+                     Wire: {wire_mib:.0} MiB ({saved_pct:.0}% saved by compression).",
+                    elapsed.as_secs_f64(),
+                );
+            } else {
+                println!(
+                    "Transfer complete: {file_name} ({mib:.0} MiB) in {:.1}s \
+                     ({throughput:.0} MiB/s end-to-end). Hash verified.",
+                    elapsed.as_secs_f64(),
+                );
+            }
         }
         ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
         other => bail!("unexpected final message: {other:?}"),
@@ -1835,6 +1881,7 @@ fn encode_and_dispatch(
     worker_i: &mut usize,
     n: usize,
     file_hasher: Option<&Arc<ChunkHasher>>,
+    stats: &CompressionStats,
 ) -> Result<()> {
     let data_shards = encoder.data_shards;
     let parity_shards = encoder.parity_shards;
@@ -1854,6 +1901,12 @@ fn encode_and_dispatch(
             }
         }
         let (payload, comp) = maybe_compress(raw.clone(), compression)?;
+        // Accumulate compression stats for real shards only (padding shards are
+        // synthetic zeros and would distort the ratio).
+        if i < real_count {
+            stats.0.fetch_add(raw.len() as u64, AtomicOrd::Relaxed);
+            stats.1.fetch_add(payload.len() as u64, AtomicOrd::Relaxed);
+        }
         hashes.push(hash);
         payloads.push(payload);
         comp_flags.push(comp);
@@ -1922,6 +1975,7 @@ fn stripe_encode_chunks(
     transfer_id: [u8; 16],
     file_hasher: Option<Arc<ChunkHasher>>,
     worker_txs: Vec<tokio::sync::mpsc::Sender<FecChunkData>>,
+    stats: CompressionStats,
 ) -> Result<()> {
     let encoder = FecEncoder::new(fec_params.data_shards, fec_params.parity_shards)?;
     let data_shards = fec_params.data_shards;
@@ -1949,6 +2003,7 @@ fn stripe_encode_chunks(
                 &mut worker_i,
                 n,
                 file_hasher.as_ref(),
+                &stats,
             )?;
             buf.clear();
         }
@@ -1975,6 +2030,7 @@ fn stripe_encode_chunks(
             &mut worker_i,
             n,
             file_hasher.as_ref(),
+            &stats,
         )?;
     }
 
@@ -2054,6 +2110,8 @@ where
     };
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     let num_streams = params.streams;
+
+    let compress_stats = new_compression_stats();
 
     let manifest = TransferManifest {
         transfer_id,
@@ -2213,6 +2271,7 @@ where
     let fec_params_clone = fec_params.clone();
     let compression_clone = compression.clone();
     let hasher_for_encoder = file_hasher.clone();
+    let stats_for_encoder = (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1));
     let encoder_task = tokio::task::spawn_blocking(move || {
         stripe_encode_chunks(
             feeder_rx,
@@ -2221,6 +2280,7 @@ where
             transfer_id,
             hasher_for_encoder,
             worker_txs,
+            stats_for_encoder,
         )
     });
 
@@ -2272,7 +2332,14 @@ where
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
-    print_completion(msg, &file_name, file_size, file_hash, transfer_start)?;
+    print_completion(
+        msg,
+        &file_name,
+        file_size,
+        file_hash,
+        transfer_start,
+        &compress_stats,
+    )?;
 
     Ok(())
 }
