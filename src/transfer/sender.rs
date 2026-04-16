@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
 
 use async_channel as ac;
 
@@ -342,6 +342,7 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             peer_version,
             &config,
+            Some(conn.clone()),
             move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
                 let conn = conn_for_workers.clone();
                 async move {
@@ -464,6 +465,7 @@ async fn send_tcp(
         neg_resp.cpu_cores,
         peer_version,
         &config,
+        None, // no quinn connection on TCP path
         move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
             let fp = trusted_fp.clone();
             async move {
@@ -544,6 +546,7 @@ async fn run_transfer<CW, CR, F, Fut>(
     receiver_cores: u32,
     peer_protocol_version: u32,
     config: &SendConfig,
+    qconn: Option<quinn::Connection>,
     spawn_worker: F,
 ) -> Result<()>
 where
@@ -738,6 +741,27 @@ where
     // pinned via -n N (explicit count implies user wants static behaviour).
     let adaptive_enabled = config.streams.is_none()
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
+
+    // Observability: shared atomics sampled by a background stats task (QUIC
+    // only) and read by the reader task to populate the progress bar {msg} slot.
+    let rtt_ms_atom = Arc::new(AtomicU32::new(rtt.as_millis() as u32));
+    let loss_atom = Arc::new(AtomicU64::new(0u64));
+    let rtt_ms_for_reader = Arc::clone(&rtt_ms_atom);
+    let loss_for_reader = Arc::clone(&loss_atom);
+    let _stats_task = qconn.map(|c| {
+        let rtt_a = rtt_ms_atom;
+        let loss_a = loss_atom;
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                iv.tick().await;
+                let s = c.stats();
+                rtt_a.store(s.path.rtt.as_millis() as u32, AtomicOrd::Relaxed);
+                loss_a.store(s.path.lost_packets, AtomicOrd::Relaxed);
+            }
+        })
+    });
+
     let scale_tx_for_reader = scale_tx.clone();
     let reader = tokio::spawn(async move {
         let mut flash_until: Option<std::time::Instant> = None;
@@ -754,6 +778,19 @@ where
         // Suppress sending another Target while a pending Ack is expected.
         let mut pending_scale = false;
 
+        // Format persistent diagnostic for the {msg} slot of the progress bar.
+        // Shows in wide-terminal mode (≥140 cols); no-op when {msg} is absent.
+        let make_diag = || {
+            let streams = current_streams_for_reader.load(AtomicOrd::Relaxed);
+            let rtt_ms = rtt_ms_for_reader.load(AtomicOrd::Relaxed);
+            let loss = loss_for_reader.load(AtomicOrd::Relaxed);
+            if rtt_ms > 0 {
+                format!("streams={streams} rtt={rtt_ms}ms loss={loss}")
+            } else {
+                format!("streams={streams}")
+            }
+        };
+
         loop {
             match framing::recv_message::<_, ReceiverMessage>(&mut ctrl_recv).await {
                 Ok(Some(ReceiverMessage::Progress {
@@ -765,7 +802,7 @@ where
 
                     // Revert flash message if its display window has elapsed.
                     if flash_until.is_some_and(|d| std::time::Instant::now() >= d) {
-                        pb_for_reader.set_message("");
+                        pb_for_reader.set_message(make_diag());
                         flash_until = None;
                     }
 
@@ -867,7 +904,7 @@ where
                 Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
                     tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
                     pending_scale = false;
-                    pb_for_reader.set_message("");
+                    pb_for_reader.set_message(make_diag());
                     flash_until = None;
                     let _ = scale_tx_for_reader
                         .send(ScaleMsg::Ack(accepted_count))
