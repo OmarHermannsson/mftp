@@ -18,7 +18,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 |---|---|
 | **QUIC transport** | Parallel streams over a single connection; no TCP head-of-line blocking |
 | **BBR congestion control** | Measures bandwidth and RTT directly; avoids CUBIC's sawtooth pattern on lossy/high-latency links |
-| **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 5 ms) where kernel TCP beats QUIC |
+| **Auto TCP+TLS fallback** | If UDP is blocked, retries transparently over TCP+TLS; also auto-switches on LAN/datacenter links (RTT ≤ 15 ms) where kernel TCP beats QUIC |
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
 | **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH. **Significantly slower** (~22–32 MiB/s cap) due to SSH SFTP protocol overhead |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
@@ -111,6 +111,11 @@ Options:
                            raise to 12 if the remote sshd allows it).
       --chunk-size <BYTES> Chunk size in bytes (default: auto from RTT).
       --no-compress        Disable adaptive zstd compression.
+  -r, --recursive          Transfer directories recursively. Required when the
+                           source is a directory; silently accepted (no-op) when
+                           the source is a regular file.
+      --preserve           Preserve source file permissions and modification time
+                           on the receiver. No effect on Windows receivers.
       --fec <DATA:PARITY>  Enable Reed-Solomon forward error correction.
                            e.g. --fec 8:2 adds 25% overhead but tolerates up to 2
                            lost chunks per stripe without retransmission.
@@ -126,7 +131,7 @@ Options:
                                   server launch).
                            Omit for auto: QUIC → TCP+TLS → SFTP (SSH mode only).
       --tcp-below-rtt <MS> In auto mode, switch to TCP+TLS when measured RTT ≤ this
-                           value. Ignored when --transport is set [default: 5.0].
+                           value. Ignored when --transport is set [default: 15].
       --adaptive-streams   Dynamically scale stream count during transfer.
                            The sender measures throughput and receiver congestion
                            every 100 ms and adjusts stream count to maximise
@@ -163,7 +168,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.54
+mftp 0.1.89
 ```
 
 ---
@@ -385,7 +390,7 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 - **SFTP fallback is significantly slower**: the SFTP path is capped at ~3 MiB/s per stream (a fundamental SSH SFTP protocol limitation — synchronous write acknowledgments). At the default of 8 streams that is ~22 MiB/s; 12 streams gives ~32 MiB/s. This is several times slower than the QUIC or TCP+TLS paths, which saturate the link. If transfers are consistently falling back to SFTP, open a port and use `--port <N>`.
 - **macOS: not tested**: mftp is developed and tested on Linux. It may compile and work on macOS, but this is not verified. Issues specific to macOS are welcome but may not be promptly fixed.
 - **TOFU fingerprint persistence**: `--trust` fingerprints are not stored between sessions. You must pass `--trust` on every non-interactive invocation, or accept the prompt each time.
-- **Single file**: recursive directory transfer is not yet supported.
+- **Directory transfer**: `-r` transfers the directory tree recursively. `--preserve` copies mode bits and mtime; without it, files land with default umask permissions and current mtime.
 
 ---
 
@@ -393,7 +398,7 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
 - **Lossy links**: add `--fec 8:2` (or `--fec 4:1` for lighter overhead) to tolerate burst loss without retransmission. FEC shines on links where 1–5% packet loss is common.
-- **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 5 ms. No flags needed — just run the same command.
+- **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 15 ms. No flags needed — just run the same command.
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips compression. No `--no-compress` needed.
 - **Open port required**: in SSH mode, use `--port <N>` with a firewall-allowed port to avoid the automatic fallback to SFTP. The SFTP path is reliable but slower.
 - **SFTP fallback throughput**: if the direct transfer ports are always blocked, raise `--streams` from the default of 8 to 12 for ~32 MiB/s. Check that the remote sshd's `MaxStartups` is set to at least `12:30:100`.
@@ -430,7 +435,6 @@ cargo clippy -- -D warnings
 
 ## Roadmap
 
-- **Directory transfer** — recursive send with a single command
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
 
 ---
