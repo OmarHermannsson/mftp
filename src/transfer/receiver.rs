@@ -563,6 +563,8 @@ impl StripeBuffer {
 /// against `blake3(raw)`), `None` for reconstructed shards (trust RS; file hash
 /// catches errors end-to-end).
 #[allow(clippy::too_many_arguments)]
+/// Returns the pwrite duration in µs so callers can report disk latency without
+/// including the resume-state fsync that follows.
 fn write_fec_chunk(
     chunk_index: u64,
     payload: &[u8],
@@ -575,7 +577,7 @@ fn write_fec_chunk(
     pb: &ProgressBar,
     progress_tx: &tokio::sync::mpsc::Sender<u64>,
     deferred: &crate::fs_ext::DeferredDontneed,
-) -> Result<()> {
+) -> Result<u32> {
     let data = if compressed {
         compress::decompress_chunk(payload, chunk_size)
             .with_context(|| format!("decompress FEC chunk {chunk_index}"))?
@@ -591,8 +593,10 @@ fn write_fec_chunk(
     }
 
     let offset = chunk_index * chunk_size as u64;
+    let write_start = std::time::Instant::now();
     crate::fs_ext::write_all_at_deferred(out_file, &data, offset, deferred)
         .with_context(|| format!("write FEC chunk {chunk_index} at offset {offset}"))?;
+    let write_us = write_start.elapsed().as_micros() as u32;
 
     if let Some(h) = hasher {
         h.feed(chunk_index, computed)?;
@@ -616,7 +620,7 @@ fn write_fec_chunk(
     }
 
     debug!(chunk = chunk_index, "FEC chunk written");
-    Ok(())
+    Ok(write_us)
 }
 
 /// Process a completed stripe: write directly received data shards and use
@@ -624,6 +628,9 @@ fn write_fec_chunk(
 ///
 /// Designed to run in `spawn_blocking`; all I/O is synchronous.
 #[allow(clippy::too_many_arguments)]
+/// Returns the peak pwrite duration (µs) across all chunks in the stripe so
+/// callers can update disk-latency stats without including the resume-state
+/// fsync that follows each write.
 fn process_stripe(
     stripe: StripeBuffer,
     chunk_size: usize,
@@ -633,7 +640,7 @@ fn process_stripe(
     pb: Arc<ProgressBar>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
     deferred: crate::fs_ext::DeferredDontneed,
-) -> Result<()> {
+) -> Result<u32> {
     let data_shards = stripe.data_shards;
     let parity_shards = stripe.parity_shards;
     let real_data_count = stripe.real_data_count;
@@ -641,9 +648,10 @@ fn process_stripe(
 
     if stripe.received_data == real_data_count && stripe.shard_lengths.is_none() {
         // Happy path: all real data shards arrived; no RS needed.
+        let mut peak_write_us = 0u32;
         for i in 0..real_data_count {
             let (payload, hash, compressed) = stripe.data[i].as_ref().unwrap();
-            write_fec_chunk(
+            let write_us = write_fec_chunk(
                 first_chunk + i as u64,
                 payload,
                 *compressed,
@@ -656,8 +664,9 @@ fn process_stripe(
                 &progress_tx,
                 &deferred,
             )?;
+            peak_write_us = peak_write_us.max(write_us);
         }
-        return Ok(());
+        return Ok(peak_write_us);
     }
 
     // RS reconstruction path.
@@ -694,6 +703,7 @@ fn process_stripe(
     let decoder = FecDecoder::new(data_shards, parity_shards)?;
     let reconstructed = decoder.reconstruct(shards, shard_lengths)?;
 
+    let mut peak_write_us = 0u32;
     for i in 0..real_data_count {
         let was_reconstructed = stripe.data[i].is_none();
         let payload = &reconstructed[i]; // already trimmed to shard_lengths[i]
@@ -704,7 +714,7 @@ fn process_stripe(
         } else {
             stripe.data[i].as_ref().map(|(_, h, _)| *h)
         };
-        write_fec_chunk(
+        let write_us = write_fec_chunk(
             first_chunk + i as u64,
             payload,
             compressed,
@@ -717,9 +727,10 @@ fn process_stripe(
             &progress_tx,
             &deferred,
         )?;
+        peak_write_us = peak_write_us.max(write_us);
     }
 
-    Ok(())
+    Ok(peak_write_us)
 }
 
 // ── Shared transfer body ──────────────────────────────────────────────────────
@@ -1692,6 +1703,11 @@ where
                 crate::fs_ext::write_all_at_deferred(f, &data, offset, &deferred_c)
                     .with_context(|| format!("write chunk {chunk_index} at offset {offset}"))?;
             }
+            // Measure only the actual data write; resume fsync below must not
+            // inflate this value and cause spurious disk-stall reports.
+            let write_us = write_start.elapsed().as_micros() as u32;
+            stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
+
             // Release the write semaphore now that all pwrite calls for this chunk
             // are done; the remaining work below is cheap.
             drop(write_permit);
@@ -1723,9 +1739,6 @@ where
             if let Some(snap) = snap {
                 snap.write_to_disk()?;
             }
-
-            let write_us = write_start.elapsed().as_micros() as u32;
-            stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
             stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
 
             debug!(chunk = chunk_index, "received");
@@ -1865,15 +1878,16 @@ where
                 .expect("write semaphore closed");
             stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
             processing.spawn_blocking(move || {
-                let write_start = std::time::Instant::now();
-                let result = process_stripe(
+                let peak_write_us = process_stripe(
                     stripe, chunk_size, out_file, resume, hasher, pb, ptx, deferred_c,
                 );
                 drop(write_permit);
-                let write_us = write_start.elapsed().as_micros() as u32;
+                // Use the pwrite time returned by process_stripe (excludes resume
+                // fsync) so disk_stall_ms reflects only actual data write latency.
+                let write_us = peak_write_us.as_ref().ok().copied().unwrap_or(0);
                 stats.last_disk_us.fetch_max(write_us, Ordering::Relaxed);
                 stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
-                result
+                peak_write_us.map(|_| ())
             });
         }
 
