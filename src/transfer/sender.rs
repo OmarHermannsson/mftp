@@ -261,6 +261,21 @@ async fn send_quic_with_conn(
     let neg_resp: NegotiateResponse = framing::recv_message_required(&mut ctrl_recv).await?;
     let rtt = conn.stats().path.rtt;
 
+    // Expand the connection-level send window for high-BDP links (fast WAN /
+    // satellite).  The static 512 MiB default is sufficient up to ~600 ms at
+    // 1 Gbps, but on a 10 Gbps link at 600 ms the BDP is ~750 MiB — exceeding
+    // the default and capping throughput.  The per-stream window (64 MiB) is
+    // sized for the per-stream BDP and doesn't need adjustment.
+    let bdp_window = crate::net::connection::compute_bdp_window(rtt);
+    if bdp_window > crate::net::connection::SEND_WINDOW {
+        conn.set_send_window(bdp_window);
+        debug!(
+            bdp_window,
+            rtt_ms = rtt.as_secs_f64() * 1000.0,
+            "enlarged send window for BDP"
+        );
+    }
+
     let conn_for_workers = conn.clone();
     let peer_version = neg_resp.protocol_version;
 

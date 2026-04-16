@@ -61,8 +61,22 @@ fn install_crypto_provider() {
 // buffer absorbs burst UDP datagrams; the QUIC window controls how much the
 // *sender* is allowed to have in flight before the receiver must grant credit.
 const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024 * 1024; // 64 MiB per stream
-const CONNECTION_RECEIVE_WINDOW: u32 = 8 * 64 * 1024 * 1024; // 512 MiB total
-const SEND_WINDOW: u64 = 8 * 64 * 1024 * 1024; // 512 MiB
+pub(crate) const CONNECTION_RECEIVE_WINDOW: u32 = 8 * 64 * 1024 * 1024; // 512 MiB total
+pub(crate) const SEND_WINDOW: u64 = 8 * 64 * 1024 * 1024; // 512 MiB
+
+/// Compute a BDP-aware connection-level window for a measured RTT.
+///
+/// Uses a 10 Gbps reference bandwidth (generous upper bound) and 1.5× headroom
+/// to accommodate BBR's probe phase and ACK delay.  The result is clamped to
+/// the static `SEND_WINDOW` floor so that low-latency connections are unchanged.
+///
+/// At 600 ms RTT → 1.125 GiB (exceeds the 512 MiB static window).
+/// At  15 ms RTT → ~28 MiB  → clamped to 512 MiB (no change).
+pub fn compute_bdp_window(rtt: std::time::Duration) -> u64 {
+    const REFERENCE_BW_BYTES_PER_SEC: f64 = 10_000_000_000.0 / 8.0; // 10 Gbps
+    let bdp = (REFERENCE_BW_BYTES_PER_SEC * rtt.as_secs_f64() * 1.5) as u64;
+    bdp.max(SEND_WINDOW)
+}
 
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
@@ -501,4 +515,34 @@ fn prompt_trust() -> bool {
     let mut answer = String::new();
     BufReader::new(tty_r).read_line(&mut answer).ok();
     answer.trim().eq_ignore_ascii_case("yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn bdp_window_clamps_at_floor_for_low_rtt() {
+        // At 15 ms RTT: BDP = 1.25 GB/s * 0.015 * 1.5 = ~28 MiB → clamped to 512 MiB.
+        let w = compute_bdp_window(Duration::from_millis(15));
+        assert_eq!(
+            w, SEND_WINDOW,
+            "low-RTT window should equal the static floor"
+        );
+    }
+
+    #[test]
+    fn bdp_window_scales_for_high_rtt() {
+        // At 600 ms RTT: BDP = 1.25 GB/s * 0.6 * 1.5 = 1.125 GiB > 512 MiB.
+        let w = compute_bdp_window(Duration::from_millis(600));
+        let floor = SEND_WINDOW;
+        assert!(w > floor, "high-RTT window should exceed the static floor");
+        // Sanity-check the magnitude: expect roughly 1.1 GiB ± 10%.
+        let expected = (10_000_000_000u64 / 8) * 6 / 10 * 15 / 10; // ≈ 1.125 GiB
+        assert!(
+            (w as i64 - expected as i64).unsigned_abs() < expected / 10,
+            "window {w} should be close to {expected}"
+        );
+    }
 }

@@ -382,6 +382,22 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
         Err(e) => return Err(e.into()),
     };
 
+    // Expand the connection-level receive window for high-BDP links, mirroring
+    // the sender's set_send_window adjustment.  RTT from the just-completed
+    // QUIC handshake is close enough for window sizing before data starts.
+    let rtt = conn.stats().path.rtt;
+    let bdp_window = crate::net::connection::compute_bdp_window(rtt);
+    if bdp_window > crate::net::connection::CONNECTION_RECEIVE_WINDOW as u64 {
+        if let Ok(w) = quinn::VarInt::from_u64(bdp_window) {
+            conn.set_receive_window(w);
+            tracing::debug!(
+                bdp_window,
+                rtt_ms = rtt.as_secs_f64() * 1000.0,
+                "enlarged receive window for BDP"
+            );
+        }
+    }
+
     let conn_for_accept = conn.clone();
     let mut ctrl_send = run_receive(ctrl_send, ctrl_recv, output_dir, move || {
         let conn = conn_for_accept.clone();
