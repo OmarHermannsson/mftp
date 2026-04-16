@@ -23,8 +23,14 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// Mirrors the QUIC path (quinn uses BBR via `BbrConfig`). Only attempted on
 /// Linux; silently skipped on other platforms or when the kernel module is not
 /// loaded. Failure is non-fatal — the OS default (CUBIC) is still correct.
+///
+/// The warn on failure fires at most once per process to avoid spamming one
+/// line per TCP connection on hosts without `tcp_bbr` available.
 #[cfg(target_os = "linux")]
 fn try_set_bbr(raw_fd: std::os::unix::io::RawFd) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
     let bbr = b"bbr";
     let ret = unsafe {
         libc::setsockopt(
@@ -35,9 +41,10 @@ fn try_set_bbr(raw_fd: std::os::unix::io::RawFd) {
             bbr.len() as libc::socklen_t,
         )
     };
-    if ret != 0 {
+    if ret != 0 && !LOGGED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
-            "could not set TCP_CONGESTION=bbr: {}",
+            "could not set TCP_CONGESTION=bbr: {} (kernel tcp_bbr module not loaded; \
+             continuing with default congestion control)",
             std::io::Error::last_os_error()
         );
     }
