@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::AsyncRead;
 use tokio::net::TcpListener;
@@ -316,22 +316,37 @@ pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<(
     // looping here instead of exiting we keep both endpoints bound so the
     // retry can succeed without relaunching the receiver.
     //
-    // No overall timeout here: in SSH mode the server is launched by the
-    // sender and inherits the SSH session.  If the sender is killed, the SSH
-    // connection closes and the remote sshd sends SIGHUP to this process,
-    // causing it to exit.  The DATA_STREAM_ACCEPT_TIMEOUT inside run_receive
-    // handles the case where the sender dies after connecting the control
-    // stream but before all data streams are established.
+    // A timeout is applied to each accept as a safety net: 5 minutes for the
+    // initial connection, 60 seconds for the retry.  This prevents the
+    // receiver from hanging indefinitely when SIGHUP is not delivered (e.g.
+    // the user has SSH ControlMaster enabled and the muxed session outlives
+    // our SSH child, or a network partition where TCP keepalives haven't
+    // fired yet).
     for attempt in 0_u8..=1 {
-        let result = accept_one_quic_or_tcp(&quic_server, &tcp_server).await;
+        let timeout = if attempt == 0 {
+            STDIO_ACCEPT_TIMEOUT
+        } else {
+            STDIO_RETRY_TIMEOUT
+        };
+        let result =
+            tokio::time::timeout(timeout, accept_one_quic_or_tcp(&quic_server, &tcp_server)).await;
         match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt == 0 => {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) if attempt == 0 => {
                 // First transfer failed; stay alive so the sender's automatic
                 // resume retry can reconnect to the same port.
                 warn!("transfer failed (attempt 1), waiting for resume retry: {e:#}");
             }
-            Err(e) => return Err(e),
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => bail!(
+                "no {} received within {}s — exiting",
+                if attempt == 0 {
+                    "connection"
+                } else {
+                    "reconnection"
+                },
+                timeout.as_secs(),
+            ),
         }
     }
     Ok(())
@@ -1222,36 +1237,13 @@ fn prepare_transfer(
 
     // ── Progress bar ─────────────────────────────────────────────────────────
 
+    let term_width = console::Term::stdout().size().1 as usize;
+    let wide = term_width >= 140;
     let pb = Arc::new({
-        let term_width = console::Term::stdout().size().1 as usize;
-        let template = if term_width >= 140 {
-            "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}  {msg}"
-        } else {
-            "[recv] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-             {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}"
-        };
         let pb = ProgressBar::new(manifest.file_size);
-        pb.set_style(ProgressStyle::with_template(template).unwrap());
+        pb.set_style(crate::progress::transfer_style("↓", wide));
         pb.enable_steady_tick(Duration::from_millis(100));
-        let chunk_mib = manifest.chunk_size / (1024 * 1024);
-        let file_count = dir_entries.map(|e| {
-            e.iter()
-                .filter(|en| matches!(en.kind, FileKind::File))
-                .count()
-        });
-        let prefix = if let Some(n) = file_count {
-            format!(
-                "{} · {} streams · {} MiB · {n} files",
-                manifest.file_name, manifest.num_streams, chunk_mib
-            )
-        } else {
-            format!(
-                "{} · {} streams · {} MiB",
-                manifest.file_name, manifest.num_streams, chunk_mib
-            )
-        };
-        pb.set_prefix(prefix);
+        pb.set_prefix(manifest.file_name.clone());
         pb
     });
 
@@ -1906,6 +1898,18 @@ where
 /// replies with `ReceiverMessage::Ready`, so 30 s is very generous; it
 /// only fires when the sender has already died mid-setup.
 const DATA_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long `serve_one_stdio` waits for the initial connection.  The sender
+/// connects almost immediately after receiving the handshake line, so this
+/// only fires when something has gone badly wrong (sender crashed, firewall,
+/// etc.).  Acts as a safety net for cases where SIGHUP is not delivered (e.g.
+/// SSH ControlMaster, network partition before TCP keepalives fire).
+const STDIO_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How long `serve_one_stdio` waits for the sender to reconnect after a
+/// mid-flight failure.  The sender retries immediately on the same SSH
+/// session, so 60 s is very generous.
+const STDIO_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ── Manifest validation ───────────────────────────────────────────────────────
 

@@ -122,6 +122,8 @@ async fn probe_remote_platform(dest: &SshDest) -> Result<Option<RemotePlatform>>
     // `uname -sm` on Unix; `ver` on Windows cmd.exe.  Both are run; one will
     // produce noise, the other the expected string — the parser skips noise.
     let mut child = tokio::process::Command::new("ssh")
+        .arg("-o")
+        .arg("ControlPath=none")
         .arg(&dest.user_host)
         .arg("uname -sm 2>/dev/null; ver 2>NUL")
         .stdin(Stdio::null())
@@ -243,6 +245,8 @@ exec "$f" server --output-dir "$d"{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")
+        .arg("-o")
+        .arg("ControlPath=none")
         .arg(&dest.user_host)
         .arg("sh")
         .arg("-c")
@@ -624,6 +628,8 @@ fn spawn_remote_binary(
     // remote login shell.  Using `sh -c <script>` here would make `server`
     // and `--output-dir` become $0/$1 (ignored) instead of mftp arguments.
     tokio::process::Command::new("ssh")
+        .arg("-o")
+        .arg("ControlPath=none")
         .arg(&dest.user_host)
         .arg(&remote_cmd)
         .stdin(Stdio::null())
@@ -687,6 +693,8 @@ exec "$f" server --output-dir "$d"{port_arg}"#
     );
 
     let mut child = tokio::process::Command::new("ssh")
+        .arg("-o")
+        .arg("ControlPath=none")
         .arg(&dest.user_host)
         .arg("sh")
         .arg("-c")
