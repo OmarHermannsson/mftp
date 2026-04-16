@@ -162,7 +162,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.100
+mftp 0.1.101
 ```
 
 ---
