@@ -95,7 +95,7 @@ struct Cli {
     /// Splits the file into one range per stream and reads them concurrently.
     /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
     /// effect on network-bound transfers or spinning disks.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     parallel_reads: bool,
 
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)

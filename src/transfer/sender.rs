@@ -1635,8 +1635,9 @@ pub(crate) fn scan_directory(root: &Path, preserve: bool) -> Result<Vec<FileEntr
                 mode,
                 mtime,
             });
+        } else {
+            warn!("skipping {}: unsupported file type {:?}", path, ft);
         }
-        // other file types (devices, sockets, …) are silently skipped
     }
 
     // Stable sort: walkdir already sorts within each directory level, but a

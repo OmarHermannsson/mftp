@@ -132,11 +132,12 @@ Options:
                            Omit for auto: QUIC → TCP+TLS → SFTP (SSH mode only).
       --tcp-below-rtt <MS> In auto mode, switch to TCP+TLS when measured RTT ≤ this
                            value. Ignored when --transport is set [default: 15].
-      --adaptive-streams   Dynamically scale stream count during transfer.
-                           The sender measures throughput and receiver congestion
-                           every 100 ms and adjusts stream count to maximise
-                           utilisation. Bounded by [2, 2 × min(cores)].
-                           Requires both endpoints to be protocol version ≥ 2.
+      --adaptive-streams   Enabled by default. The sender measures throughput and
+                           receiver congestion every 100 ms and adjusts stream
+                           count to maximise utilisation. Bounded by
+                           [2, 2 × min(cores)]. Pass -n N to pin streams and
+                           disable adaptive scaling. Requires both endpoints
+                           to be protocol version ≥ 2.
       --parallel-reads     Use multiple parallel file readers instead of one
                            sequential reader. Only beneficial on local NVMe with
                            queue depth ≥ 32; no measurable effect on spinning
@@ -168,7 +169,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.89
+mftp 0.1.93
 ```
 
 ---
@@ -436,6 +437,16 @@ cargo clippy -- -D warnings
 ## Roadmap
 
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
+
+### Shipped (not yet extracted to changelog)
+
+- Recursive directory transfer (`-r`) with optional metadata preservation (`--preserve`)
+- Adaptive stream scaling on by default (dynamic scale-up/scale-down, protocol v2)
+- SFTP fallback when the remote host cannot reach the mftp receive port
+- FEC resume support: resumes skip already-received parity stripes
+- NVMe parallel multi-reader (`--parallel-reads`)
+- BDP-aware QUIC window sizing from measured RTT
+- Adaptive zstd compression level (per-worker EMA of ratio/CPU)
 
 ---
 
