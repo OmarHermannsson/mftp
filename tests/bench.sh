@@ -17,18 +17,18 @@
 #
 # Requirements:
 #   - mftp binary built: cargo build --release
-#   - Remote binary installed: scp target/release/mftp mftp@10.1.1.168:/data/mftp
+#   - Remote binary installed: scp target/release/mftp $REMOTE_USER@$REMOTE_HOST:/data/mftp
 #   - Test files created: see tests/make_testfiles.sh
-#   - SSH key auth to mftp@10.1.1.168
+#   - SSH key auth configured (set REMOTE_USER and REMOTE_HOST env vars)
 
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MFTP=./target/release/mftp
-REMOTE_USER=mftp
-REMOTE_HOST=10.1.1.168
-REMOTE=mftp@10.1.1.168
+REMOTE_USER=${REMOTE_USER:?set REMOTE_USER (e.g. export REMOTE_USER=myuser)}
+REMOTE_HOST=${REMOTE_HOST:?set REMOTE_HOST (e.g. export REMOTE_HOST=192.168.1.1)}
+REMOTE=${REMOTE_USER}@${REMOTE_HOST}
 REMOTE_MFTP=/data/mftp
 REMOTE_DIR=/data
 IFACE=ens33
