@@ -843,7 +843,9 @@ where
                         saturated_run = 0;
                     }
 
-                    // Disk stall: flash in bar, log at info, throttle to once per 10 s.
+                    // Disk stall: log at info, throttle to once per 10 s.
+                    // No progress-bar flash needed — stall=Nms is already shown
+                    // persistently in the diagnostic line.
                     if disk_stall_ms > 50
                         && last_disk_warn.elapsed() >= std::time::Duration::from_secs(10)
                     {
@@ -851,9 +853,6 @@ where
                             disk_stall_ms,
                             "receiver disk stall: writes are taking longer than 50 ms"
                         );
-                        pb_for_reader.set_message(format!("⚠ disk stall {disk_stall_ms}ms"));
-                        flash_until =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         last_disk_warn = std::time::Instant::now();
                     }
 
@@ -2301,9 +2300,6 @@ where
                             disk_stall_ms,
                             "receiver disk stall: writes are taking longer than 50 ms"
                         );
-                        pb_for_reader.set_message(format!("⚠ disk stall {disk_stall_ms}ms"));
-                        flash_until =
-                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                         last_disk_warn = std::time::Instant::now();
                     }
                 }
