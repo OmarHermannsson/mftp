@@ -1,0 +1,4 @@
+# Release builds should use: --target x86_64-unknown-linux-musl
+# Install the toolchain once with: rustup target add x86_64-unknown-linux-musl
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

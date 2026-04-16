@@ -29,3 +29,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check
+
+  build-musl:
+    name: Release (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: file target/x86_64-unknown-linux-musl/release/mftp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mftp-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/mftp

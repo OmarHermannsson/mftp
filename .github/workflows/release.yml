@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: mftp-linux-x86_64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: mftp-windows-x86_64.exe
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: mftp-macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: mftp-macos-aarch64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/mftp
+          [[ "${{ matrix.os }}" == windows* ]] && BIN="${BIN}.exe"
+          cp "$BIN" "${{ matrix.asset }}"
+          gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset }}"
