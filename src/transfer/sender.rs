@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
@@ -52,6 +52,26 @@ impl std::fmt::Display for MidTransferFailure {
 }
 
 impl std::error::Error for MidTransferFailure {}
+
+/// Marker: the sender finished transmitting all data and sent `SenderMessage::Complete`,
+/// but the receiver did not respond within the ack timeout.
+///
+/// This is distinct from `MidTransferFailure`: the data is fully on the wire and
+/// every chunk was individually verified.  Retrying or falling back to SFTP would
+/// be harmful; the caller should warn and treat the transfer as succeeded.
+#[derive(Debug)]
+pub(crate) struct AckTimeoutAfterComplete;
+
+impl std::fmt::Display for AckTimeoutAfterComplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timed out waiting for receiver verification after all data was sent"
+        )
+    }
+}
+
+impl std::error::Error for AckTimeoutAfterComplete {}
 
 /// Aggregate compression statistics shared across all worker tasks.
 ///
@@ -721,8 +741,6 @@ where
     let adaptive_enabled = config.adaptive_streams
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
     let scale_tx_for_reader = scale_tx.clone();
-    let file_name_for_reader = file_name.clone();
-    let file_count_for_reader = file_count;
     let reader = tokio::spawn(async move {
         let mut flash_until: Option<std::time::Instant> = None;
         let mut saturated_run = 0u32;
@@ -851,14 +869,6 @@ where
                 Ok(Some(ReceiverMessage::AdjustStreamsAck { accepted_count })) => {
                     tracing::info!(accepted = accepted_count, "receiver acked stream scaling");
                     pending_scale = false;
-                    let new_prefix = if let Some(n) = file_count_for_reader {
-                        format!("{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB · {n} files")
-                    } else {
-                        format!(
-                            "{file_name_for_reader} · {accepted_count} streams · {chunk_mib} MiB"
-                        )
-                    };
-                    pb_for_reader.set_prefix(new_prefix);
                     pb_for_reader.set_message("");
                     flash_until = None;
                     let _ = scale_tx_for_reader
@@ -1119,10 +1129,14 @@ where
     // B3: bound the wait so the sender doesn't hang indefinitely if the
     // receiver died without sending Complete/Error (e.g. all streams were
     // stopped and the receiver exited before we got here).
-    let completion_timeout = rtt * 4 + Duration::from_secs(10);
-    let msg = tokio::time::timeout(completion_timeout, completion_rx)
+    let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx)
         .await
-        .context("timed out waiting for receiver acknowledgement")?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for receiver acknowledgement after all data was sent"
+            )
+            .context(AckTimeoutAfterComplete)
+        })?
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();
@@ -1139,6 +1153,23 @@ where
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Compute the timeout for waiting on the receiver's final `Complete` message.
+///
+/// After the sender transmits all data, the receiver must hash-verify the full
+/// file before responding.  On the resume path it re-reads the file from disk,
+/// so the budget must scale with `file_size`.
+///
+/// Formula: max(4×RTT + 30 s,  file_size / 500 MB/s + 30 s)
+///
+/// The 500 MB/s floor is a conservative estimate for sequential disk read +
+/// BLAKE3 on spinning media.  The 30-second addend covers small files and any
+/// network / scheduling jitter.
+fn ack_timeout(rtt: Duration, file_size: u64) -> Duration {
+    const HASH_FLOOR_BPS: u64 = 500_000_000; // 500 MB/s
+    let hash_estimate = Duration::from_secs(file_size / HASH_FLOOR_BPS + 1);
+    (rtt * 4 + Duration::from_secs(30)).max(hash_estimate + Duration::from_secs(30))
+}
 
 /// Read the source file sequentially and distribute non-skipped chunks
 /// round-robin to the per-worker channels.
@@ -1370,24 +1401,19 @@ fn make_progress_bar(
     chunk_mib: usize,
     file_count: Option<usize>,
 ) -> Arc<ProgressBar> {
-    let term_width = console::Term::stdout().size().1 as usize;
-    let template = if term_width >= 140 {
-        "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-         {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}  {msg}"
+    let meta = if let Some(n) = file_count {
+        format!("  {streams} streams · {chunk_mib} MiB chunks · {n} files")
     } else {
-        "[send] {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} \
-         {bytes}/{total_bytes} {bytes_per_sec} eta {eta}  {prefix}"
+        format!("  {streams} streams · {chunk_mib} MiB chunks")
     };
+    eprintln!("{meta}");
+    let term_width = console::Term::stdout().size().1 as usize;
+    let wide = term_width >= 140;
     Arc::new({
         let pb = ProgressBar::new(file_size);
-        pb.set_style(ProgressStyle::with_template(template).unwrap());
+        pb.set_style(crate::progress::transfer_style("↑", wide));
         pb.enable_steady_tick(Duration::from_millis(100));
-        let prefix = if let Some(n) = file_count {
-            format!("{file_name} · {streams} streams · {chunk_mib} MiB · {n} files")
-        } else {
-            format!("{file_name} · {streams} streams · {chunk_mib} MiB")
-        };
-        pb.set_prefix(prefix);
+        pb.set_prefix(file_name.to_owned());
         pb
     })
 }
@@ -2325,10 +2351,14 @@ where
 
     // B3: bound the wait so the sender doesn't hang if the receiver died
     // without sending Complete/Error.
-    let completion_timeout = rtt * 4 + Duration::from_secs(10);
-    let msg = tokio::time::timeout(completion_timeout, completion_rx)
+    let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx)
         .await
-        .context("timed out waiting for receiver acknowledgement")?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for receiver acknowledgement after all data was sent"
+            )
+            .context(AckTimeoutAfterComplete)
+        })?
         .context("receiver closed without completing")?;
     reader.await.ok();
     pb.finish_and_clear();

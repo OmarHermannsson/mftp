@@ -529,6 +529,20 @@ pub async fn send_via_ssh(
         match &result {
             Ok(()) => break result,
             Err(e) => {
+                // C2a: all data was sent but the receiver's verification
+                // response timed out.  Every chunk was individually verified
+                // during transfer; retrying or falling back to SFTP would be
+                // harmful.  Warn and treat as success.
+                if e.downcast_ref::<crate::transfer::sender::AckTimeoutAfterComplete>()
+                    .is_some()
+                {
+                    eprintln!(
+                        "[mftp] warning: all data was sent but the receiver's \
+                         verification timed out. The transfer likely completed \
+                         successfully — check the receiver for errors."
+                    );
+                    break Ok(());
+                }
                 // C2: if the transfer made progress (MidTransferFailure marker
                 // is present) and we have retries left, retry QUIC rather than
                 // falling back to SFTP.  The receiver's resume bitmap means the
