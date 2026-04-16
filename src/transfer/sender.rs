@@ -130,10 +130,6 @@ pub struct SendConfig {
     /// Automatically forced to `None` when the transport falls back to TCP+TLS
     /// (TCP already provides reliable delivery; FEC would only add overhead).
     pub fec: Option<FecParams>,
-    /// Enable adaptive stream scaling (requires both peers protocol_version ≥ 2).
-    /// When true, the sender adjusts stream count mid-transfer based on measured
-    /// throughput and receiver congestion signals.
-    pub adaptive_streams: bool,
     /// Use multiple parallel file readers instead of a single sequential reader.
     /// Only measurable on local NVMe with queue-depth ≥ 32; no benefit on
     /// network-bound transfers or spinning disks.
@@ -738,7 +734,9 @@ where
     let max_in_flight_base = num_streams as u32 * 4;
     // cpu_cap mirrors the same formula used in compute_params().
     let cpu_cap = (receiver_cores.min(sender_cores) as usize).max(1) * 2;
-    let adaptive_enabled = config.adaptive_streams
+    // Adaptive scaling is on by default; disabled when streams are explicitly
+    // pinned via -n N (explicit count implies user wants static behaviour).
+    let adaptive_enabled = config.streams.is_none()
         && peer_protocol_version >= crate::protocol::messages::PROTOCOL_VERSION;
     let scale_tx_for_reader = scale_tx.clone();
     let reader = tokio::spawn(async move {

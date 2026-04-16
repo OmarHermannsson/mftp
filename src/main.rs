@@ -56,16 +56,6 @@ struct Cli {
     #[arg(long, global = true, value_name = "DATA:PARITY")]
     fec: Option<String>,
 
-    /// Dynamically scale the number of parallel streams during transfer.
-    ///
-    /// Requires both sender and receiver to be protocol version ≥ 2.
-    /// The sender measures throughput and receiver congestion every 100 ms and
-    /// adjusts the stream count to maximise utilisation without saturating the
-    /// receiver.  Stream count is bounded by [2, 2 × min(cores)].
-    /// Silently disabled if the peer does not support protocol version ≥ 2.
-    #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
-    adaptive_streams: bool,
-
     /// Force a specific transport path.
     ///
     /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
@@ -78,10 +68,6 @@ struct Cli {
     /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
     #[arg(long, global = true, value_name = "TRANSPORT")]
     transport: Option<Transport>,
-
-    /// Force TCP+TLS transport (alias for --transport tcp)
-    #[arg(long, global = true, hide = true)]
-    tcp: bool,
 
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
     /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
@@ -212,11 +198,11 @@ async fn main() -> Result<()> {
             preserve,
         } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
-            let forced_transport = match (cli.transport, cli.tcp) {
-                (Some(Transport::Quic), _) => Some(ForcedTransport::Quic),
-                (Some(Transport::Tcp), _) | (None, true) => Some(ForcedTransport::Tcp),
-                (Some(Transport::Sftp), _) => Some(ForcedTransport::Sftp),
-                (None, false) => None,
+            let forced_transport = match cli.transport {
+                Some(Transport::Quic) => Some(ForcedTransport::Quic),
+                Some(Transport::Tcp) => Some(ForcedTransport::Tcp),
+                Some(Transport::Sftp) => Some(ForcedTransport::Sftp),
+                None => None,
             };
             let fec = cli.fec.as_deref().and_then(|s| {
                 let parts: Vec<&str> = s.splitn(2, ':').collect();
@@ -255,7 +241,6 @@ async fn main() -> Result<()> {
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,
-                adaptive_streams: cli.adaptive_streams,
                 parallel_reads: cli.parallel_reads,
                 recursive,
                 preserve,
@@ -279,11 +264,7 @@ async fn main() -> Result<()> {
             let addr = bind
                 .parse()
                 .with_context(|| format!("invalid bind address: {bind}"))?;
-            if cli.tcp {
-                receiver::listen_tcp(addr, receiver::ReceiveConfig { output_dir }).await
-            } else {
-                receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
-            }
+            receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
         Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
     }
