@@ -86,6 +86,12 @@ fn transport_base() -> quinn::TransportConfig {
     // sawtooth throughput pattern that CUBIC exhibits at high latency and makes
     // better use of the pipe on satellite / intercontinental links.
     t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Start at 1350 B instead of the quinn default of 1200 B.  MTU discovery
+    // is already enabled by default and will probe higher; raising the floor
+    // skips the lowest portion of the probe range on most real-world paths
+    // (Ethernet MTU 1500, QUIC overhead ~40 B → useful payload ≈ 1460 B).
+    // Black-hole detection will fall back if the path cannot sustain 1350 B.
+    t.initial_mtu(1350);
     // Per-stream and connection-level flow control windows.
     t.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
     t.receive_window(quinn::VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));

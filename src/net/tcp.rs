@@ -18,6 +18,31 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// Set TCP congestion algorithm to BBR when supported by the kernel.
+///
+/// Mirrors the QUIC path (quinn uses BBR via `BbrConfig`). Only attempted on
+/// Linux; silently skipped on other platforms or when the kernel module is not
+/// loaded. Failure is non-fatal — the OS default (CUBIC) is still correct.
+#[cfg(target_os = "linux")]
+fn try_set_bbr(raw_fd: std::os::unix::io::RawFd) {
+    let bbr = b"bbr";
+    let ret = unsafe {
+        libc::setsockopt(
+            raw_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            bbr.as_ptr().cast(),
+            bbr.len() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            "could not set TCP_CONGESTION=bbr: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// How long to wait for a TCP handshake before giving up.
 ///
 /// Matches the QUIC connect timeout so that a firewall silently dropping UDP
@@ -54,6 +79,11 @@ pub async fn bind_tcp(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
             "could not set SO_SNDBUF to {}: {e}",
             super::SOCKET_BUFFER_SIZE
         );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        try_set_bbr(socket.as_raw_fd());
     }
     socket.set_nonblocking(true).context("set_nonblocking")?;
     socket.bind(&addr.into()).context("TCP bind")?;
@@ -121,6 +151,11 @@ async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
             "could not set SO_SNDBUF to {}: {e}",
             super::SOCKET_BUFFER_SIZE
         );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        try_set_bbr(socket.as_raw_fd());
     }
 
     let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.connect(addr))
