@@ -1311,6 +1311,7 @@ fn prepare_directory(entries: &[FileEntry], base_dir: &std::path::Path) -> Resul
                 std::fs::create_dir_all(&dest)
                     .with_context(|| format!("create dir {}", dest.display()))?;
             }
+            #[allow(unused_variables)]
             FileKind::Symlink { target } => {
                 // Create parent if needed.
                 if let Some(parent) = dest.parent() {

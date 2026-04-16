@@ -1566,6 +1566,7 @@ const PREREAD_THRESHOLD: u64 = 256 * 1024; // 256 KiB
 /// Files ≥ 1 entry and ≤ PREREAD_THRESHOLD are flagged for pre-reading by the
 /// caller.
 pub(crate) fn scan_directory(root: &Path, preserve: bool) -> Result<Vec<FileEntry>> {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     use walkdir::WalkDir;
 
