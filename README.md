@@ -382,7 +382,6 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 
 - **Firewall**: the QUIC and TCP+TLS paths both require an open port on the receiver. In SSH mode a random port is used by default — likely to be blocked. Use `--port <N>` with a known-open port, or rely on the automatic SFTP fallback (port 22 only, but capped at ~22–32 MiB/s). See [Firewall configuration](#firewall-configuration) above.
 - **SFTP fallback is significantly slower**: the SFTP path is capped at ~3 MiB/s per stream (a fundamental SSH SFTP protocol limitation — synchronous write acknowledgments). At the default of 8 streams that is ~22 MiB/s; 12 streams gives ~32 MiB/s. This is several times slower than the QUIC or TCP+TLS paths, which saturate the link. If transfers are consistently falling back to SFTP, open a port and use `--port <N>`.
-- **macOS: not tested**: mftp is developed and tested on Linux. It may compile and work on macOS, but this is not verified. Issues specific to macOS are welcome but may not be promptly fixed.
 - **TOFU fingerprint persistence**: `--trust` fingerprints are not stored between sessions. You must pass `--trust` on every non-interactive invocation, or accept the prompt each time.
 - **Directory transfer**: `-r` transfers the directory tree recursively. `--preserve` copies mode bits and mtime; without it, files land with default umask permissions and current mtime.
 
@@ -424,7 +423,7 @@ cargo build --release
 
 Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu). On Windows, OpenSSL is vendored automatically — no extra setup needed.
 
-> **Platform support**: Linux (x86_64, arm64) is the primary supported platform. macOS may compile and work, but is not tested — proceed with caution and report issues. Windows builds are supported for the receiver-less SFTP path; the full QUIC/TCP stack is untested on Windows.
+> **Platform support**: Linux (x86_64, arm64) and macOS (x86_64, aarch64) are fully supported. Windows builds are supported for the receiver-less SFTP path; the full QUIC/TCP stack is untested on Windows.
 
 ```sh
 # Check only (fast)
@@ -436,6 +435,37 @@ cargo test
 # Lint
 cargo clippy -- -D warnings
 ```
+
+### Building on macOS
+
+mftp is fully supported on macOS (x86_64 and aarch64). If you encounter linker errors related to missing zlib symbols (`_deflate`, `_inflate`, etc.) during `cargo build`, this is caused by `libz-sys` picking up the wrong architecture library from MacPorts or Homebrew. The repository includes a pre-configured `.cargo/config.toml` that forces static zlib linking and sets the correct deployment target; no additional steps are needed beyond running `cargo build --release`.
+
+If you need to cross-compile (e.g., building for x86_64 on Apple silicon), the same configuration applies automatically:
+
+```sh
+# Build for x86_64-apple-darwin (on Apple silicon host)
+cargo build --release --target x86_64-apple-darwin
+# Output: target/x86_64-apple-darwin/release/mftp
+
+# Build for aarch64-apple-darwin (native on Apple silicon)
+cargo build --release --target aarch64-apple-darwin
+```
+
+The `.cargo/config.toml` settings that enable this:
+
+```toml
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-lz"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-lz"]
+
+[env]
+LIBZ_SYS_STATIC = "1"
+MACOSX_DEPLOYMENT_TARGET = "13.0"
+```
+
+These settings force zlib to be built from source (instead of discovering a system library of the wrong architecture) and ensure all C dependencies target macOS 13.0 or later for binary compatibility.
 
 ---
 
