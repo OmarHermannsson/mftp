@@ -423,7 +423,7 @@ cargo build --release
 
 Requires Rust 1.75+ (for `div_ceil` stabilization) and libssh2 (for the SFTP fallback). On most Linux distributions libssh2 is already installed; on others install `libssh2-devel` (RPM) or `libssh2-dev` (Debian/Ubuntu). On Windows, OpenSSL is vendored automatically — no extra setup needed.
 
-> **Platform support**: Linux (x86_64, arm64) and macOS (x86_64, aarch64) are fully supported. Windows builds are supported for the receiver-less SFTP path; the full QUIC/TCP stack is untested on Windows.
+> **Platform support**: Linux (x86_64, arm64), macOS (x86_64, aarch64), and Windows (x86_64) are all supported. CI builds and runs the full test suite on Linux, macOS, and Windows on every change.
 
 ```sh
 # Check only (fast)
