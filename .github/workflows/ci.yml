@@ -67,3 +67,18 @@ jobs:
         with:
           name: mftp-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/mftp
+
+  build-windows:
+    name: Release (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mftp-x86_64-pc-windows-msvc
+          path: target/x86_64-pc-windows-msvc/release/mftp.exe
