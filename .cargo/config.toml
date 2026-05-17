@@ -2,3 +2,13 @@
 # Install the toolchain once with: rustup target add x86_64-unknown-linux-musl
 [target.x86_64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-lz"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-lz"]
+
+[env]
+LIBZ_SYS_STATIC = "1"
+MACOSX_DEPLOYMENT_TARGET = "13.0"
