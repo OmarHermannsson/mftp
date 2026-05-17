@@ -454,18 +454,12 @@ cargo build --release --target aarch64-apple-darwin
 The `.cargo/config.toml` settings that enable this:
 
 ```toml
-[target.x86_64-apple-darwin]
-rustflags = ["-C", "link-arg=-lz"]
-
-[target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-lz"]
-
 [env]
 LIBZ_SYS_STATIC = "1"
-MACOSX_DEPLOYMENT_TARGET = "13.0"
+MACOSX_DEPLOYMENT_TARGET = "12.0"
 ```
 
-These settings force zlib to be built from source (instead of discovering a system library of the wrong architecture) and ensure all C dependencies target macOS 13.0 or later for binary compatibility.
+`LIBZ_SYS_STATIC=1` forces zlib to be built from source instead of discovering a system library of the wrong architecture, and `MACOSX_DEPLOYMENT_TARGET=12.0` ensures C dependencies target macOS Monterey or later for binary compatibility.
 
 ---
 
