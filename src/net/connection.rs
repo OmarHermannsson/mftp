@@ -78,14 +78,35 @@ pub fn compute_bdp_window(rtt: std::time::Duration) -> u64 {
     bdp.max(SEND_WINDOW)
 }
 
+/// BBR initial congestion window (bytes).  quinn's BBR default is
+/// `200 * 1200 ≈ 234 KiB`; we raise it modestly so the exponential STARTUP phase
+/// reaches a high-BDP line rate in a few fewer RTTs (each doubling costs a full
+/// RTT — ~600 ms on a satellite link).  Override with `MFTP_INITIAL_CWND=<bytes>`
+/// (clamped to [64 KiB, 64 MiB]); lower it on thin/constrained links where a
+/// large first-flight burst would cause startup loss.
+const DEFAULT_INITIAL_WINDOW: u64 = 1024 * 1024; // 1 MiB
+
+fn bbr_config() -> quinn::congestion::BbrConfig {
+    let iw = std::env::var("MFTP_INITIAL_CWND")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| v.clamp(64 * 1024, 64 * 1024 * 1024))
+        .unwrap_or(DEFAULT_INITIAL_WINDOW);
+    let mut cfg = quinn::congestion::BbrConfig::default();
+    cfg.initial_window(iw);
+    cfg
+}
+
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(quinn::VarInt::from_u32(MAX_IDLE_TIMEOUT_MS).into()));
     // BBR congestion control: measures bandwidth and RTT directly rather than
     // inferring congestion from packet loss (CUBIC default).  This avoids the
     // sawtooth throughput pattern that CUBIC exhibits at high latency and makes
-    // better use of the pipe on satellite / intercontinental links.
-    t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // better use of the pipe on satellite / intercontinental links.  Initial
+    // window raised above quinn's ~234 KiB default to shorten STARTUP on
+    // high-BDP links (see DEFAULT_INITIAL_WINDOW).
+    t.congestion_controller_factory(Arc::new(bbr_config()));
     // Start at 1350 B instead of the quinn default of 1200 B.  MTU discovery
     // is already enabled by default and will probe higher; raising the floor
     // skips the lowest portion of the probe range on most real-world paths
