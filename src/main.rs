@@ -134,6 +134,15 @@ enum Command {
         /// Mutually exclusive with --download.
         #[arg(long, conflicts_with = "download")]
         no_download: bool,
+        /// Expected SHA-256 (hex) of the cross-platform binary downloaded from
+        /// GitHub releases. When set, the download must match exactly or the
+        /// transfer aborts before anything runs on the remote. This is the only
+        /// check that defends against a compromised release — supply the hash
+        /// from a trusted source (e.g. the published `<asset>.sha256`). Without
+        /// it, the download is still checked against the release's own checksum
+        /// file and the computed hash is printed for manual comparison.
+        #[arg(long, value_name = "HEX")]
+        remote_binary_sha256: Option<String>,
         /// Transfer directories recursively.
         ///
         /// Required when the source is a directory; silently accepted (no-op) when
@@ -196,6 +205,7 @@ async fn main() -> Result<()> {
             no_download,
             recursive,
             preserve,
+            remote_binary_sha256,
         } => {
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
             let forced_transport = match cli.transport {
@@ -251,8 +261,16 @@ async fn main() -> Result<()> {
                 _ => mftp::ssh::DownloadPolicy::Ask,
             };
             if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
-                mftp::ssh::send_via_ssh(file, dest, config, remote_mftp, port, download_policy)
-                    .await
+                mftp::ssh::send_via_ssh(
+                    file,
+                    dest,
+                    config,
+                    remote_mftp,
+                    port,
+                    download_policy,
+                    remote_binary_sha256,
+                )
+                .await
             } else {
                 let addr = destination
                     .parse()

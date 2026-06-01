@@ -54,4 +54,12 @@ jobs:
           BIN=target/${{ matrix.target }}/release/mftp
           [[ "${{ matrix.os }}" == windows* ]] && BIN="${BIN}.exe"
           cp "$BIN" "${{ matrix.asset }}"
-          gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset }}"
+          # Publish a per-asset SHA-256 alongside the binary so `mftp send` can
+          # verify cross-platform downloads (see download_remote_binary).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${{ matrix.asset }}" "${{ matrix.asset }}.sha256"

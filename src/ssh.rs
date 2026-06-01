@@ -14,6 +14,14 @@
 //! binary version instant (the remote already has it; stdin is drained to
 //! `/dev/null`).  Only the first transfer — or after a version upgrade — pays
 //! the copy cost.
+//!
+//! When the remote OS/arch differs from the local machine, mftp can instead
+//! download the matching release binary from GitHub and pipe *that*.  Such
+//! downloads are integrity-checked before they ever run on the remote: against
+//! an explicit `--remote-binary-sha256` pin if given (the only defence against a
+//! compromised release), otherwise against the release's own published
+//! `<asset>.sha256`, with the computed digest always printed.  See
+//! [`download_remote_binary`].
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -171,11 +179,26 @@ fn download_url(platform: &RemotePlatform) -> String {
     )
 }
 
-/// Download the mftp binary for `platform` from GitHub releases.
+/// Download the mftp binary for `platform` from GitHub releases and verify its
+/// integrity before it is handed to the remote for execution.
+///
+/// Verification has three layers, strongest first:
+/// 1. If `pinned_sha256` is `Some`, the download must match it exactly or this
+///    fails.  This is the only layer that defends against a compromised release
+///    (the user supplies the expected hash out-of-band, e.g. from the release
+///    notes over a trusted channel).
+/// 2. The matching `<asset>.sha256` file is fetched from the same release and
+///    compared.  This catches transport/CDN corruption and truncated downloads.
+///    A *missing* checksum file (older releases) is a soft warning, not fatal.
+/// 3. The computed SHA-256 is always printed so the user can compare it against
+///    the published release artifacts after the fact.
 ///
 /// `reqwest` follows GitHub's 302 redirect to the CDN automatically.
 /// Returns the raw binary bytes.
-async fn download_remote_binary(platform: &RemotePlatform) -> Result<Vec<u8>> {
+async fn download_remote_binary(
+    platform: &RemotePlatform,
+    pinned_sha256: Option<&str>,
+) -> Result<Vec<u8>> {
     let url = download_url(platform);
     tracing::debug!("downloading remote binary from {url}");
     eprintln!(
@@ -198,9 +221,87 @@ async fn download_remote_binary(platform: &RemotePlatform) -> Result<Vec<u8>> {
         );
     }
 
-    let bytes = resp.bytes().await.context("reading download body")?;
-    eprintln!("[mftp] downloaded {} KiB", bytes.len() / 1024);
-    Ok(bytes.to_vec())
+    let bytes = resp
+        .bytes()
+        .await
+        .context("reading download body")?
+        .to_vec();
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let digest_hex = hex::encode(digest);
+    eprintln!(
+        "[mftp] downloaded {} KiB — sha256 {}",
+        bytes.len() / 1024,
+        digest_hex
+    );
+
+    // Layer 1: explicit user-supplied pin (strongest).
+    if let Some(pin) = pinned_sha256 {
+        let pin = pin.trim().trim_start_matches("0x");
+        if !pin.eq_ignore_ascii_case(&digest_hex) {
+            bail!(
+                "downloaded binary sha256 {digest_hex} does not match \
+                 --remote-binary-sha256 {pin}; refusing to run it on the remote"
+            );
+        }
+        eprintln!("[mftp] verified against --remote-binary-sha256 pin");
+        return Ok(bytes);
+    }
+
+    // Layer 2: the published per-asset checksum from the same release.
+    match fetch_published_sha256(&url).await {
+        Ok(Some(expected)) => {
+            if !expected.eq_ignore_ascii_case(&digest_hex) {
+                bail!(
+                    "downloaded binary sha256 {digest_hex} does not match the \
+                     published checksum {expected} ({url}.sha256) — the download \
+                     may be corrupt or tampered with; refusing to run it"
+                );
+            }
+            eprintln!("[mftp] verified against published {url}.sha256 checksum");
+        }
+        Ok(None) => {
+            eprintln!(
+                "[mftp] warning: no published .sha256 checksum found for this \
+                 release; integrity rests on TLS only. Compare the sha256 above \
+                 against the release page, or pass --remote-binary-sha256 to pin it."
+            );
+        }
+        Err(e) => {
+            eprintln!("[mftp] warning: could not fetch published checksum: {e:#}; integrity rests on TLS only");
+        }
+    }
+
+    Ok(bytes)
+}
+
+/// Fetch and parse the `<binary_url>.sha256` artifact from the release.
+///
+/// Returns `Ok(Some(hex))` when present, `Ok(None)` on a 404 (release predates
+/// checksum publishing), or `Err` on a transport failure.  The file follows
+/// `sha256sum`/`shasum -a 256` output: `<hex>␠␠<filename>`.
+async fn fetch_published_sha256(binary_url: &str) -> Result<Option<String>> {
+    let url = format!("{binary_url}.sha256");
+    let resp = reqwest::get(&url).await.context("fetch .sha256")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        bail!("checksum download returned HTTP {}", resp.status());
+    }
+    let body = resp.text().await.context("read .sha256 body")?;
+    let hex = parse_sha256_line(&body)
+        .with_context(|| format!("malformed checksum file at {url}: {body:?}"))?;
+    Ok(Some(hex))
+}
+
+/// Extract the 64-hex-char digest from a `sha256sum`/`shasum -a 256` line of the
+/// form `<hex>␠␠<filename>`.  Returns `None` if the first token is not a valid
+/// SHA-256 hex digest.
+fn parse_sha256_line(body: &str) -> Option<String> {
+    body.split_whitespace()
+        .next()
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|h| h.to_owned())
 }
 
 /// Pipe `binary` to the remote over SSH stdin and run it as a server.
@@ -395,6 +496,7 @@ pub async fn send_via_ssh(
     remote_mftp: Option<String>,
     remote_port: Option<u16>,
     download_policy: DownloadPolicy,
+    binary_sha256: Option<String>,
 ) -> Result<()> {
     // Fast path: SFTP forced — skip remote server launch entirely and go
     // straight to parallel SFTP over port 22.
@@ -443,7 +545,7 @@ pub async fn send_via_ssh(
 
                 if should_download {
                     let rp = remote_platform.as_ref().unwrap();
-                    match download_remote_binary(rp).await {
+                    match download_remote_binary(rp, binary_sha256.as_deref()).await {
                         Ok(binary) => {
                             eprintln!("[mftp] piping downloaded binary to remote ({remote_desc})…");
                             match pipe_binary_to_remote(&dest, &binary, rp, remote_port).await {
@@ -744,13 +846,37 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        download_url, local_platform, parse_remote_platform_output, platform_matches, shell_quote,
-        RemotePlatform,
+        download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
+        platform_matches, shell_quote, RemotePlatform,
     };
 
     #[test]
     fn shell_quote_plain() {
         assert_eq!(shell_quote("/tmp/out"), "'/tmp/out'");
+    }
+
+    #[test]
+    fn sha256_line_parsed() {
+        let h = "a".repeat(64);
+        // `sha256sum` style: hex, two spaces, filename.
+        assert_eq!(
+            parse_sha256_line(&format!("{h}  mftp-linux-x86_64")),
+            Some(h.clone())
+        );
+        // `shasum`/BSD style with a single space is also tolerated.
+        assert_eq!(parse_sha256_line(&format!("{h} file")), Some(h.clone()));
+        // bare digest with trailing newline.
+        assert_eq!(parse_sha256_line(&format!("{h}\n")), Some(h));
+    }
+
+    #[test]
+    fn sha256_line_rejects_malformed() {
+        assert_eq!(parse_sha256_line(""), None);
+        assert_eq!(parse_sha256_line("not-a-hash  file"), None);
+        // Wrong length (63 chars).
+        assert_eq!(parse_sha256_line(&"a".repeat(63)), None);
+        // Non-hex character in an otherwise 64-char token.
+        assert_eq!(parse_sha256_line(&format!("{}g  f", "a".repeat(63))), None);
     }
 
     #[test]
