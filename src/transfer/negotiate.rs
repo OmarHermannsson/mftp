@@ -411,7 +411,7 @@ mod tests {
             );
             // Stagger timestamps so duration is meaningful.
             s.timestamp = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis((400 - i * 100) as u64))
+                .checked_sub(std::time::Duration::from_millis(400 - i * 100))
                 .unwrap_or_else(std::time::Instant::now);
             samples.push(s);
         }
@@ -438,7 +438,7 @@ mod tests {
         for i in 0..5u64 {
             let mut s = make_sample(5_000_000 + i * 1_000, 1, 0);
             s.timestamp = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis((400 - i * 100) as u64))
+                .checked_sub(std::time::Duration::from_millis(400 - i * 100))
                 .unwrap_or_else(std::time::Instant::now);
             samples.push(s);
         }

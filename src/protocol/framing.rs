@@ -17,6 +17,11 @@ use crate::protocol::messages::{ChunkData, FecChunkData};
 
 /// Hard cap for chunk data frames (one compressed chunk payload).
 const MAX_DATA_FRAME_SIZE: u32 = 128 * 1024 * 1024; // 128 MiB
+/// Maximum shards in a single FEC stripe.  `reed-solomon-erasure`'s galois_8
+/// field supports at most 256 total shards (data + parity), so any wire-supplied
+/// `shard_count` above this is malformed.  Bounding it also stops the metadata
+/// allocations in `recv_fec_chunk_data` from overflowing a 32-bit `usize`.
+const MAX_FEC_SHARDS: usize = 256;
 /// Tight cap for control frames (NegotiateRequest/Response, TransferManifest,
 /// SenderMessage, ReceiverMessage).  Prevents a malicious peer from forcing a
 /// large heap allocation before deserialization even begins.
@@ -230,6 +235,15 @@ where
     let shard_index_in_stripe = u16::from_le_bytes(hdr[65..67].try_into().unwrap());
     let is_parity = hdr[67] != 0;
     let shard_count = u32::from_le_bytes(hdr[68..72].try_into().unwrap()) as usize;
+
+    // Reject implausible shard counts before they reach the allocations below.
+    // Reed-Solomon (galois_8) tops out at 256 total shards, so a single stripe's
+    // shard_count can never legitimately exceed that.  Without this guard a
+    // crafted value would make `shard_count * 4` / `shard_count * 5` wrap on a
+    // 32-bit `usize`, yielding undersized buffers and a subsequent read overrun.
+    if shard_count > MAX_FEC_SHARDS {
+        bail!("FEC chunk frame: implausible shard_count {shard_count} (limit {MAX_FEC_SHARDS})");
+    }
 
     // Read shard_lengths (4 bytes each).
     let mut lengths_buf = vec![0u8; shard_count * 4];

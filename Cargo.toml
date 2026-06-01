@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.108"
+version = "0.1.109"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -97,3 +97,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+# Trap on integer overflow rather than silently wrapping.  This is a transfer
+# tool parsing attacker-influenced sizes/counts off the wire; a panic on a
+# wrapped length is far safer than a wraparound feeding an undersized buffer.
+# The arithmetic cost is negligible next to the network and crypto work.
+overflow-checks = true

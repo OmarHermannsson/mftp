@@ -1937,6 +1937,10 @@ const MAX_STREAMS: usize = 1024;
 /// Limits memory usage and prevents degenerate manifests.
 const MAX_DIR_ENTRIES: usize = 500_000;
 
+/// Maximum total Reed-Solomon shards (data + parity) in a stripe.  The galois_8
+/// field caps this at 256; the manifest validator rejects anything larger.
+const MAX_FEC_TOTAL_SHARDS: usize = 256;
+
 fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<()> {
     if m.file_name.is_empty() {
         bail!("manifest: file_name is empty");
@@ -1984,6 +1988,26 @@ fn validate_manifest(m: &crate::protocol::messages::TransferManifest) -> Result<
             "manifest: num_streams {} out of allowed range [1, {MAX_STREAMS}]",
             m.num_streams
         );
+    }
+    if let Some(ref fec) = m.fec {
+        // Reed-Solomon (galois_8) requires data_shards ≥ 1, parity_shards ≥ 1,
+        // and data + parity ≤ 256.  Reject out-of-range values from a malicious
+        // manifest up front with a clear error instead of letting them surface
+        // deep inside stripe-buffer allocation or RS init.
+        if fec.data_shards == 0 || fec.parity_shards == 0 {
+            bail!(
+                "manifest: FEC data_shards/parity_shards must be ≥ 1 \
+                 (got {}:{})",
+                fec.data_shards,
+                fec.parity_shards
+            );
+        }
+        if fec.data_shards + fec.parity_shards > MAX_FEC_TOTAL_SHARDS {
+            bail!(
+                "manifest: FEC data_shards + parity_shards = {} exceeds limit {MAX_FEC_TOTAL_SHARDS}",
+                fec.data_shards + fec.parity_shards
+            );
+        }
     }
     Ok(())
 }
@@ -2128,5 +2152,59 @@ fn resolve_relative_path(base_dir: &str, target: &str) -> String {
         ".".to_string()
     } else {
         parts.join("/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::messages::{Compression, FecParams};
+
+    fn base_manifest() -> TransferManifest {
+        TransferManifest {
+            transfer_id: [0u8; 16],
+            file_name: "file.bin".to_string(),
+            file_size: 10,
+            chunk_size: MIN_CHUNK_SIZE,
+            total_chunks: 10u64.div_ceil(MIN_CHUNK_SIZE as u64),
+            num_streams: 1,
+            compression: Compression::None,
+            fec: None,
+        }
+    }
+
+    #[test]
+    fn manifest_accepts_valid_fec() {
+        let mut m = base_manifest();
+        m.fec = Some(FecParams {
+            data_shards: 8,
+            parity_shards: 2,
+        });
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn manifest_rejects_zero_fec_shards() {
+        let mut m = base_manifest();
+        m.fec = Some(FecParams {
+            data_shards: 0,
+            parity_shards: 2,
+        });
+        assert!(validate_manifest(&m).is_err());
+        m.fec = Some(FecParams {
+            data_shards: 4,
+            parity_shards: 0,
+        });
+        assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_oversized_fec_stripe() {
+        let mut m = base_manifest();
+        m.fec = Some(FecParams {
+            data_shards: 200,
+            parity_shards: 100,
+        });
+        assert!(validate_manifest(&m).is_err());
     }
 }
