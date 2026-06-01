@@ -141,6 +141,13 @@ Options:
       --no-download        When the remote platform differs from local, skip the
                            download attempt and fall back to SFTP immediately.
                            Mutually exclusive with --download.
+      --remote-binary-sha256 <HEX>
+                           Expected SHA-256 of the cross-platform binary fetched
+                           from GitHub releases. When set, the download must match
+                           exactly or the transfer aborts before anything runs on
+                           the remote. Without it, the download is still checked
+                           against the release's published <asset>.sha256 and the
+                           computed hash is printed for manual comparison.
   -v, --verbose            Increase log verbosity (-v / -vv / -vvv).
 ```
 
@@ -162,7 +169,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.101
+mftp 0.1.119
 ```
 
 ---
@@ -273,6 +280,8 @@ File on disk
 
 Control stream (after all data streams finish):
   Sender ──► SenderMessage::Complete { file_hash }
+  Receiver ──► ReceiverMessage::Retransmit { chunks }   (v5, if any chunk missing)
+       └─ Sender re-sends those chunks as ChunkData here, then Complete again
   Receiver ──► ReceiverMessage::Complete { file_hash }  (after full-file verify)
 ```
 
@@ -291,6 +300,7 @@ Control stream (1 per connection):
   Receiver → ReceiverMessage::Ready { received_bits, total_chunks }  ← resume bitvector
   ...data streams transfer...
   Sender → SenderMessage::Complete  { file_hash }
+  Receiver → ReceiverMessage::Retransmit { chunks }  (v5; repair over this stream)
   Receiver → ReceiverMessage::Complete { file_hash }
 
 Data streams (N per connection):
@@ -307,7 +317,7 @@ Data streams (N per connection):
 
 Enable with `--fec DATA:PARITY` on the sender (e.g. `--fec 8:2`). The receiver accepts both FEC and non-FEC transfers on the same port — the `TransferManifest` advertises whether FEC is active.
 
-**Stripe layout**: chunks are grouped into stripes of `DATA` shards. Each stripe is RS-encoded to produce `PARITY` additional shards. All `DATA + PARITY` shards are sent independently across the parallel streams. The receiver can reconstruct any stripe as long as it receives at least `DATA` out of the `DATA + PARITY` shards — tolerating up to `PARITY` lost shards per stripe without retransmission.
+**Stripe layout**: chunks are grouped into stripes of `DATA` shards. Each stripe is RS-encoded to produce `PARITY` additional shards. All `DATA + PARITY` shards are sent independently across the parallel streams. The receiver can reconstruct any stripe as long as it receives at least `DATA` out of the `DATA + PARITY` shards — tolerating up to `PARITY` lost shards per stripe without retransmission. A stripe that loses *more* than `PARITY` shards is recovered by in-band incremental repair (see below) rather than aborting the transfer.
 
 **Ordering**: compression happens before FEC encoding, so parity shards are computed over (and are the same size as) compressed data shards. FEC is automatically disabled when the transport falls back to TCP, since TCP guarantees delivery.
 
@@ -326,9 +336,13 @@ Note that this always pays the compression CPU cost before deciding whether to u
 
 ### Integrity
 
-- **Per-chunk**: BLAKE3 of the raw (pre-compression) chunk bytes. The sender computes the hash before compressing, embeds it in the frame, and the receiver decompresses then re-computes and compares before writing to disk.
-- **Full-file**: BLAKE3 of the concatenated per-chunk hashes — `blake3(hash[0] || hash[1] || … || hash[N-1])`. The sender sends this in `SenderMessage::Complete`; the receiver verifies it after all chunks land. A mismatch fails the transfer.
+- **Per-chunk**: BLAKE3 of the raw (pre-compression) chunk bytes. The sender computes the hash before compressing, embeds it in the frame, and the receiver decompresses then re-computes and compares before writing to disk. A chunk that fails this check is dropped (left unmarked) rather than aborting — see *Incremental repair* below.
+- **Full-file**: BLAKE3 of the concatenated per-chunk hashes — `blake3(hash[0] || hash[1] || … || hash[N-1])`. The sender sends this in `SenderMessage::Complete`; the receiver verifies it after all chunks land. A mismatch fails the transfer (and deletes the resume file so the next run starts clean).
 - **SFTP fallback**: integrity is provided by SSH's channel MAC (HMAC-SHA2-256). Per-chunk and full-file hashing are not available on this path since there is no mftp receiver process.
+
+### Incremental repair
+
+When chunks are missing at the completion checkpoint — a dropped corrupt chunk, or an FEC stripe that received too few shards to reconstruct — a protocol-v5 receiver requests exactly those chunks back via `ReceiverMessage::Retransmit`. The sender re-reads them and re-sends them as plain `ChunkData` on the **existing control stream**, so the connection (and its warmed congestion window) stays alive instead of being torn down. This is single-file only and bounded (`MAX_REPAIR_ROUNDS`); if repair is unavailable or exhausted the transfer fails and a resumed rerun re-fetches only the missing chunks.
 
 ### Resume
 
@@ -473,6 +487,8 @@ MACOSX_DEPLOYMENT_TARGET = "12.0"
 - Adaptive stream scaling on by default; pin with `-n N` (dynamic scale-up/scale-down, protocol v2)
 - SFTP fallback when the remote host cannot reach the mftp receive port
 - FEC resume support: resumes skip already-received parity stripes
+- In-band incremental repair (protocol v5): missing/corrupt chunks and unreconstructable FEC stripes are re-requested over the control stream instead of aborting (single-file)
+- Verified self-update: cross-platform binaries downloaded from GitHub releases are checked against `--remote-binary-sha256` or the published `<asset>.sha256` before running on the remote
 - NVMe parallel multi-reader (`--parallel-reads`, advanced/hidden flag)
 - BDP-aware QUIC connection window sizing from measured RTT
 - Adaptive zstd compression level (per-worker EMA of ratio/CPU)
