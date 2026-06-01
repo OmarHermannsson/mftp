@@ -9,6 +9,34 @@ use mftp::protocol::messages::FecParams;
 use mftp::transfer::sender::ForcedTransport;
 use mftp::transfer::{receiver, sender};
 
+/// Shown under `mftp --help`.  Concrete invocations cover the common cases the
+/// flag docs describe abstractly.
+const EXAMPLES: &str = "\
+EXAMPLES:
+  # Send to an already-running receiver (host:port)
+  mftp send bigfile.tar 203.0.113.7:7777
+
+  # SSH mode: mftp launches a one-shot receiver on the remote itself
+  mftp send bigfile.tar user@host:/data/
+
+  # Recursive directory transfer, preserving mode + mtime
+  mftp send -r ./dataset user@host:/data/ --preserve
+
+  # Lossy/satellite link: add Reed-Solomon FEC (8 data : 2 parity shards)
+  mftp send bigfile.tar user@host:/data/ --fec 8:2
+
+  # Pin a fingerprint for unattended/scripted runs (no TOFU prompt)
+  mftp send bigfile.tar 203.0.113.7:7777 --trust <hex-sha256>
+
+  # Run as a receiver listening on all interfaces
+  mftp receive 0.0.0.0:7777 --output-dir /data
+
+EXIT STATUS:
+  0  transfer completed and verified
+  non-zero  any failure (connection, integrity, disk, user abort);
+            safe to retry — interrupted transfers resume automatically.
+";
+
 /// Transport path for `--transport`.
 #[derive(clap::ValueEnum, Clone)]
 enum Transport {
@@ -26,7 +54,8 @@ enum Transport {
 #[command(
     name = "mftp",
     about = "High-throughput file transfer over high-latency links",
-    version
+    version,
+    after_help = EXAMPLES,
 )]
 struct Cli {
     #[command(subcommand)]
@@ -180,6 +209,41 @@ enum Command {
     },
 }
 
+/// Parse a `--fec DATA:PARITY` argument (e.g. `8:2`).
+///
+/// Returns a hard error on malformed or out-of-range input rather than silently
+/// disabling FEC — a user who asked for parity should never unknowingly send
+/// without it.  Bounds match the Reed-Solomon limits enforced on the receiver.
+fn parse_fec(s: &str) -> Result<FecParams> {
+    let (data, parity) = s
+        .split_once(':')
+        .with_context(|| format!("--fec must be DATA:PARITY (e.g. 8:2), got {s:?}"))?;
+    let data_shards: usize = data
+        .trim()
+        .parse()
+        .with_context(|| format!("--fec DATA must be a number, got {data:?}"))?;
+    let parity_shards: usize = parity
+        .trim()
+        .parse()
+        .with_context(|| format!("--fec PARITY must be a number, got {parity:?}"))?;
+    if data_shards < 2 {
+        anyhow::bail!("--fec DATA must be ≥ 2 (got {data_shards})");
+    }
+    if parity_shards < 1 {
+        anyhow::bail!("--fec PARITY must be ≥ 1 (got {parity_shards})");
+    }
+    if data_shards + parity_shards > 256 {
+        anyhow::bail!(
+            "--fec DATA + PARITY must be ≤ 256 (got {})",
+            data_shards + parity_shards
+        );
+    }
+    Ok(FecParams {
+        data_shards,
+        parity_shards,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -214,27 +278,10 @@ async fn main() -> Result<()> {
                 Some(Transport::Sftp) => Some(ForcedTransport::Sftp),
                 None => None,
             };
-            let fec = cli.fec.as_deref().and_then(|s| {
-                let parts: Vec<&str> = s.splitn(2, ':').collect();
-                if parts.len() != 2 {
-                    eprintln!("[mftp] --fec must be DATA:PARITY (e.g. 8:2); ignoring");
-                    return None;
-                }
-                let data = parts[0].parse::<usize>().ok();
-                let parity = parts[1].parse::<usize>().ok();
-                match (data, parity) {
-                    (Some(d), Some(p)) if d >= 2 && p >= 1 => Some(FecParams {
-                        data_shards: d,
-                        parity_shards: p,
-                    }),
-                    _ => {
-                        eprintln!(
-                            "[mftp] --fec: DATA must be ≥ 2 and PARITY must be ≥ 1; ignoring"
-                        );
-                        None
-                    }
-                }
-            });
+            let fec = match cli.fec.as_deref() {
+                Some(s) => Some(parse_fec(s)?),
+                None => None,
+            };
             // Validate -r / directory combination early to give a clear error.
             if file.is_dir() && !recursive {
                 anyhow::bail!(
@@ -285,5 +332,29 @@ async fn main() -> Result<()> {
             receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
         Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fec;
+
+    #[test]
+    fn fec_valid() {
+        let f = parse_fec("8:2").unwrap();
+        assert_eq!(f.data_shards, 8);
+        assert_eq!(f.parity_shards, 2);
+        // surrounding whitespace tolerated
+        assert!(parse_fec(" 4 : 1 ").is_ok());
+    }
+
+    #[test]
+    fn fec_rejects_malformed() {
+        assert!(parse_fec("8").is_err()); // no separator
+        assert!(parse_fec("x:2").is_err()); // non-numeric data
+        assert!(parse_fec("8:y").is_err()); // non-numeric parity
+        assert!(parse_fec("1:2").is_err()); // data < 2
+        assert!(parse_fec("8:0").is_err()); // parity < 1
+        assert!(parse_fec("200:100").is_err()); // sum > 256
     }
 }

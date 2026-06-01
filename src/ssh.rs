@@ -372,7 +372,9 @@ exec "$f" server --output-dir "$d"{port_arg}"#
 ///
 /// Opens `/dev/tty` directly so the prompt works even when stdin is redirected.
 /// Returns `false` in non-interactive contexts where `/dev/tty` is unavailable.
-fn prompt_download(remote_desc: &str) -> bool {
+/// The prompt spells out the platform mismatch that triggered the download and
+/// that the binary will be integrity-checked before it runs on the remote.
+fn prompt_download(local_desc: &str, remote_desc: &str) -> bool {
     use std::io::{BufRead, BufReader, Write};
     let Ok(mut tty) = std::fs::OpenOptions::new()
         .read(true)
@@ -383,7 +385,9 @@ fn prompt_download(remote_desc: &str) -> bool {
     };
     let _ = write!(
         tty,
-        "Download mftp for {remote_desc} from GitHub releases? [y/N]: "
+        "Remote is {remote_desc} but this mftp is built for {local_desc}, so it \
+         can't be reused there.\nDownload the {remote_desc} mftp binary from \
+         GitHub releases (verified by sha256) and run it on the remote? [y/N]: "
     );
     let _ = tty.flush();
     let Ok(tty_r) = std::fs::File::open("/dev/tty") else {
@@ -540,7 +544,7 @@ pub async fn send_via_ssh(
                     && match download_policy {
                         DownloadPolicy::Always => true,
                         DownloadPolicy::Never => false,
-                        DownloadPolicy::Ask => prompt_download(&remote_desc),
+                        DownloadPolicy::Ask => prompt_download(&local_desc, &remote_desc),
                     };
 
                 if should_download {
