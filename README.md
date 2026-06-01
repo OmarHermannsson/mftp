@@ -328,11 +328,12 @@ Enable with `--fec DATA:PARITY` on the sender (e.g. `--fec 8:2`). The receiver a
 mftp compresses each chunk independently with zstd:
 
 1. **Magic-byte check** — if the first 4 bytes match a known compressed format (gzip, zstd, bzip2, zip, 7-zip, xz, jpeg, png, mp4, mkv/webm…), compression is skipped entirely.
-2. **Full-chunk compression** — the chunk is compressed and the result compared to the original size.
-3. **Threshold** — if compression does not achieve at least a 5% reduction, the compressed bytes are discarded and the chunk is sent raw.
-4. **Per-chunk flag** — `ChunkData.compressed` tells the receiver whether to decompress.
+2. **Sample probe** — a 64 KiB leading sample is compressed first; if it doesn't shrink by ≥ 5%, the chunk is sent raw without compressing the rest, so incompressible data not caught by the magic-byte table costs only the sample, not the full chunk.
+3. **Full-chunk compression** — if the sample compresses well, the whole chunk is compressed; a final 5% threshold still applies (only the leading portion may have been compressible), and the compressed bytes are discarded if it isn't met.
+4. **Adaptive level** — a per-worker EMA of the achieved ratio shifts the zstd level between 1 / 3 / 6 to trade CPU for ratio.
+5. **Per-chunk flag** — `ChunkData.compressed` tells the receiver whether to decompress.
 
-Note that this always pays the compression CPU cost before deciding whether to use the result. For files that are already compressed (not caught by the magic-byte table), this is wasted work. `--no-compress` avoids it entirely.
+`--no-compress` skips the whole path.
 
 ### Integrity
 
@@ -493,6 +494,8 @@ MACOSX_DEPLOYMENT_TARGET = "12.0"
 - FEC resume support: resumes skip already-received parity stripes
 - In-band incremental repair (protocol v5): missing/corrupt chunks and unreconstructable FEC stripes are re-requested over the control stream instead of aborting (single-file)
 - Verified self-update: cross-platform binaries downloaded from GitHub releases are checked against `--remote-binary-sha256` or the published `<asset>.sha256` before running on the remote
+- One-RTT QUIC startup (protocol v6): the sender pipelines NegotiateRequest + manifest + DirEntries into a single flight, halving the pre-data control round-trips
+- Tunable congestion ramp / buffers: 1 MiB BBR initial window (`MFTP_INITIAL_CWND`), 64 MiB socket buffers (`MFTP_SOCKET_BUFFER`), opt-in ACK-frequency (`MFTP_ACK_ELICITING_THRESHOLD`)
 - NVMe parallel multi-reader (`--parallel-reads`, advanced/hidden flag)
 - BDP-aware QUIC connection window sizing from measured RTT
 - Adaptive zstd compression level (per-worker EMA of ratio/CPU)
