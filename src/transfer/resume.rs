@@ -87,19 +87,46 @@ impl ResumeState {
 
     /// Load an existing resume file for this transfer, or create fresh state.
     ///
-    /// If the file exists but is corrupt/stale, it is silently discarded and a
-    /// fresh state is returned (the transfer simply restarts from the beginning).
+    /// If the file exists but is corrupt/stale, it is discarded and a fresh
+    /// state is returned (the transfer restarts from the beginning).  Status is
+    /// reported to stderr so the user can see a resume happen at the default log
+    /// level.
+    ///
+    /// # Durability note
+    /// A chunk's resume bit is set after its `pwrite` returns but the data file
+    /// is not fsynced per chunk, so a crash can leave a chunk marked-received
+    /// whose bytes never reached stable storage.  This is safe because the
+    /// whole-file hash check at the end of the transfer will fail on any such
+    /// gap and [`delete`](Self::delete) the resume file, forcing a clean
+    /// re-transfer on the next run rather than silently accepting corruption.
     pub fn load_or_new(dir: &Path, transfer_id: &[u8; 16], total_chunks: u64) -> Self {
+        let name = format!("{}.mftp-resume", hex::encode(transfer_id));
+        let path = dir.join(&name);
+        let existed = path.exists();
         match Self::try_load(dir, transfer_id, total_chunks) {
             Ok(state) => {
                 let n = state.received_chunks().len();
                 if n > 0 {
-                    tracing::info!("resuming transfer: {n}/{total_chunks} chunks already on disk");
+                    eprintln!(
+                        "[mftp] resuming: {n}/{total_chunks} chunks already on disk \
+                         (state: {})",
+                        path.display()
+                    );
                 }
                 state
             }
+            Err(e) if existed => {
+                // A file was present but unusable (corrupt, or from a different
+                // file/size that happens to share this transfer_id) — tell the
+                // user we're discarding it rather than failing silently.
+                eprintln!(
+                    "[mftp] ignoring unusable resume file {} ({e:#}); starting fresh",
+                    path.display()
+                );
+                Self::new(dir, transfer_id, total_chunks)
+            }
             Err(e) => {
-                tracing::debug!("no usable resume file, starting fresh: {e:#}");
+                tracing::debug!("no resume file, starting fresh: {e:#}");
                 Self::new(dir, transfer_id, total_chunks)
             }
         }
