@@ -380,13 +380,32 @@ struct PinnedFingerprintVerifier {
 
 impl PinnedFingerprintVerifier {
     fn new(fp: &str) -> Result<Self> {
-        if fp.len() != 64 || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("invalid fingerprint (expected 64 hex chars): {fp}");
+        let normalized = normalize_fingerprint(fp);
+        if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!(
+                "invalid --trust fingerprint (expected 64 hex chars, got {} usable): {fp:?}",
+                normalized.len()
+            );
         }
         Ok(Self {
-            expected: fp.to_ascii_lowercase(),
+            expected: normalized,
         })
     }
+}
+
+/// Normalize a user-supplied fingerprint for comparison.
+///
+/// Tolerates the shapes people actually paste: surrounding whitespace, a
+/// `sha256:` prefix, and `AA:BB:..`/spaced grouping, and case.  Produces a bare
+/// lowercase hex string.
+fn normalize_fingerprint(fp: &str) -> String {
+    fp.trim()
+        .trim_start_matches("sha256:")
+        .trim_start_matches("SHA256:")
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintVerifier {
@@ -527,6 +546,20 @@ fn prompt_trust() -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn fingerprint_normalization_tolerates_common_shapes() {
+        let canonical = "a".repeat(64);
+        // Already canonical.
+        assert!(PinnedFingerprintVerifier::new(&canonical).is_ok());
+        // Uppercase, surrounding whitespace, sha256: prefix, and colon grouping.
+        let messy = format!("  SHA256:{}  ", "AA:".repeat(32));
+        let v = PinnedFingerprintVerifier::new(&messy).expect("should normalize");
+        assert_eq!(v.expected, canonical);
+        // Still rejects genuinely wrong input.
+        assert!(PinnedFingerprintVerifier::new("deadbeef").is_err());
+        assert!(PinnedFingerprintVerifier::new(&"z".repeat(64)).is_err());
+    }
 
     #[test]
     fn bdp_window_clamps_at_floor_for_low_rtt() {
