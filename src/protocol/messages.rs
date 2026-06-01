@@ -14,7 +14,22 @@ use serde::{Deserialize, Serialize};
 ///   4 — adds `fatal` field to ReceiverMessage::Error so the sender can
 ///       distinguish fatal errors (hash mismatch, disk full) from transient
 ///       stream errors and decide whether to retry or abort.
-pub const PROTOCOL_VERSION: u32 = 4;
+///   5 — adds ReceiverMessage::Retransmit for in-band incremental repair: at
+///       the completion checkpoint the receiver can request missing chunks
+///       (failed hash, or an unreconstructable FEC stripe) over the control
+///       stream instead of aborting, keeping the connection (and its warmed
+///       congestion window) alive. Single-file transfers only.
+pub const PROTOCOL_VERSION: u32 = 5;
+
+/// Maximum number of completion→repair round-trips before the sender/receiver
+/// give up and fall back to abort + resume.  A deterministic sender-side fault
+/// would otherwise retransmit forever.
+pub const MAX_REPAIR_ROUNDS: u32 = 5;
+
+/// Maximum chunks the receiver will request in a single `Retransmit` (keeps the
+/// message within the control-frame limit and bounds repair effort — a larger
+/// gap is cheaper to recover with a fresh resumed transfer).
+pub const MAX_REPAIR_CHUNKS_PER_ROUND: usize = 100_000;
 
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,4 +246,12 @@ pub enum ReceiverMessage {
     /// adjustment.  It may differ from `target_count` if the receiver could
     /// not open/accept all requested streams.
     AdjustStreamsAck { accepted_count: u8 },
+    /// Sent in response to `SenderMessage::Complete` (protocol v5+) when chunks
+    /// are still missing from disk — a failed hash check or an FEC stripe that
+    /// could not be reconstructed.  The sender re-reads each listed chunk and
+    /// re-sends it as a plain `ChunkData` frame on the control stream, then
+    /// re-sends `Complete`; the receiver re-checks and either repeats or
+    /// finalizes.  Bounded by `MAX_REPAIR_ROUNDS` / `MAX_REPAIR_CHUNKS_PER_ROUND`
+    /// on both ends.  Single-file transfers only.
+    Retransmit { chunks: Vec<u64> },
 }

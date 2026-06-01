@@ -33,6 +33,46 @@ use crate::protocol::{
 use crate::transfer::hash::ChunkHasher;
 use crate::transfer::resume::{ResumeState, RESUME_SAVE_BATCH};
 
+/// Test-only fault injection for exercising the incremental-repair path.
+///
+/// Lets a test mark chunk indices to be dropped exactly once on first receipt,
+/// simulating corruption so the completion-checkpoint repair flow runs against
+/// real sender/receiver machinery.  Hidden from docs; prod cost is a single
+/// relaxed atomic load per chunk (the set is never enabled outside tests).
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static DROP_ONCE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+    fn set() -> &'static Mutex<HashSet<u64>> {
+        DROP_ONCE.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// Mark chunk indices to drop once each on next receipt (test only).
+    pub fn drop_chunks_once(indices: &[u64]) {
+        set().lock().unwrap().extend(indices.iter().copied());
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear all pending drops and disable the hook.
+    pub fn clear() {
+        set().lock().unwrap().clear();
+        ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    /// Returns true (and consumes the mark) if `idx` should be dropped.
+    pub(crate) fn should_drop(idx: u64) -> bool {
+        if !ENABLED.load(Ordering::Relaxed) {
+            return false;
+        }
+        set().lock().unwrap().remove(&idx)
+    }
+}
+
 /// Shared receiver-side metrics updated by data workers and read by the
 /// progress reporter every 100 ms.
 struct ReceiverStats {
@@ -596,7 +636,14 @@ fn write_fec_chunk(
     let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
     if let Some(expected) = expected_hash {
         if computed != expected {
-            bail!("FEC chunk {chunk_index}: hash mismatch");
+            // Drop the corrupt shard rather than aborting the transfer; the
+            // chunk stays unmarked in resume and is recovered at the completion
+            // checkpoint (in-band repair on v5, or a resumed rerun otherwise).
+            warn!(
+                chunk = chunk_index,
+                "FEC data shard hash mismatch; dropping (will be repaired or re-fetched)"
+            );
+            return Ok(0);
         }
     }
 
@@ -849,9 +896,10 @@ where
     let (ack_req_tx, ack_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
 
     // Ctrl-reader channels: ctrl_reader_task forwards SenderMessage variants
-    // received during the data phase to the main loop and finish_transfer.
+    // received during the data phase to the main loop.  It returns the control
+    // recv half + Complete hash via its JoinHandle so the repair handshake can
+    // read further frames after the data phase.
     let (scale_req_tx, mut scale_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
-    let (complete_tx, complete_rx) = tokio::sync::oneshot::channel::<[u8; 32]>();
 
     // Shared metrics: in-flight task count and peak disk latency.
     let stats = ReceiverStats::new();
@@ -966,7 +1014,7 @@ where
     // Ctrl-reader task: reads SenderMessage from the control stream during the
     // data phase, forwarding AdjustStreams requests and the final Complete.
     // Owns ctrl_recv so framing reads are never cancelled mid-frame.
-    tokio::spawn(ctrl_reader_task(ctrl_recv, scale_req_tx, complete_tx));
+    let ctrl_reader = tokio::spawn(ctrl_reader_task(ctrl_recv, scale_req_tx));
 
     // Main transfer loop: drain worker tasks and handle dynamic stream scaling.
     let mut task_err: Option<anyhow::Error> = None;
@@ -1052,62 +1100,13 @@ where
     // writes have completed and the block device has had time to drain them.
     deferred_dontneed.flush();
 
-    // FEC: after all stream workers finish, decide whether every chunk actually
-    // landed on disk.  We consult the resume bitvector (the authoritative record
-    // of what was written) rather than the leftover stripe map — that map also
-    // holds harmless remnants of late-arriving parity shards for stripes whose
-    // data was already reconstructed and written.  Any genuinely missing chunk
-    // means a stripe could not be recovered; report it with an attributable
-    // error naming the affected stripes instead of leaving it to surface later
-    // as a generic whole-file hash mismatch.
-    let fec_incomplete: Option<anyhow::Error> = if fec_stripe_bufs.is_some() {
-        let missing = pt.resume.lock().unwrap().missing_chunks();
-        if missing.is_empty() {
-            None
-        } else {
-            let data_shards = manifest
-                .fec
-                .as_ref()
-                .map(|f| f.data_shards)
-                .unwrap_or(1)
-                .max(1) as u64;
-            let mut stripes: Vec<u64> = missing.iter().map(|c| c / data_shards).collect();
-            stripes.dedup();
-            let shown: Vec<String> = stripes
-                .iter()
-                .take(8)
-                .map(|s| {
-                    let first = s * data_shards;
-                    format!("#{s} (chunks {}..{})", first, first + data_shards)
-                })
-                .collect();
-            let more = stripes.len().saturating_sub(shown.len());
-            let suffix = if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            };
-            Some(anyhow!(
-                "FEC reconstruction failed: {} chunk(s) across {} stripe(s) could \
-                 not be recovered: {}{}. The link likely dropped more shards than \
-                 the parity level tolerates — retry, or raise --fec parity.",
-                missing.len(),
-                stripes.len(),
-                shown.join(", "),
-                suffix
-            ))
-        }
-    } else {
-        None
-    };
-
     // Reporter closes when all workers finish (progress_tx fully dropped).
     // Wait for it to return ctrl_send.
     let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
-    // Surface a worker error first (it is the more proximate cause), then any
-    // FEC reconstruction shortfall.
-    if let Some(e) = task_err.or(fec_incomplete) {
+    // A hard worker failure (panic, disk error, malformed frame) is fatal and
+    // not repairable — surface it immediately.
+    if let Some(e) = task_err {
         let _ = framing::send_message(
             &mut ctrl_send,
             &ReceiverMessage::Error {
@@ -1119,15 +1118,87 @@ where
         bail!("{e}");
     }
 
-    // Wait for the sender's Complete message (forwarded by ctrl_reader_task).
-    let expected_hash = complete_rx
-        .await
-        .context("sender closed without sending Complete")?;
+    // Reclaim the control recv half + the sender's first Complete hash.
+    let (mut ctrl_recv, hash_opt) = ctrl_reader.await.context("ctrl reader task panicked")?;
+    let mut expected_hash =
+        hash_opt.ok_or_else(|| anyhow!("sender closed without sending Complete"))?;
+
+    // ── Incremental repair (protocol v5) ──────────────────────────────────────
+    //
+    // Some chunks may be missing from disk: a dropped corrupt chunk, or an FEC
+    // stripe that could not be reconstructed.  Rather than fail outright, ask
+    // the sender (over the still-open control stream) to re-send exactly those
+    // chunks as plain ChunkData, keeping the connection and its warmed
+    // congestion window alive.  Single-file only; bounded by MAX_REPAIR_ROUNDS.
+    let repairable = pt.layout.is_none() && neg_req.protocol_version >= 5 && pt.out_file.is_some();
+    let mut repaired = false;
+    let mut round = 0u32;
+    // `repairable` is fixed, but each iteration either breaks or writes repaired
+    // chunks into resume state and is bounded by MAX_REPAIR_ROUNDS — not infinite.
+    #[allow(clippy::while_immutable_condition)]
+    while repairable {
+        let missing = pt.resume.lock().unwrap().missing_chunks();
+        if missing.is_empty() {
+            break;
+        }
+        round += 1;
+        if round > crate::protocol::messages::MAX_REPAIR_ROUNDS
+            || missing.len() > crate::protocol::messages::MAX_REPAIR_CHUNKS_PER_ROUND
+        {
+            // Too much missing or too many rounds — stop and let the explicit
+            // missing-chunk error below fire (resume recovers on rerun).
+            break;
+        }
+        info!(round, count = missing.len(), "requesting in-band repair");
+        pt.pb
+            .set_message(format!("repairing {} chunk(s)…", missing.len()));
+        let want = missing.len();
+        framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Retransmit { chunks: missing },
+        )
+        .await?;
+
+        // Read exactly that many ChunkData repair frames, then the sender's
+        // follow-up Complete (which re-syncs us for the next round).
+        let out_file = pt.out_file.clone().expect("repairable implies single-file");
+        for _ in 0..want {
+            let cd = framing::recv_chunk_data(&mut ctrl_recv)
+                .await?
+                .ok_or_else(|| anyhow!("sender closed control stream mid-repair"))?;
+            write_repair_chunk(&cd, &out_file, &pt.resume, manifest.chunk_size, &pt.pb).await?;
+        }
+        repaired = true;
+        match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await? {
+            Some(SenderMessage::Complete { file_hash }) => expected_hash = file_hash,
+            _ => bail!("sender closed control stream without re-Complete after repair"),
+        }
+    }
+
+    // If chunks are still missing (repair unavailable, exhausted, or too large),
+    // report an attributable error before the generic whole-file hash check.
+    let still_missing = pt.resume.lock().unwrap().missing_chunks();
+    if !still_missing.is_empty() {
+        let e = missing_chunks_error(&still_missing, &manifest);
+        let _ = framing::send_message(
+            &mut ctrl_send,
+            &ReceiverMessage::Error {
+                message: e.to_string(),
+                fatal: true,
+            },
+        )
+        .await;
+        bail!("{e}");
+    }
+
+    // After any repair, per-chunk hashes fed to the ChunkHasher are incomplete
+    // (repaired chunks bypassed it), so force a from-disk rehash by passing None.
+    let hasher = if repaired { None } else { pt.hasher };
 
     finish_transfer(
         &mut ctrl_send,
         pt.resume,
-        pt.hasher,
+        hasher,
         pt.layout,
         &output_dir,
         &manifest,
@@ -1136,6 +1207,92 @@ where
     .await?;
 
     Ok(ctrl_send)
+}
+
+/// Build an attributable error naming the chunks (and, for FEC, stripes) that
+/// never landed on disk after the transfer and any repair attempts.
+fn missing_chunks_error(missing: &[u64], manifest: &TransferManifest) -> anyhow::Error {
+    if let Some(fec) = &manifest.fec {
+        let data_shards = fec.data_shards.max(1) as u64;
+        let mut stripes: Vec<u64> = missing.iter().map(|c| c / data_shards).collect();
+        stripes.dedup();
+        let shown: Vec<String> = stripes
+            .iter()
+            .take(8)
+            .map(|s| {
+                let first = s * data_shards;
+                format!("#{s} (chunks {}..{})", first, first + data_shards)
+            })
+            .collect();
+        let more = stripes.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        anyhow!(
+            "FEC reconstruction failed: {} chunk(s) across {} stripe(s) could not \
+             be recovered even after repair: {}{}. The link likely dropped more \
+             shards than the parity level tolerates — retry, or raise --fec parity.",
+            missing.len(),
+            stripes.len(),
+            shown.join(", "),
+            suffix
+        )
+    } else {
+        let shown: Vec<String> = missing.iter().take(8).map(|c| format!("#{c}")).collect();
+        let more = missing.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        anyhow!(
+            "{} chunk(s) missing after transfer: {}{} — retry; a resumed rerun \
+             will re-fetch only the missing chunks.",
+            missing.len(),
+            shown.join(", "),
+            suffix
+        )
+    }
+}
+
+/// Verify, write, and mark a single chunk received during the v5 repair phase
+/// (single-file transfers only).
+async fn write_repair_chunk(
+    cd: &ChunkData,
+    out_file: &Arc<std::fs::File>,
+    resume: &Arc<Mutex<ResumeState>>,
+    chunk_size: usize,
+    pb: &ProgressBar,
+) -> Result<()> {
+    let data = if cd.compressed {
+        compress::decompress_chunk(&cd.payload, chunk_size)
+            .with_context(|| format!("decompress repair chunk {}", cd.chunk_index))?
+    } else {
+        cd.payload.clone()
+    };
+    let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
+    if computed != cd.chunk_hash {
+        bail!("repair chunk {} failed hash verification", cd.chunk_index);
+    }
+    let offset = cd.chunk_index * chunk_size as u64;
+    let f = Arc::clone(out_file);
+    let n = data.len() as u64;
+    tokio::task::spawn_blocking(move || crate::fs_ext::write_all_at(&f, &data, offset))
+        .await
+        .context("repair write task panicked")?
+        .with_context(|| format!("write repair chunk {} at offset {offset}", cd.chunk_index))?;
+    // Persist the resume bit immediately — repair sets are small, so the
+    // per-chunk fsync cost is negligible and it keeps the bitvector accurate.
+    let snap = {
+        let mut r = resume.lock().unwrap();
+        r.mark_received(cd.chunk_index);
+        r.snapshot()?
+    };
+    snap.write_to_disk()?;
+    pb.inc(n);
+    Ok(())
 }
 
 // ── Directory layout helper ───────────────────────────────────────────────────
@@ -1519,17 +1676,18 @@ where
 /// Reads `SenderMessage` variants from the control stream during the data
 /// transfer phase (concurrently with data workers).
 ///
-/// Forwards `AdjustStreams` requests to the main loop via `scale_tx` and the
-/// final `Complete` file hash via `complete_tx`.  Exits when the control
-/// stream is closed or `complete_tx` is sent.
+/// Forwards `AdjustStreams` requests to the main loop via `scale_tx`.  Returns
+/// the recv half of the control stream together with the `Complete` file hash
+/// (or `None` if the stream closed first) so the caller can drive the v5
+/// incremental-repair handshake — which reads `ChunkData` repair frames and
+/// further `Complete` messages on the same stream — after the data phase.
 async fn ctrl_reader_task<R>(
     mut ctrl_recv: R,
     scale_tx: tokio::sync::mpsc::Sender<u8>,
-    complete_tx: tokio::sync::oneshot::Sender<[u8; 32]>,
-) where
+) -> (R, Option<[u8; 32]>)
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    let mut complete_tx = Some(complete_tx);
     loop {
         match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await {
             Ok(Some(SenderMessage::AdjustStreams { target_count })) => {
@@ -1538,14 +1696,12 @@ async fn ctrl_reader_task<R>(
                 }
             }
             Ok(Some(SenderMessage::Complete { file_hash })) => {
-                if let Some(tx) = complete_tx.take() {
-                    let _ = tx.send(file_hash);
-                }
-                break;
+                return (ctrl_recv, Some(file_hash));
             }
-            _ => break, // EOF or error — main loop will surface via complete_rx timeout
+            _ => break, // EOF or error
         }
     }
+    (ctrl_recv, None)
 }
 
 async fn finish_transfer<S>(
@@ -1691,6 +1847,14 @@ where
         }
 
         let chunk_index = chunk.chunk_index;
+
+        // Test-only fault injection: simulate a corrupt/lost chunk by dropping it
+        // (leaving it unmarked) exactly once, exercising the repair path.
+        if test_hooks::should_drop(chunk_index) {
+            warn!(chunk = chunk_index, "test hook: dropping chunk");
+            continue;
+        }
+
         let chunk_size = manifest.chunk_size;
         let out_file = out_file.as_ref().map(Arc::clone);
         let layout = layout.as_ref().map(Arc::clone);
@@ -1725,12 +1889,20 @@ where
 
             let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
             if computed != chunk.chunk_hash {
+                // Drop the corrupt chunk and keep the worker (and its stream)
+                // alive instead of aborting the whole transfer.  The chunk stays
+                // unmarked in the resume bitvector, so the completion checkpoint
+                // either repairs it in-band (protocol v5) or fails the whole-file
+                // hash and lets a resumed rerun re-fetch it.
                 stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
-                bail!(
-                    "chunk {chunk_index} hash mismatch: got {}, expected {}",
-                    hex::encode(computed),
-                    hex::encode(chunk.chunk_hash)
+                drop(write_permit);
+                warn!(
+                    chunk = chunk_index,
+                    got = %hex::encode(computed),
+                    expected = %hex::encode(chunk.chunk_hash),
+                    "chunk hash mismatch; dropping (will be repaired or re-fetched)"
                 );
+                return Ok(());
             }
 
             let write_start = std::time::Instant::now();
@@ -1885,6 +2057,18 @@ where
                     fcd.shard_index_in_stripe
                 );
             }
+        }
+
+        // Test-only fault injection: drop a marked data shard, simulating loss.
+        // Dropping more than `parity_shards` per stripe makes it unreconstructable,
+        // exercising the FEC repair path.
+        if !fcd.is_parity && test_hooks::should_drop(fcd.chunk_index) {
+            warn!(
+                chunk = fcd.chunk_index,
+                "test hook: dropping FEC data shard"
+            );
+            shard_count += 1;
+            continue;
         }
 
         let stripe_index = fcd.stripe_index;

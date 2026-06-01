@@ -724,7 +724,9 @@ where
     }
 
     let pb_for_reader = pb.clone();
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    // mpsc (not oneshot): the reader forwards Retransmit requests non-terminally
+    // and keeps reading until a terminal Complete/Error arrives.
+    let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel::<ReceiverMessage>(4);
     // B2: channel for the reader task to signal a fatal receiver error to the
     // main loop without waiting for workers to drain first.
     let (early_abort_tx, mut early_abort_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -930,8 +932,15 @@ where
                     {
                         let _ = early_abort_tx.try_send(message.clone());
                     }
-                    let _ = completion_tx.send(other);
-                    return;
+                    // Retransmit is non-terminal: forward it and keep reading so
+                    // the next Complete/Error after the repair round is seen too.
+                    let terminal = !matches!(other, ReceiverMessage::Retransmit { .. });
+                    if completion_tx.send(other).await.is_err() {
+                        return; // main loop dropped the receiver
+                    }
+                    if terminal {
+                        return;
+                    }
                 }
                 _ => return, // EOF or error — completion_rx surfaces this
             }
@@ -1171,18 +1180,24 @@ where
     };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    // B3: bound the wait so the sender doesn't hang indefinitely if the
-    // receiver died without sending Complete/Error (e.g. all streams were
-    // stopped and the receiver exited before we got here).
-    let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for receiver acknowledgement after all data was sent"
-            )
-            .context(AckTimeoutAfterComplete)
-        })?
-        .context("receiver closed without completing")?;
+    // Completion handshake: service any v5 incremental-repair requests over the
+    // control stream (single-file only), bounded by MAX_REPAIR_ROUNDS, until the
+    // receiver returns a terminal Complete/Error.  B3: bounded by ack_timeout so
+    // the sender never hangs if the receiver died without acknowledging.
+    let msg = await_completion_with_repair(
+        ctrl_send,
+        &mut completion_rx,
+        file,
+        file_size,
+        chunk_size,
+        transfer_id,
+        &compression,
+        file_hash,
+        rtt,
+        entries.is_none(),
+        &pb,
+    )
+    .await?;
     reader.await.ok();
     pb.finish_and_clear();
     print_completion(
@@ -1195,6 +1210,118 @@ where
     )?;
 
     Ok(())
+}
+
+// ── Incremental repair (protocol v5) ───────────────────────────────────────────
+
+/// Drive the completion handshake after all data has been sent, servicing any
+/// `Retransmit` repair requests over the control stream until the receiver
+/// returns a terminal `Complete`/`Error` (or the repair bounds are exceeded).
+///
+/// The caller must have already sent the first `SenderMessage::Complete`.  On a
+/// `Retransmit`, the listed chunks are re-read from `file`, re-sent as plain
+/// `ChunkData` on `ctrl_send`, and a fresh `Complete` is sent — all on the
+/// existing connection, so the warmed congestion window survives.  Repair is
+/// single-file only; `repairable` is false for directory transfers.
+#[allow(clippy::too_many_arguments)]
+async fn await_completion_with_repair<CW>(
+    ctrl_send: &mut CW,
+    completion_rx: &mut tokio::sync::mpsc::Receiver<ReceiverMessage>,
+    file: &Path,
+    file_size: u64,
+    chunk_size: usize,
+    transfer_id: [u8; 16],
+    compression: &Compression,
+    file_hash: [u8; 32],
+    rtt: Duration,
+    repairable: bool,
+    pb: &ProgressBar,
+) -> Result<ReceiverMessage>
+where
+    CW: AsyncWrite + Unpin,
+{
+    let mut round = 0u32;
+    loop {
+        let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out waiting for receiver acknowledgement after all data was sent"
+                )
+                .context(AckTimeoutAfterComplete)
+            })?
+            .context("receiver closed without completing")?;
+
+        let chunks = match msg {
+            ReceiverMessage::Retransmit { chunks } => chunks,
+            terminal => return Ok(terminal),
+        };
+
+        if !repairable {
+            bail!(
+                "receiver requested in-band repair, which is not supported for directory transfers"
+            );
+        }
+        round += 1;
+        if round > crate::protocol::messages::MAX_REPAIR_ROUNDS {
+            bail!(
+                "exceeded {} repair rounds; receiver still missing {} chunk(s) — aborting (resume will recover)",
+                crate::protocol::messages::MAX_REPAIR_ROUNDS,
+                chunks.len()
+            );
+        }
+        if chunks.len() > crate::protocol::messages::MAX_REPAIR_CHUNKS_PER_ROUND {
+            bail!(
+                "receiver requested {} chunks for repair, over the {} limit — aborting (resume will recover)",
+                chunks.len(),
+                crate::protocol::messages::MAX_REPAIR_CHUNKS_PER_ROUND
+            );
+        }
+
+        tracing::info!(round, count = chunks.len(), "servicing repair request");
+        pb.set_message(format!("repairing {} chunk(s)…", chunks.len()));
+
+        // Re-read + recompress the requested chunks off the async runtime.
+        let built = {
+            let file = file.to_owned();
+            let compression = compression.clone();
+            tokio::task::spawn_blocking(move || -> Result<Vec<ChunkData>> {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(&file)
+                    .with_context(|| format!("open {} for repair", file.display()))?;
+                let mut out = Vec::with_capacity(chunks.len());
+                for idx in chunks {
+                    let offset = idx * chunk_size as u64;
+                    if offset >= file_size {
+                        bail!("repair: chunk {idx} is out of range for this file");
+                    }
+                    let len = ((file_size - offset) as usize).min(chunk_size);
+                    let mut raw = vec![0u8; len];
+                    f.seek(SeekFrom::Start(offset))
+                        .with_context(|| format!("seek to repair chunk {idx}"))?;
+                    f.read_exact(&mut raw)
+                        .with_context(|| format!("read repair chunk {idx}"))?;
+                    let chunk_hash = *blake3::hash(&raw).as_bytes();
+                    let (payload, compressed) = maybe_compress(raw, &compression)?;
+                    out.push(ChunkData {
+                        transfer_id,
+                        chunk_index: idx,
+                        chunk_hash,
+                        compressed,
+                        payload,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+            .context("repair read task panicked")??
+        };
+
+        for cd in &built {
+            framing::send_chunk_data(ctrl_send, cd).await?;
+        }
+        framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
+    }
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -2257,7 +2384,9 @@ where
     let pb = make_progress_bar(&file_name, file_size, num_streams, chunk_mib, None);
     let transfer_start = Instant::now();
     let pb_for_reader = pb.clone();
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<ReceiverMessage>();
+    // mpsc (not oneshot): the reader forwards Retransmit requests non-terminally
+    // and keeps reading until a terminal Complete/Error arrives.
+    let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel::<ReceiverMessage>(4);
     let max_in_flight = num_streams as u32 * 4;
     let reader = tokio::spawn(async move {
         let mut flash_until: Option<std::time::Instant> = None;
@@ -2313,8 +2442,15 @@ where
                     }
                 }
                 Ok(Some(other)) => {
-                    let _ = completion_tx.send(other);
-                    return;
+                    // Retransmit is non-terminal: forward it and keep reading so
+                    // the next Complete/Error after the repair round is seen too.
+                    let terminal = !matches!(other, ReceiverMessage::Retransmit { .. });
+                    if completion_tx.send(other).await.is_err() {
+                        return;
+                    }
+                    if terminal {
+                        return;
+                    }
                 }
                 _ => return,
             }
@@ -2402,17 +2538,23 @@ where
     };
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
-    // B3: bound the wait so the sender doesn't hang if the receiver died
-    // without sending Complete/Error.
-    let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx)
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for receiver acknowledgement after all data was sent"
-            )
-            .context(AckTimeoutAfterComplete)
-        })?
-        .context("receiver closed without completing")?;
+    // Completion handshake with v5 incremental repair.  FEC transfers are always
+    // single-file, so repair is always available here; a stripe the receiver
+    // could not reconstruct comes back as a Retransmit and is repaired in-band.
+    let msg = await_completion_with_repair(
+        ctrl_send,
+        &mut completion_rx,
+        file,
+        file_size,
+        chunk_size,
+        transfer_id,
+        &compression,
+        file_hash,
+        rtt,
+        true,
+        &pb,
+    )
+    .await?;
     reader.await.ok();
     pb.finish_and_clear();
     print_completion(
