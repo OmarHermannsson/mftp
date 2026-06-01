@@ -548,8 +548,16 @@ impl StripeBuffer {
         Ok(())
     }
 
-    /// True when we have enough shards (real data + parity + synthetic zeros) to
-    /// reconstruct all real file chunks in this stripe.
+    /// True when we have enough shards to reconstruct all real file chunks.
+    ///
+    /// Reed-Solomon needs `data_shards` shards *present* to reconstruct.  For the
+    /// last (partial) stripe `process_stripe` injects the `data_shards −
+    /// real_data_count` trailing positions as synthetic zero shards (they are
+    /// known, not transmitted), so the number that still has to arrive over the
+    /// wire is `data_shards − (data_shards − real_data_count) = real_data_count`.
+    /// Hence the threshold below is `real_data_count`, not `data_shards` — the
+    /// two are equal for full stripes, so this is *correct*, not a premature
+    /// trigger.  Keep it in sync with the synthetic-shard fill in `process_stripe`.
     fn is_ready(&self) -> bool {
         self.received_data + self.received_parity >= self.real_data_count
     }
@@ -1044,25 +1052,62 @@ where
     // writes have completed and the block device has had time to drain them.
     deferred_dontneed.flush();
 
-    // FEC: after all stream workers finish, any remaining stripes in the map
-    // did not receive enough shards for reconstruction — warn and let the
-    // file-hash check in finish_transfer surface the error.
-    if let Some(ref bufs_arc) = fec_stripe_bufs {
-        let remaining = bufs_arc.lock().unwrap();
-        if !remaining.is_empty() {
-            warn!(
-                "{} FEC stripe(s) incomplete after transfer: received too few shards \
-                 to reconstruct — those chunks will fail the file hash check",
-                remaining.len()
-            );
+    // FEC: after all stream workers finish, decide whether every chunk actually
+    // landed on disk.  We consult the resume bitvector (the authoritative record
+    // of what was written) rather than the leftover stripe map — that map also
+    // holds harmless remnants of late-arriving parity shards for stripes whose
+    // data was already reconstructed and written.  Any genuinely missing chunk
+    // means a stripe could not be recovered; report it with an attributable
+    // error naming the affected stripes instead of leaving it to surface later
+    // as a generic whole-file hash mismatch.
+    let fec_incomplete: Option<anyhow::Error> = if fec_stripe_bufs.is_some() {
+        let missing = pt.resume.lock().unwrap().missing_chunks();
+        if missing.is_empty() {
+            None
+        } else {
+            let data_shards = manifest
+                .fec
+                .as_ref()
+                .map(|f| f.data_shards)
+                .unwrap_or(1)
+                .max(1) as u64;
+            let mut stripes: Vec<u64> = missing.iter().map(|c| c / data_shards).collect();
+            stripes.dedup();
+            let shown: Vec<String> = stripes
+                .iter()
+                .take(8)
+                .map(|s| {
+                    let first = s * data_shards;
+                    format!("#{s} (chunks {}..{})", first, first + data_shards)
+                })
+                .collect();
+            let more = stripes.len().saturating_sub(shown.len());
+            let suffix = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            Some(anyhow!(
+                "FEC reconstruction failed: {} chunk(s) across {} stripe(s) could \
+                 not be recovered: {}{}. The link likely dropped more shards than \
+                 the parity level tolerates — retry, or raise --fec parity.",
+                missing.len(),
+                stripes.len(),
+                shown.join(", "),
+                suffix
+            ))
         }
-    }
+    } else {
+        None
+    };
 
     // Reporter closes when all workers finish (progress_tx fully dropped).
     // Wait for it to return ctrl_send.
     let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
-    if let Some(e) = task_err {
+    // Surface a worker error first (it is the more proximate cause), then any
+    // FEC reconstruction shortfall.
+    if let Some(e) = task_err.or(fec_incomplete) {
         let _ = framing::send_message(
             &mut ctrl_send,
             &ReceiverMessage::Error {
