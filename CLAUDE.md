@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-`mftp` is a CLI tool for transferring large files over the internet with maximum throughput, especially over high-latency links (satellite, intercontinental). It uses QUIC with parallel streams, adaptive zstd compression, per-chunk SHA-256 integrity, resumable transfers, and optional Reed-Solomon FEC.
+`mftp` is a CLI tool for transferring large files over the internet with maximum throughput, especially over high-latency links (satellite, intercontinental). It uses QUIC with parallel streams, adaptive zstd compression, per-chunk BLAKE3 integrity (SHA-256 is kept only for TLS cert/SSH-key fingerprints), resumable transfers, and optional Reed-Solomon FEC.
 
 ## Commands
 
@@ -80,9 +80,9 @@ File on disk
       read chunk (mmap/pread)
       → detect compression → zstd encode (if beneficial)
       → FEC encode (if --fec): adds parity shards to stripe
-      → SHA-256 hash payload
+      → BLAKE3 hash payload
       → framing::send_message(ChunkData) on stream
-  → Control stream: wait for ReceiverMessage::Complete or ::Retransmit
+  → Control stream: wait for ReceiverMessage::Complete or ::Error
 ```
 
 ### Data Flow (Receive)
@@ -93,11 +93,11 @@ QUIC connection accepted
   → ResumeState::load_or_new → reply ReceiverMessage::Ready(have_chunks)
   → N tasks each reading one data stream:
       framing::recv_message(ChunkData)
-      → verify SHA-256
+      → verify BLAKE3 chunk hash
       → FEC decode (accumulate stripe; reconstruct on shard threshold)
       → decompress if flagged
       → pwrite chunk to output file at correct offset
-      → ResumeState::mark_received + save()
+      → ResumeState::mark_received (state flushed in batches; see below)
   → all chunks received → verify whole-file SHA-256
   → send ReceiverMessage::Complete
   → ResumeState::delete()
@@ -107,9 +107,9 @@ QUIC connection accepted
 
 - **QUIC streams, not connections**: all chunks share one QUIC connection; each of the N parallel sender tasks holds one long-lived bidirectional stream. This avoids per-connection handshake overhead while providing independent flow control per stream (no TCP head-of-line blocking).
 - **Compression before FEC**: FEC operates on compressed bytes, so parity shards are smaller.
-- **Per-chunk hashing**: SHA-256 is computed over the wire payload (post-compression, post-FEC-encoding for data shards), enabling chunk-level retry without re-hashing the whole file.
+- **Per-chunk hashing**: BLAKE3 is computed over the decompressed chunk bytes and verified on the receiver before the chunk is written. There is no in-band per-chunk retransmit — a hash mismatch aborts the transfer, and the missing chunk is re-fetched on the next run via the resume bit-vector.
 - **Socket buffers**: both endpoints set `SO_SNDBUF`/`SO_RCVBUF` to at least 32 MiB (covers ~250 ms RTT at 1 Gbps BDP) via socket2 before binding.
-- **Resume granularity**: the bit-vector in `ResumeState` is flushed to disk after each chunk, so a crash loses at most one in-progress chunk.
+- **Resume granularity**: the bit-vector in `ResumeState` is flushed to disk every `RESUME_SAVE_BATCH` (64) chunks, not per chunk, to keep fsync off the hot path; a crash therefore loses at most ~64 in-flight chunks. The fsync runs outside the state mutex (snapshot-then-write). Correctness does not depend on the resume file being current: the end-of-transfer whole-file hash catches any gap and deletes the resume file, forcing a clean re-transfer.
 
 ### TLS / Authentication
 

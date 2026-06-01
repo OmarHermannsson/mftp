@@ -6,8 +6,12 @@
 //!      (which may include chunks already received, enabling resume).
 //!   3. Remaining chunks are dispatched across N parallel QUIC data streams via
 //!      a work-stealing queue in `chunk::ChunkQueue`.
-//!   4. After all chunks are sent, sender waits for `ReceiverMessage::Complete`
-//!      or handles `ReceiverMessage::Retransmit`.
+//!   4. After all chunks are sent, the sender waits for
+//!      `ReceiverMessage::Complete` (success) or `ReceiverMessage::Error`.
+//!      There is no in-band per-chunk retransmit: a chunk that fails its hash
+//!      check aborts the transfer with an error. Because the failed chunk was
+//!      never marked received, re-running the transfer re-fetches only the
+//!      missing chunks via the resume state.
 //!
 //! # Receive flow
 //!   1. `Receiver` accepts a QUIC connection, reads `TransferManifest`.
