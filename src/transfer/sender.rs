@@ -277,6 +277,48 @@ async fn send_quic_with_conn(
 
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
 
+    // RTT is available from the QUIC handshake immediately (no round-trip), so
+    // we compute parameters and build the manifest up front and pipeline the
+    // whole opening flight — NegotiateRequest + TransferManifest + DirEntries —
+    // without blocking on NegotiateResponse in between.  This collapses startup
+    // from two control round-trips to one (the receiver's NegotiateResponse +
+    // Ready come back as a single reply flight).  Framing is ordered,
+    // self-delimiting frames, so the wire bytes are identical to the old
+    // two-await ordering and any v3+ receiver reads them unchanged.
+    let rtt = conn.stats().path.rtt;
+    let compression = if config.compress {
+        Compression::Zstd {
+            level: config.compress_level,
+        }
+    } else {
+        Compression::None
+    };
+    let file_name = file
+        .file_name()
+        .context("file has no name")?
+        .to_string_lossy()
+        .into_owned();
+    // Propose stream count from sender_cores alone; the receiver's real core
+    // count (NegotiateResponse) only refines adaptive stream scaling later, and
+    // the receiver accepts exactly manifest.num_streams data streams.
+    let params = compute_params(
+        rtt,
+        file_size,
+        sender_cores,
+        sender_cores,
+        config.streams,
+        config.chunk_size,
+    );
+    let manifest = build_manifest(
+        file_name,
+        file_size,
+        params.chunk_size,
+        params.streams,
+        compression,
+        config.fec.clone(),
+        dir_entries.as_deref(),
+    );
+
     framing::send_message(
         &mut ctrl_send,
         &NegotiateRequest {
@@ -285,8 +327,18 @@ async fn send_quic_with_conn(
         },
     )
     .await?;
+    framing::send_message(&mut ctrl_send, &manifest).await?;
+    framing::send_message(
+        &mut ctrl_send,
+        &DirEntries {
+            entries: dir_entries.clone(),
+        },
+    )
+    .await?;
+
+    // Await the receiver's reply flight; Ready follows on the same stream and is
+    // read inside run_transfer/run_transfer_fec.
     let neg_resp: NegotiateResponse = framing::recv_message_required(&mut ctrl_recv).await?;
-    let rtt = conn.stats().path.rtt;
 
     // Expand the connection-level send window for high-BDP links (fast WAN /
     // satellite).  The static 512 MiB default is sufficient up to ~600 ms at
@@ -306,18 +358,17 @@ async fn send_quic_with_conn(
     let conn_for_workers = conn.clone();
     let peer_version = neg_resp.protocol_version;
 
-    if let Some(fec_params) = config.fec.clone() {
+    if config.fec.is_some() {
         run_transfer_fec(
             &file,
             file_size,
-            peer_version,
             &mut ctrl_send,
             ctrl_recv,
             rtt,
             sender_cores,
             neg_resp.cpu_cores,
             &config,
-            fec_params,
+            manifest,
             move |rx, transfer_id| {
                 let conn = conn_for_workers.clone();
                 async move {
@@ -343,6 +394,7 @@ async fn send_quic_with_conn(
             peer_version,
             &config,
             Some(conn.clone()),
+            Some(manifest),
             move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
                 let conn = conn_for_workers.clone();
                 async move {
@@ -466,6 +518,7 @@ async fn send_tcp(
         peer_version,
         &config,
         None, // no quinn connection on TCP path
+        None, // TCP can't pipeline: it measures RTT via the negotiate round-trip
         move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
             let fp = trusted_fp.clone();
             async move {
@@ -525,6 +578,44 @@ async fn tcp_stream_worker(
 
 // ── Shared transfer body ──────────────────────────────────────────────────────
 
+/// Build the `TransferManifest` from negotiated parameters and source info.
+///
+/// The `transfer_id` is derived deterministically from the source (name, size,
+/// chunk_size, and — for directories — the tree shape) so re-sending the same
+/// source resumes an interrupted transfer.  Including `chunk_size` ensures stale
+/// resume state from a prior negotiation with different parameters is never reused.
+fn build_manifest(
+    file_name: String,
+    file_size: u64,
+    chunk_size: usize,
+    num_streams: usize,
+    compression: Compression,
+    fec: Option<FecParams>,
+    entries: Option<&[FileEntry]>,
+) -> TransferManifest {
+    let transfer_id: [u8; 16] = if let Some(ents) = entries {
+        directory_transfer_id(&file_name, file_size, chunk_size, ents)
+    } else {
+        let mut h = blake3::Hasher::new();
+        h.update(file_name.as_bytes());
+        h.update(&file_size.to_le_bytes());
+        h.update(&(chunk_size as u64).to_le_bytes());
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        id
+    };
+    TransferManifest {
+        transfer_id,
+        file_name,
+        file_size,
+        chunk_size,
+        total_chunks: file_size.div_ceil(chunk_size as u64),
+        num_streams,
+        compression,
+        fec,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Core transfer logic shared by both the QUIC and TCP paths.
 ///
@@ -547,6 +638,11 @@ async fn run_transfer<CW, CR, F, Fut>(
     peer_protocol_version: u32,
     config: &SendConfig,
     qconn: Option<quinn::Connection>,
+    // `Some` when the caller already pipelined NegotiateRequest + manifest +
+    // DirEntries into one flight (QUIC fast path); `None` to build and send the
+    // manifest here (TCP path, which can't compute params before the RTT-probing
+    // round-trip).
+    prebuilt: Option<TransferManifest>,
     spawn_worker: F,
 ) -> Result<()>
 where
@@ -570,12 +666,6 @@ where
         );
     }
 
-    let file_name = file
-        .file_name()
-        .context("file has no name")?
-        .to_string_lossy()
-        .into_owned();
-
     let compression = if config.compress {
         Compression::Zstd {
             level: config.compress_level,
@@ -584,63 +674,60 @@ where
         Compression::None
     };
 
-    let params = compute_params(
-        rtt,
-        file_size,
-        sender_cores,
-        receiver_cores,
-        config.streams,
-        config.chunk_size,
-    );
+    let manifest = match prebuilt {
+        // QUIC fast path: the manifest (and DirEntries) were already sent by the
+        // caller in the same flight as NegotiateRequest — one fewer round-trip.
+        Some(m) => m,
+        // TCP path: now that the NegotiateResponse round-trip has measured RTT
+        // and revealed receiver_cores, compute params, build, and send.
+        None => {
+            let file_name = file
+                .file_name()
+                .context("file has no name")?
+                .to_string_lossy()
+                .into_owned();
+            let params = compute_params(
+                rtt,
+                file_size,
+                sender_cores,
+                receiver_cores,
+                config.streams,
+                config.chunk_size,
+            );
+            let m = build_manifest(
+                file_name,
+                file_size,
+                params.chunk_size,
+                params.streams,
+                compression.clone(),
+                None,
+                entries,
+            );
+            framing::send_message(ctrl_send, &m).await?;
+            // v3+: DirEntries immediately after the manifest (strict ordering).
+            if peer_protocol_version >= 3 {
+                let dir_entries_msg = DirEntries {
+                    entries: entries.map(|e| e.to_vec()),
+                };
+                framing::send_message(ctrl_send, &dir_entries_msg).await?;
+            }
+            m
+        }
+    };
+
+    let chunk_size = manifest.chunk_size;
+    let transfer_id = manifest.transfer_id;
+    let total_chunks = manifest.total_chunks;
+    let num_streams = manifest.num_streams;
+    let file_name = manifest.file_name.clone();
     tracing::info!(
-        streams = params.streams,
-        chunk_mib = params.chunk_size / (1024 * 1024),
+        streams = num_streams,
+        chunk_mib = chunk_size / (1024 * 1024),
         rtt_ms = rtt.as_secs_f64() * 1000.0,
         sender_cores,
         receiver_cores,
         "negotiated transfer parameters"
     );
-
-    let chunk_size = params.chunk_size;
-
-    // Derive a deterministic transfer_id so that re-sending the same source
-    // (same name, size, chunk_size, and tree shape for directories) resumes
-    // an interrupted transfer.  Including chunk_size ensures stale resume state
-    // from a prior negotiation with different parameters is never reused.
-    let transfer_id: [u8; 16] = if let Some(ents) = entries {
-        directory_transfer_id(&file_name, file_size, chunk_size, ents)
-    } else {
-        let mut h = blake3::Hasher::new();
-        h.update(file_name.as_bytes());
-        h.update(&file_size.to_le_bytes());
-        h.update(&(chunk_size as u64).to_le_bytes());
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
-        id
-    };
-    let total_chunks = file_size.div_ceil(chunk_size as u64);
-    let num_streams = params.streams;
-
-    let manifest = TransferManifest {
-        transfer_id,
-        file_name: file_name.clone(),
-        file_size,
-        chunk_size,
-        total_chunks,
-        num_streams,
-        compression: compression.clone(),
-        fec: None,
-    };
-    framing::send_message(ctrl_send, &manifest).await?;
-
-    // v3+: send DirEntries immediately after the manifest.
-    // The receiver reads this before replying with Ready, so ordering is strict.
-    if peer_protocol_version >= 3 {
-        let dir_entries_msg = DirEntries {
-            entries: entries.map(|e| e.to_vec()),
-        };
-        framing::send_message(ctrl_send, &dir_entries_msg).await?;
-    }
 
     // Receive Ready — receiver sends a packed bitvector of already-on-disk chunks.
     // Uses the data-frame limit (128 MiB) because the bitvector can be large for
@@ -2259,14 +2346,15 @@ fn stripe_encode_chunks(
 async fn run_transfer_fec<CW, CR, F, Fut>(
     file: &Path,
     file_size: u64,
-    peer_protocol_version: u32,
     ctrl_send: &mut CW,
     mut ctrl_recv: CR,
     rtt: Duration,
     sender_cores: u32,
     receiver_cores: u32,
     config: &SendConfig,
-    fec_params: FecParams,
+    // Already pipelined by the QUIC caller (FEC is QUIC-only) in the same flight
+    // as NegotiateRequest + DirEntries — saving a control round-trip.
+    manifest: TransferManifest,
     spawn_worker: F,
 ) -> Result<()>
 where
@@ -2275,11 +2363,10 @@ where
     F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16]) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let file_name = file
-        .file_name()
-        .context("file has no name")?
-        .to_string_lossy()
-        .into_owned();
+    let fec_params = manifest
+        .fec
+        .clone()
+        .expect("run_transfer_fec requires FEC params in the manifest");
     let compression = if config.compress {
         Compression::Zstd {
             level: config.compress_level,
@@ -2288,17 +2375,14 @@ where
         Compression::None
     };
 
-    let params = compute_params(
-        rtt,
-        file_size,
-        sender_cores,
-        receiver_cores,
-        config.streams,
-        config.chunk_size,
-    );
+    let chunk_size = manifest.chunk_size;
+    let transfer_id = manifest.transfer_id;
+    let total_chunks = manifest.total_chunks;
+    let num_streams = manifest.num_streams;
+    let file_name = manifest.file_name.clone();
     tracing::info!(
-        streams = params.streams,
-        chunk_mib = params.chunk_size / (1024 * 1024),
+        streams = num_streams,
+        chunk_mib = chunk_size / (1024 * 1024),
         fec_data = fec_params.data_shards,
         fec_parity = fec_params.parity_shards,
         rtt_ms = rtt.as_secs_f64() * 1000.0,
@@ -2307,37 +2391,7 @@ where
         "negotiated transfer parameters"
     );
 
-    let chunk_size = params.chunk_size;
-    let transfer_id: [u8; 16] = {
-        let mut h = blake3::Hasher::new();
-        h.update(file_name.as_bytes());
-        h.update(&file_size.to_le_bytes());
-        h.update(&(chunk_size as u64).to_le_bytes());
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&h.finalize().as_bytes()[..16]);
-        id
-    };
-    let total_chunks = file_size.div_ceil(chunk_size as u64);
-    let num_streams = params.streams;
-
     let compress_stats = new_compression_stats();
-
-    let manifest = TransferManifest {
-        transfer_id,
-        file_name: file_name.clone(),
-        file_size,
-        chunk_size,
-        total_chunks,
-        num_streams,
-        compression: compression.clone(),
-        fec: Some(fec_params.clone()),
-    };
-    framing::send_message(ctrl_send, &manifest).await?;
-
-    // v3+: always send DirEntries (entries: None for single-file FEC transfers).
-    if peer_protocol_version >= 3 {
-        framing::send_message(ctrl_send, &DirEntries { entries: None }).await?;
-    }
 
     // Receive Ready — check which stripes the receiver already has complete.
     let ready: ReceiverMessage = framing::recv_data_message(&mut ctrl_recv)

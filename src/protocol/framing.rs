@@ -369,3 +369,50 @@ where
         .with_context(|| format!("read frame body ({len} bytes)"))?;
     Ok(Some(bincode::deserialize(&buf)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::messages::{Compression, DirEntries, NegotiateRequest, TransferManifest};
+
+    /// The Phase-1 (v6) startup optimization rests on this invariant: the sender
+    /// may write NegotiateRequest + TransferManifest + DirEntries back-to-back
+    /// without awaiting between them, and a receiver reading them in its fixed
+    /// order still decodes each correctly — because frames are ordered and
+    /// self-delimiting. This test encodes that directly over an in-memory duplex.
+    #[tokio::test]
+    async fn pipelined_opening_flight_decodes_in_order() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+
+        let neg = NegotiateRequest {
+            cpu_cores: 8,
+            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+        };
+        let manifest = TransferManifest {
+            transfer_id: [7u8; 16],
+            file_name: "f.bin".to_string(),
+            file_size: 123_456,
+            chunk_size: 4 * 1024 * 1024,
+            total_chunks: 1,
+            num_streams: 6,
+            compression: Compression::None,
+            fec: None,
+        };
+        let dir = DirEntries { entries: None };
+
+        // Sender side: three frames written with no intervening reads/awaits.
+        send_message(&mut a, &neg).await.unwrap();
+        send_message(&mut a, &manifest).await.unwrap();
+        send_message(&mut a, &dir).await.unwrap();
+
+        // Receiver side: reads in the run_receive order.
+        let got_neg: NegotiateRequest = recv_message_required(&mut b).await.unwrap();
+        assert_eq!(got_neg.cpu_cores, 8);
+        let got_manifest: TransferManifest = recv_data_message(&mut b).await.unwrap().unwrap();
+        assert_eq!(got_manifest.file_name, "f.bin");
+        assert_eq!(got_manifest.num_streams, 6);
+        assert_eq!(got_manifest.chunk_size, 4 * 1024 * 1024);
+        let got_dir: DirEntries = recv_data_message(&mut b).await.unwrap().unwrap();
+        assert!(got_dir.entries.is_none());
+    }
+}

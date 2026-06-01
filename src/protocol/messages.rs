@@ -19,7 +19,15 @@ use serde::{Deserialize, Serialize};
 ///       (failed hash, or an unreconstructable FEC stripe) over the control
 ///       stream instead of aborting, keeping the connection (and its warmed
 ///       congestion window) alive. Single-file transfers only.
-pub const PROTOCOL_VERSION: u32 = 5;
+///   6 — QUIC sender pipelines NegotiateRequest + TransferManifest + DirEntries
+///       into a single opening flight instead of waiting for NegotiateResponse
+///       between them, collapsing startup from two control round-trips to one.
+///       This is wire-byte-identical to v5 for any v3+ receiver (framing is
+///       ordered, self-delimiting frames, and the receiver reads them in the
+///       same order regardless of sender await timing), so it requires no
+///       receiver change; the bump is a marker and documents that the QUIC fast
+///       path assumes a peer ≥ v3 (directory transfers already require it).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Maximum number of completion→repair round-trips before the sender/receiver
 /// give up and fall back to abort + resume.  A deterministic sender-side fault
