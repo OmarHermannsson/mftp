@@ -129,6 +129,21 @@ fn sender_transport() -> Arc<quinn::TransportConfig> {
     // Send PING frames so the receiver's idle timer doesn't expire while it is
     // hashing the received file.
     t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    // Optional ACK-frequency tuning: request the peer (the data receiver) to
+    // coalesce ACKs, cutting reverse-path ACK traffic on asymmetric/high-RTT
+    // links. Off by default — over-batching can blunt BBR's bandwidth/RTT
+    // sampling — so enable and tune only with measurement, via
+    // MFTP_ACK_ELICITING_THRESHOLD=<n> (ACK after n ack-eliciting packets).
+    if let Some(n) = std::env::var("MFTP_ACK_ELICITING_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if let Ok(threshold) = quinn::VarInt::from_u64(n.clamp(1, 1000)) {
+            let mut af = quinn::AckFrequencyConfig::default();
+            af.ack_eliciting_threshold(threshold);
+            t.ack_frequency_config(Some(af));
+        }
+    }
     Arc::new(t)
 }
 
@@ -229,17 +244,12 @@ fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
         .context("UDP socket creation failed")?;
 
     // Best-effort: some kernels cap at /proc/sys/net/core/rmem_max.
-    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!(
-            "could not set SO_RCVBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    let buf = super::socket_buffer_size();
+    if let Err(e) = socket.set_recv_buffer_size(buf) {
+        tracing::warn!("could not set SO_RCVBUF to {buf}: {e}");
     }
-    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!(
-            "could not set SO_SNDBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    if let Err(e) = socket.set_send_buffer_size(buf) {
+        tracing::warn!("could not set SO_SNDBUF to {buf}: {e}");
     }
 
     socket.set_nonblocking(true)?;

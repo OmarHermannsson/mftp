@@ -75,17 +75,12 @@ pub async fn bind_tcp(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .context("TCP socket creation failed")?;
     socket.set_reuse_address(true).context("SO_REUSEADDR")?;
-    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!(
-            "could not set SO_RCVBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    let buf = super::socket_buffer_size();
+    if let Err(e) = socket.set_recv_buffer_size(buf) {
+        tracing::warn!("could not set SO_RCVBUF to {buf}: {e}");
     }
-    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE) {
-        tracing::warn!(
-            "could not set SO_SNDBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    if let Err(e) = socket.set_send_buffer_size(buf) {
+        tracing::warn!("could not set SO_SNDBUF to {buf}: {e}");
     }
     #[cfg(target_os = "linux")]
     {
@@ -147,17 +142,12 @@ async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
     .context("TCP socket creation failed")?;
 
     // Mirror the buffer sizing from the server side (bind_tcp) and the QUIC path.
-    if let Err(e) = socket.set_recv_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
-        tracing::warn!(
-            "could not set SO_RCVBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    let buf = super::socket_buffer_size();
+    if let Err(e) = socket.set_recv_buffer_size(buf as u32) {
+        tracing::warn!("could not set SO_RCVBUF to {buf}: {e}");
     }
-    if let Err(e) = socket.set_send_buffer_size(super::SOCKET_BUFFER_SIZE as u32) {
-        tracing::warn!(
-            "could not set SO_SNDBUF to {}: {e}",
-            super::SOCKET_BUFFER_SIZE
-        );
+    if let Err(e) = socket.set_send_buffer_size(buf as u32) {
+        tracing::warn!("could not set SO_SNDBUF to {buf}: {e}");
     }
     #[cfg(target_os = "linux")]
     {

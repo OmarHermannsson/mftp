@@ -409,11 +409,15 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips compression. No `--no-compress` needed.
 - **Open port required**: in SSH mode, use `--port <N>` with a firewall-allowed port to avoid the automatic fallback to SFTP. The SFTP path is reliable but slower.
 - **SFTP fallback throughput**: if the direct transfer ports are always blocked, raise `--streams` from the default of 8 to 12 for ~32 MiB/s. Check that the remote sshd's `MaxStartups` is set to at least `12:30:100`.
-- **OS socket buffer limit**: on Linux, the kernel may cap socket buffers below 32 MiB. Set `net.core.rmem_max` and `net.core.wmem_max` to `33554432` on both hosts for maximum throughput.
+- **OS socket buffer limit**: mftp requests 64 MiB socket buffers, but the Linux kernel clamps to `net.core.rmem_max`/`wmem_max` (it logs a warning if it can't grant the full amount). Raise both on each host for maximum throughput on high-BDP links:
 
   ```sh
-  sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432
+  sudo sysctl -w net.core.rmem_max=67108864 net.core.wmem_max=67108864
   ```
+
+  On very-high-BDP paths (10 Gbps × high RTT) raise the sysctls further and set `MFTP_SOCKET_BUFFER=<bytes>` to request a larger buffer.
+
+- **Faster congestion ramp**: QUIC starts at a 1 MiB BBR congestion window (raised from quinn's ~234 KiB default) so high-RTT transfers reach line rate a few RTTs sooner. Tune with `MFTP_INITIAL_CWND=<bytes>` — lower it on thin/constrained links where a large first-flight burst would cause startup loss.
 
 - **TCP BBR on the TCP+TLS path**: mftp requests BBR congestion control for TCP sockets on Linux (mirroring the QUIC path). If you see a warning about `TCP_CONGESTION=bbr`, the `tcp_bbr` kernel module is not loaded on that host. Load it manually or persist it across reboots:
 
