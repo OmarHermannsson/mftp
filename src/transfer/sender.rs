@@ -1944,7 +1944,7 @@ fn feed_chunks_single(
 /// are used for RS parity computation but **not** dispatched as data shards.
 #[allow(clippy::too_many_arguments)]
 fn encode_and_dispatch(
-    buf: &[(u64, Vec<u8>)],
+    buf: Vec<(u64, Vec<u8>)>,
     real_count: usize,
     encoder: &FecEncoder,
     compression: &Compression,
@@ -1959,25 +1959,29 @@ fn encode_and_dispatch(
     let data_shards = encoder.data_shards;
     let parity_shards = encoder.parity_shards;
 
-    // Step 1: compress each shard and hash real ones.
+    // Step 1: compress each shard and hash real ones.  `buf` is consumed so each
+    // raw chunk moves straight into the compressor (no 8 MiB clone per shard).
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(data_shards);
     let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(data_shards);
     let mut comp_flags: Vec<bool> = Vec::with_capacity(data_shards);
+    let mut real_chunk_indices: Vec<u64> = Vec::with_capacity(real_count);
 
-    for (i, (chunk_idx, raw)) in buf.iter().enumerate() {
-        let hash = *blake3::hash(raw).as_bytes();
+    for (i, (chunk_idx, raw)) in buf.into_iter().enumerate() {
+        let hash = *blake3::hash(&raw).as_bytes();
+        let raw_len = raw.len();
         // Feed real chunk hashes into the file hasher inline (fresh transfers only;
         // on resume the full-file hash is computed by a separate concurrent task).
         if i < real_count {
             if let Some(h) = file_hasher {
-                h.feed(*chunk_idx, hash)?;
+                h.feed(chunk_idx, hash)?;
             }
+            real_chunk_indices.push(chunk_idx);
         }
-        let (payload, comp) = maybe_compress(raw.clone(), compression)?;
+        let (payload, comp) = maybe_compress(raw, compression)?;
         // Accumulate compression stats for real shards only (padding shards are
         // synthetic zeros and would distort the ratio).
         if i < real_count {
-            stats.0.fetch_add(raw.len() as u64, AtomicOrd::Relaxed);
+            stats.0.fetch_add(raw_len as u64, AtomicOrd::Relaxed);
             stats.1.fetch_add(payload.len() as u64, AtomicOrd::Relaxed);
         }
         hashes.push(hash);
@@ -1985,15 +1989,18 @@ fn encode_and_dispatch(
         comp_flags.push(comp);
     }
 
-    // Step 2: RS encode — FecEncoder pads to stripe_max internally.
+    // Step 2: RS encode.  This clone is unavoidable: the encoder pads its inputs
+    // to stripe_max in place and returns only the parity shards, but we still
+    // need the originals (at their unpadded length) to dispatch as data shards.
     let (parity, shard_lengths) = encoder.encode(payloads.clone())?;
     let shard_compressed: Vec<u8> = comp_flags.iter().map(|&c| c as u8).collect();
 
-    // Step 3: dispatch real data shards.
-    for i in 0..real_count {
+    // Step 3: dispatch real data shards, moving each payload out of `payloads`
+    // (the padding shards at the tail are dropped here).
+    for (i, payload) in payloads.into_iter().enumerate().take(real_count) {
         let fcd = FecChunkData {
             transfer_id,
-            chunk_index: buf[i].0,
+            chunk_index: real_chunk_indices[i],
             chunk_hash: hashes[i],
             compressed: comp_flags[i],
             stripe_index,
@@ -2001,7 +2008,7 @@ fn encode_and_dispatch(
             is_parity: false,
             shard_lengths: Vec::new(),
             shard_compressed: Vec::new(),
-            payload: payloads[i].clone(),
+            payload,
         };
         if worker_txs[*worker_i].blocking_send(fcd).is_err() {
             bail!("FEC worker channel closed prematurely");
@@ -2065,8 +2072,11 @@ fn stripe_encode_chunks(
             // This is correct even when preceding stripes were skipped on resume —
             // a sequential counter would give wrong indices in that case.
             let stripe_index = (buf[0].0 / data_shards as u64) as u32;
+            // Hand ownership of the full stripe to the encoder and start a fresh
+            // buffer for the next one (so raw chunks need not be cloned downstream).
+            let stripe = std::mem::replace(&mut buf, Vec::with_capacity(data_shards));
             encode_and_dispatch(
-                &buf,
+                stripe,
                 data_shards, // all real
                 &encoder,
                 &compression,
@@ -2078,7 +2088,6 @@ fn stripe_encode_chunks(
                 file_hasher.as_ref(),
                 &stats,
             )?;
-            buf.clear();
         }
     }
 
@@ -2093,7 +2102,7 @@ fn stripe_encode_chunks(
             buf.push((u64::MAX, Vec::new())); // sentinel chunk_index; empty payload
         }
         encode_and_dispatch(
-            &buf,
+            buf,
             real_count,
             &encoder,
             &compression,
