@@ -97,10 +97,19 @@ mftp_throughput() {
     remote_clean
     drop_caches
     local output
-    # --remote-mftp skips binary copy; --trust skips TOFU prompt
+    # --remote-mftp skips binary copy; --trust skips TOFU prompt.
+    # MFTP_PORT pins the data port to a firewall-allowed one (else the random
+    # port is blocked and the transfer silently degrades to SFTP — see below).
     output=$("$MFTP" send "$@" \
         --remote-mftp "$REMOTE_MFTP" \
+        ${MFTP_PORT:+--port "$MFTP_PORT"} \
         "$file" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/" 2>&1) || true
+    # Warn if the QUIC/TCP data path was unreachable and mftp fell back to
+    # SFTP: that path is NOT what we mean to measure, and its output uses a
+    # different format ("(N MiB/s)") that the parser below would record as 0.
+    if echo "$output" | grep -q 'SFTP fallback'; then
+        log "  ⚠ data port unreachable — fell back to SFTP (open MFTP_PORT in the firewall)"
+    fi
     local mbs
     mbs=$(echo "$output" | grep -oP '\(\K[\d.]+(?= MiB/s end-to-end)' | tail -1)
     echo "${mbs:-0}"
