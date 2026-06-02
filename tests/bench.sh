@@ -170,7 +170,7 @@ phase1() {
         mbs_mftp=$(mftp_throughput "$FILE_RANDOM")
         result "$csv" "mftp (auto)  $scenario" "$mbs_mftp" "$tc_rule"
 
-        mbs_mftp_tcp=$(mftp_throughput "$FILE_RANDOM" --tcp)
+        mbs_mftp_tcp=$(mftp_throughput "$FILE_RANDOM" --transport tcp)
         result "$csv" "mftp --tcp   $scenario" "$mbs_mftp_tcp" "$tc_rule"
     done
 
@@ -271,7 +271,7 @@ phase4() {
         mbs_quic=$(mftp_throughput "$FILE_RANDOM" --tcp-below-rtt 0)
         result "$csv" "mftp QUIC    RTT=$rtt_label" "$mbs_quic" "quic,$rtt_label"
 
-        mbs_tcp=$(mftp_throughput "$FILE_RANDOM" --tcp)
+        mbs_tcp=$(mftp_throughput "$FILE_RANDOM" --transport tcp)
         result "$csv" "mftp TCP+TLS RTT=$rtt_label" "$mbs_tcp" "tcp,$rtt_label"
     done
 
