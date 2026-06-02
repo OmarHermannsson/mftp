@@ -109,9 +109,13 @@ mftp_throughput() {
     # Warn if the QUIC/TCP data path was unreachable and mftp fell back to
     # SFTP: that path is NOT what we mean to measure, and its output uses a
     # different format ("(N MiB/s)") that the parser below would record as 0.
+    # Match the actual fallback banners ("retrying via SFTP" / "SFTP fallback:")
+    # and NOT the suppression message "SFTP fallback suppressed by --transport"
+    # that mftp prints when --transport pins the path (else --transport tcp
+    # failing to connect would be misreported as a fallback).
     # NB: this function returns its value on stdout (captured by $(...)), so the
     # warning must go to stderr/log only — never stdout — or it corrupts the CSV.
-    if echo "$output" | grep -q 'SFTP fallback'; then
+    if echo "$output" | grep -qE 'retrying via SFTP|SFTP fallback:'; then
         echo "[$(date +%T)]   ⚠ data port unreachable — fell back to SFTP (open MFTP_PORT in the firewall)" | tee -a "$LOG" >&2
     fi
     local mbs
