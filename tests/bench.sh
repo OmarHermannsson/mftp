@@ -20,6 +20,15 @@
 #   - Remote binary installed: scp target/release/mftp $REMOTE_USER@$REMOTE_HOST:/data/mftp
 #   - Test files created: see tests/make_testfiles.sh
 #   - SSH key auth configured (set REMOTE_USER and REMOTE_HOST env vars)
+#
+# Env overrides (all optional; defaults target a root-owned /data layout):
+#   REMOTE_MFTP  remote receiver binary path   (default /data/mftp)
+#   REMOTE_DIR   remote destination directory  (default /data)
+#   IFACE        remote NIC for tc netem       (default ens33)
+#   FILE_RANDOM  local incompressible source   (default /data/test_1g_random.bin)
+#   FILE_TEXT    local compressible source     (default /data/test_1g_text.bin)
+#   FILE_SIZE    source size in bytes (scp throughput calc; match the real file)
+# Use these to run without root by staging files/binary in a writable home dir.
 
 set -euo pipefail
 
@@ -29,13 +38,13 @@ MFTP=./target/release/mftp
 REMOTE_USER=${REMOTE_USER:?set REMOTE_USER (e.g. export REMOTE_USER=myuser)}
 REMOTE_HOST=${REMOTE_HOST:?set REMOTE_HOST (e.g. export REMOTE_HOST=192.168.1.1)}
 REMOTE=${REMOTE_USER}@${REMOTE_HOST}
-REMOTE_MFTP=/data/mftp
-REMOTE_DIR=/data
-IFACE=ens33
+REMOTE_MFTP=${REMOTE_MFTP:-/data/mftp}
+REMOTE_DIR=${REMOTE_DIR:-/data}
+IFACE=${IFACE:-ens33}
 
-FILE_RANDOM=/data/test_1g_random.bin
-FILE_TEXT=/data/test_1g_text.bin
-FILE_SIZE=$((1024 * 1024 * 1024))   # 1 GiB
+FILE_RANDOM=${FILE_RANDOM:-/data/test_1g_random.bin}
+FILE_TEXT=${FILE_TEXT:-/data/test_1g_text.bin}
+FILE_SIZE=${FILE_SIZE:-$((1024 * 1024 * 1024))}   # default 1 GiB
 
 PHASE=${1:-all}
 
