@@ -18,7 +18,9 @@
 # Requirements:
 #   - mftp binary built: cargo build --release
 #   - Remote binary installed: scp target/release/mftp $REMOTE_USER@$REMOTE_HOST:/data/mftp
-#   - Test files created: see tests/make_testfiles.sh
+#   - Test files created on the SENDER (paths below), e.g.:
+#       head -c 1G /dev/urandom > test_1g_random.bin        # FILE_RANDOM (incompressible)
+#       yes "$(head -c 4096 /dev/urandom | base64)" | head -c 1G > test_1g_text.bin  # FILE_TEXT (compressible, phase 5)
 #   - SSH key auth configured (set REMOTE_USER and REMOTE_HOST env vars)
 #
 # Env overrides (all optional; defaults target a root-owned /data layout):
