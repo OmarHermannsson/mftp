@@ -34,6 +34,20 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 
 ### Install
 
+**Download a prebuilt binary** — latest release: **[v0.1.130](https://github.com/OmarHermannsson/mftp/releases/latest)** (Linux x86_64, macOS Intel + Apple Silicon, Windows x86_64; each with a `.sha256`):
+
+```sh
+# Linux x86_64 — verify the checksum, then install
+curl -LO https://github.com/OmarHermannsson/mftp/releases/latest/download/mftp-linux-x86_64
+curl -LO https://github.com/OmarHermannsson/mftp/releases/latest/download/mftp-linux-x86_64.sha256
+sha256sum -c mftp-linux-x86_64.sha256
+chmod +x mftp-linux-x86_64 && sudo mv mftp-linux-x86_64 /usr/local/bin/mftp
+```
+
+For macOS/Windows, grab the matching asset (`mftp-macos-aarch64`, `mftp-macos-x86_64`, `mftp-windows-x86_64.exe`) from the [releases page](https://github.com/OmarHermannsson/mftp/releases/latest).
+
+Or with Cargo:
+
 ```sh
 cargo install mftp
 ```
