@@ -500,22 +500,7 @@ MACOSX_DEPLOYMENT_TARGET = "12.0"
 
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
 
-### Shipped (not yet extracted to changelog)
-
-- Recursive directory transfer (`-r`) with optional metadata preservation (`--preserve`)
-- Adaptive stream scaling on by default; pin with `-n N` (dynamic scale-up/scale-down, protocol v2)
-- SFTP fallback when the remote host cannot reach the mftp receive port
-- FEC resume support: resumes skip already-received parity stripes
-- In-band incremental repair (protocol v5): missing/corrupt chunks and unreconstructable FEC stripes are re-requested over the control stream instead of aborting (single-file)
-- Verified self-update: cross-platform binaries downloaded from GitHub releases are checked against `--remote-binary-sha256` or the published `<asset>.sha256` before running on the remote
-- One-RTT QUIC startup (protocol v6): the sender pipelines NegotiateRequest + manifest + DirEntries into a single flight, halving the pre-data control round-trips
-- Tunable congestion ramp / buffers: 1 MiB BBR initial window (`MFTP_INITIAL_CWND`), 64 MiB socket buffers (`MFTP_SOCKET_BUFFER`), opt-in ACK-frequency (`MFTP_ACK_ELICITING_THRESHOLD`)
-- NVMe parallel multi-reader (`--parallel-reads`, advanced/hidden flag)
-- BDP-aware QUIC connection window sizing from measured RTT
-- Adaptive zstd compression level (per-worker EMA of ratio/CPU)
-- QUIC initial MTU raised to 1350 B (skips the lowest probe segment on Ethernet paths)
-- TCP+TLS BBR: `setsockopt(TCP_CONGESTION, "bbr")` on Linux for parity with QUIC path
-- Live progress diagnostics: `streams=N rtt=Xms loss=N stall=Nms` in wide-terminal mode
+For shipped features and per-release history, see [CHANGELOG.md](CHANGELOG.md) and the [releases page](https://github.com/OmarHermannsson/mftp/releases).
 
 ---
 

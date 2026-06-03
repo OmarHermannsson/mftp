@@ -1,0 +1,66 @@
+# Changelog
+
+All notable changes to mftp are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [Unreleased]
+
+_Nothing user-facing yet._
+
+## [0.1.130] — 2026-06-02
+
+First release since 0.1.102. Adds a new in-band repair protocol, a supply-chain
+security fix, high-latency performance wins, and macOS/Windows support.
+
+### Protocol
+- Wire protocol bumped to **v6**. Sender and receiver must both be on 0.1.130+
+  for the QUIC/TCP direct path (SFTP fallback is unaffected).
+
+### Added
+- **In-band incremental repair (protocol v5+):** missing/corrupt chunks and
+  unreconstructable FEC stripes are re-requested over the control stream at the
+  completion checkpoint (`ReceiverMessage::Retransmit`, single-file) instead of
+  aborting and resuming.
+- **macOS** (x86_64 + aarch64) and **Windows** (x86_64) builds, now tested in CI.
+
+### Security
+- Cross-platform binaries downloaded from GitHub releases are checksum-verified
+  (against `--remote-binary-sha256` or the published `<asset>.sha256`) before
+  being executed on the remote host.
+
+### Performance
+- **1-RTT QUIC startup** (was 2 control round-trips): the sender pipelines
+  NegotiateRequest + manifest + DirEntries into a single flight. Measured
+  ~850 ms faster per connection at 400 ms RTT.
+- Larger, tunable **BBR initial congestion window** (`MFTP_INITIAL_CWND`).
+- **Socket-buffer default raised to 64 MiB** (`MFTP_SOCKET_BUFFER`); opt-in
+  ACK-frequency (`MFTP_ACK_ELICITING_THRESHOLD`).
+- Dropped redundant chunk copies in the FEC sender path.
+
+### Reliability
+- Hardened FEC wire/manifest validation; overflow checks enabled.
+- Attributable errors for unreconstructable FEC stripes.
+- Resume surfaces resume/discard status; durability model documented.
+
+### Changed
+- Tolerate common `--trust` fingerprint formats (colons, whitespace, case).
+- Hard-fail invalid `--fec` specs; clearer CLI examples and download prompt.
+
+## [0.1.102] and earlier — baseline
+
+Per-version history was not tracked before 0.1.130; these are the major
+capabilities present as of the 0.1.102 baseline:
+
+- Recursive directory transfer (`-r`) with optional metadata preservation (`--preserve`)
+- Adaptive stream scaling on by default; pin with `-n N` (dynamic scale-up/down, protocol v2)
+- SFTP fallback when the remote host cannot reach the mftp receive port
+- FEC resume support: resumes skip already-received parity stripes
+- NVMe parallel multi-reader (`--parallel-reads`, advanced/hidden flag)
+- BDP-aware QUIC connection window sizing from measured RTT
+- Adaptive zstd compression level (per-worker EMA of ratio/CPU)
+- QUIC initial MTU raised to 1350 B (skips the lowest probe segment on Ethernet paths)
+- TCP+TLS BBR: `setsockopt(TCP_CONGESTION, "bbr")` on Linux for parity with the QUIC path
+- Live progress diagnostics: `streams=N rtt=Xms loss=N stall=Nms` in wide-terminal mode
+
+[Unreleased]: https://github.com/OmarHermannsson/mftp/compare/v0.1.130...HEAD
+[0.1.130]: https://github.com/OmarHermannsson/mftp/releases/tag/v0.1.130
