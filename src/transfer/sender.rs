@@ -1281,7 +1281,7 @@ where
         &compression,
         file_hash,
         rtt,
-        entries.is_none(),
+        entries.map(|e| e.to_vec()),
         &pb,
     )
     .await?;
@@ -1306,10 +1306,15 @@ where
 /// returns a terminal `Complete`/`Error` (or the repair bounds are exceeded).
 ///
 /// The caller must have already sent the first `SenderMessage::Complete`.  On a
-/// `Retransmit`, the listed chunks are re-read from `file`, re-sent as plain
+/// `Retransmit`, the listed chunks are re-read from the source, re-sent as plain
 /// `ChunkData` on `ctrl_send`, and a fresh `Complete` is sent — all on the
-/// existing connection, so the warmed congestion window survives.  Repair is
-/// single-file only; `repairable` is false for directory transfers.
+/// existing connection, so the warmed congestion window survives.
+///
+/// `entries` selects the read strategy: `None` is a single-file transfer (the
+/// global chunk index maps directly to a `file` offset); `Some(entries)` is a
+/// directory transfer, where the global chunk index is reverse-mapped to the
+/// byte range(s) it spans across the concatenated file set — the inverse of
+/// [`feed_chunks_concat`] — so directory repair works in-band too.
 #[allow(clippy::too_many_arguments)]
 async fn await_completion_with_repair<CW>(
     ctrl_send: &mut CW,
@@ -1321,7 +1326,7 @@ async fn await_completion_with_repair<CW>(
     compression: &Compression,
     file_hash: [u8; 32],
     rtt: Duration,
-    repairable: bool,
+    entries: Option<Vec<FileEntry>>,
     pb: &ProgressBar,
 ) -> Result<ReceiverMessage>
 where
@@ -1344,11 +1349,6 @@ where
             terminal => return Ok(terminal),
         };
 
-        if !repairable {
-            bail!(
-                "receiver requested in-band repair, which is not supported for directory transfers"
-            );
-        }
         round += 1;
         if round > crate::protocol::messages::MAX_REPAIR_ROUNDS {
             bail!(
@@ -1372,22 +1372,54 @@ where
         let built = {
             let file = file.to_owned();
             let compression = compression.clone();
+            let entries = entries.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<ChunkData>> {
                 use std::io::{Read, Seek, SeekFrom};
-                let mut f = std::fs::File::open(&file)
-                    .with_context(|| format!("open {} for repair", file.display()))?;
+
+                // Directory transfer: precompute the concat layout once so each
+                // chunk re-read is a binary-search + scatter-read across files.
+                let concat = entries.as_ref().map(|e| {
+                    let fe: Vec<&FileEntry> = e
+                        .iter()
+                        .filter(|x| matches!(x.kind, FileKind::File) && x.size > 0)
+                        .collect();
+                    let mut ps = Vec::with_capacity(fe.len() + 1);
+                    let mut acc = 0u64;
+                    for x in &fe {
+                        ps.push(acc);
+                        acc += x.size;
+                    }
+                    ps.push(acc); // sentinel = total bytes
+                    (fe, ps)
+                });
+
+                // Single-file transfer: one shared handle, seek per chunk.
+                let mut single = match concat {
+                    Some(_) => None,
+                    None => Some(
+                        std::fs::File::open(&file)
+                            .with_context(|| format!("open {} for repair", file.display()))?,
+                    ),
+                };
+
                 let mut out = Vec::with_capacity(chunks.len());
                 for idx in chunks {
                     let offset = idx * chunk_size as u64;
                     if offset >= file_size {
-                        bail!("repair: chunk {idx} is out of range for this file");
+                        bail!("repair: chunk {idx} is out of range for this transfer");
                     }
                     let len = ((file_size - offset) as usize).min(chunk_size);
                     let mut raw = vec![0u8; len];
-                    f.seek(SeekFrom::Start(offset))
-                        .with_context(|| format!("seek to repair chunk {idx}"))?;
-                    f.read_exact(&mut raw)
-                        .with_context(|| format!("read repair chunk {idx}"))?;
+                    match &concat {
+                        Some((fe, ps)) => read_concat_chunk_into(&file, fe, ps, offset, &mut raw)?,
+                        None => {
+                            let f = single.as_mut().expect("single-file handle present");
+                            f.seek(SeekFrom::Start(offset))
+                                .with_context(|| format!("seek to repair chunk {idx}"))?;
+                            f.read_exact(&mut raw)
+                                .with_context(|| format!("read repair chunk {idx}"))?;
+                        }
+                    }
                     let chunk_hash = *blake3::hash(&raw).as_bytes();
                     let (payload, compressed) = maybe_compress(raw, &compression)?;
                     out.push(ChunkData {
@@ -2070,6 +2102,49 @@ fn feed_chunks_concat(
     Ok(())
 }
 
+/// Fill `buf` with one global chunk from a concatenated directory source.
+///
+/// The inverse of the inner loop in [`feed_chunks_concat`]: given the global
+/// byte offset where the chunk starts, walk the prefix-sum table to find the
+/// file(s) the chunk spans and read each overlapping slice in turn.  Used by
+/// the in-band repair path to re-read a chunk by its global index without the
+/// feeder's pre-read cache (repair handles only a bounded handful of chunks).
+fn read_concat_chunk_into(
+    root: &Path,
+    file_entries: &[&FileEntry],
+    prefix_sums: &[u64],
+    global_start: u64,
+    buf: &mut [u8],
+) -> Result<()> {
+    let chunk_len = buf.len();
+    let mut written = 0usize;
+    let mut fi = prefix_sums
+        .partition_point(|&ps| ps <= global_start)
+        .saturating_sub(1);
+    let mut pos = global_start;
+
+    while written < chunk_len && fi < file_entries.len() {
+        let file_start = prefix_sums[fi];
+        let file_end = prefix_sums[fi + 1];
+        let offset_in_file = pos - file_start;
+        let remaining_in_file = (file_end - pos) as usize;
+        let take = remaining_in_file.min(chunk_len - written);
+        let path = root.join(&file_entries[fi].path);
+        let f = std::fs::File::open(&path)
+            .with_context(|| format!("open {} for repair", path.display()))?;
+        crate::fs_ext::read_exact_at(&f, &mut buf[written..written + take], offset_in_file)
+            .with_context(|| format!("repair read {} at {offset_in_file}", path.display()))?;
+        written += take;
+        pos += take as u64;
+        fi += 1;
+    }
+
+    if written != chunk_len {
+        bail!("repair: short read filling chunk at offset {global_start}: {written}/{chunk_len} bytes");
+    }
+    Ok(())
+}
+
 fn maybe_compress(data: Vec<u8>, compression: &Compression) -> Result<(Vec<u8>, bool)> {
     match compression {
         Compression::None => Ok((data, false)),
@@ -2593,8 +2668,8 @@ where
     framing::send_message(ctrl_send, &SenderMessage::Complete { file_hash }).await?;
 
     // Completion handshake with v5 incremental repair.  FEC transfers are always
-    // single-file, so repair is always available here; a stripe the receiver
-    // could not reconstruct comes back as a Retransmit and is repaired in-band.
+    // single-file, so `entries` is None here; a stripe the receiver could not
+    // reconstruct comes back as a Retransmit and is repaired in-band.
     let msg = await_completion_with_repair(
         ctrl_send,
         &mut completion_rx,
@@ -2605,7 +2680,7 @@ where
         &compression,
         file_hash,
         rtt,
-        true,
+        None,
         &pb,
     )
     .await?;

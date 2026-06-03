@@ -1138,8 +1138,11 @@ where
     // stripe that could not be reconstructed.  Rather than fail outright, ask
     // the sender (over the still-open control stream) to re-send exactly those
     // chunks as plain ChunkData, keeping the connection and its warmed
-    // congestion window alive.  Single-file only; bounded by MAX_REPAIR_ROUNDS.
-    let repairable = pt.layout.is_none() && neg_req.protocol_version >= 5 && pt.out_file.is_some();
+    // congestion window alive.  Works for single-file (pwrite to the output fd)
+    // and directory transfers (scatter-write across the concat layout); bounded
+    // by MAX_REPAIR_ROUNDS.
+    let repairable =
+        neg_req.protocol_version >= 5 && (pt.out_file.is_some() || pt.layout.is_some());
     let mut repaired = false;
     let mut round = 0u32;
     // `repairable` is fixed, but each iteration either breaks or writes repaired
@@ -1174,12 +1177,19 @@ where
 
         // Read exactly that many ChunkData repair frames, then the sender's
         // follow-up Complete (which re-syncs us for the next round).
-        let out_file = pt.out_file.clone().expect("repairable implies single-file");
         for _ in 0..want {
             let cd = framing::recv_chunk_data(&mut ctrl_recv)
                 .await?
                 .ok_or_else(|| anyhow!("sender closed control stream mid-repair"))?;
-            write_repair_chunk(&cd, &out_file, &pt.resume, manifest.chunk_size, &pt.pb).await?;
+            write_repair_chunk(
+                &cd,
+                pt.out_file.as_ref(),
+                pt.layout.as_ref(),
+                &pt.resume,
+                manifest.chunk_size,
+                &pt.pb,
+            )
+            .await?;
         }
         repaired = true;
         match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await? {
@@ -1274,11 +1284,15 @@ fn missing_chunks_error(missing: &[u64], manifest: &TransferManifest) -> anyhow:
     }
 }
 
-/// Verify, write, and mark a single chunk received during the v5 repair phase
-/// (single-file transfers only).
+/// Verify, write, and mark a single chunk received during the v5 repair phase.
+///
+/// Handles both single-file transfers (pwrite the chunk to `out_file` at its
+/// global offset) and directory transfers (scatter-write across the concat
+/// `layout`, which a chunk may span when it packs several small files).
 async fn write_repair_chunk(
     cd: &ChunkData,
-    out_file: &Arc<std::fs::File>,
+    out_file: Option<&Arc<std::fs::File>>,
+    layout: Option<&Arc<ConcatLayout>>,
     resume: &Arc<Mutex<ResumeState>>,
     chunk_size: usize,
     pb: &ProgressBar,
@@ -1293,18 +1307,35 @@ async fn write_repair_chunk(
     if computed != cd.chunk_hash {
         bail!("repair chunk {} failed hash verification", cd.chunk_index);
     }
-    let offset = cd.chunk_index * chunk_size as u64;
-    let f = Arc::clone(out_file);
     let n = data.len() as u64;
-    tokio::task::spawn_blocking(move || crate::fs_ext::write_all_at(&f, &data, offset))
-        .await
-        .context("repair write task panicked")?
-        .with_context(|| format!("write repair chunk {} at offset {offset}", cd.chunk_index))?;
+    let chunk_index = cd.chunk_index;
+    match (layout, out_file) {
+        // Directory transfer: scatter the chunk across the file(s) it spans.
+        (Some(layout), _) => {
+            let layout = Arc::clone(layout);
+            tokio::task::spawn_blocking(move || {
+                layout.scatter_write(chunk_index, chunk_size, &data)
+            })
+            .await
+            .context("repair scatter-write task panicked")?
+            .with_context(|| format!("scatter-write repair chunk {chunk_index}"))?;
+        }
+        // Single-file transfer: pwrite at the chunk's global offset.
+        (None, Some(out_file)) => {
+            let offset = chunk_index * chunk_size as u64;
+            let f = Arc::clone(out_file);
+            tokio::task::spawn_blocking(move || crate::fs_ext::write_all_at(&f, &data, offset))
+                .await
+                .context("repair write task panicked")?
+                .with_context(|| format!("write repair chunk {chunk_index} at offset {offset}"))?;
+        }
+        (None, None) => bail!("repair chunk {chunk_index}: no output target available"),
+    }
     // Persist the resume bit immediately — repair sets are small, so the
     // per-chunk fsync cost is negligible and it keeps the bitvector accurate.
     let snap = {
         let mut r = resume.lock().expect("resume-state mutex poisoned");
-        r.mark_received(cd.chunk_index);
+        r.mark_received(chunk_index);
         r.snapshot()?
     };
     snap.write_to_disk()?;

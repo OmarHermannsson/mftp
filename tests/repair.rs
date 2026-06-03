@@ -108,4 +108,61 @@ async fn incremental_repair_end_to_end() {
         .await;
         test_hooks::clear();
     }
+
+    // ── Scenario 3: directory transfer with dropped chunks repaired in-band ────
+    // Directory repair was previously unsupported (the sender rejected the
+    // Retransmit). This exercises the concat reverse-mapping on the sender and
+    // scatter-write on the receiver across a multi-file tree.
+    {
+        test_hooks::clear();
+        let dir = TempDir::new().unwrap();
+        let recv = TempDir::new().unwrap();
+        let src_dir = dir.path().join("payload");
+        std::fs::create_dir(&src_dir).unwrap();
+        // Concatenated in path-sorted order (a, b, c); interior dropped chunks
+        // straddle file boundaries to test multi-file scatter on repair.
+        let fa = make_file(&src_dir, "a.bin", CHUNK * 3 + 1234);
+        let fb = make_file(&src_dir, "b.bin", CHUNK * 2);
+        let fc = make_file(&src_dir, "c.bin", CHUNK * 4);
+        test_hooks::drop_chunks_once(&[1, 4, 6]);
+
+        let server = Server::bind("127.0.0.1:0".parse().unwrap(), recv.path().to_owned()).unwrap();
+        let addr = server.local_addr;
+        let fingerprint = server.fingerprint.clone();
+        let recv_task = tokio::spawn(async move { server.accept_one().await });
+
+        let config = SendConfig {
+            streams: Some(4),
+            chunk_size: Some(CHUNK),
+            compress: false,
+            compress_level: 3,
+            trusted_fingerprint: Some(fingerprint),
+            forced_transport: None,
+            tcp_rtt_threshold: std::time::Duration::ZERO,
+            fec: None,
+            parallel_reads: false,
+            recursive: true,
+            preserve: false,
+        };
+        sender::send(src_dir.clone(), addr, config)
+            .await
+            .expect("directory send completes after repair");
+        recv_task
+            .await
+            .unwrap()
+            .expect("directory receive completes after repair");
+
+        for f in [&fa, &fb, &fc] {
+            let rel = f.file_name().unwrap();
+            let received = recv.path().join("payload").join(rel);
+            let original = std::fs::read(f).unwrap();
+            let got = std::fs::read(&received)
+                .unwrap_or_else(|e| panic!("read {}: {e}", received.display()));
+            assert_eq!(
+                original, got,
+                "content mismatch for {rel:?} after directory repair"
+            );
+        }
+        test_hooks::clear();
+    }
 }
