@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod config;
 pub mod fec;
 pub mod fs_ext;
 pub mod net;

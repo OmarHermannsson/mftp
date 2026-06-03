@@ -5,9 +5,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use mftp::config::Config;
 use mftp::protocol::messages::FecParams;
 use mftp::transfer::sender::ForcedTransport;
 use mftp::transfer::{receiver, sender};
+
+/// Built-in default for `--tcp-below-rtt` (ms), applied when neither the CLI
+/// flag nor the config file sets it.  See the flag's help for the rationale.
+const DEFAULT_TCP_BELOW_RTT_MS: f64 = 15.0;
 
 /// Shown under `mftp --help`.  Concrete invocations cover the common cases the
 /// flag docs describe abstractly.
@@ -102,8 +107,12 @@ struct Cli {
     /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
     /// congestion window ramp-up.  Set 0 to always use QUIC, or higher to widen the
     /// TCP window.  Ignored when --transport is set.
-    #[arg(long, global = true, default_value = "15", value_name = "MS")]
-    tcp_below_rtt: f64,
+    ///
+    /// Left as `Option` (rather than a clap `default_value`) so the config file
+    /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
+    /// is applied in `main` after merging CLI > config.
+    #[arg(long, global = true, value_name = "MS")]
+    tcp_below_rtt: Option<f64>,
 
     /// Use multiple parallel file readers instead of a single sequential reader.
     ///
@@ -244,9 +253,24 @@ fn parse_fec(s: &str) -> Result<FecParams> {
     })
 }
 
+/// Map a transport name from the config file to a `ForcedTransport`.
+///
+/// Accepts the same spellings as the `--transport` CLI flag (case-insensitive).
+/// Returns a hard error on anything else so a typo in the config doesn't
+/// silently fall back to auto mode.
+fn parse_transport(s: &str) -> Result<ForcedTransport> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "quic" => Ok(ForcedTransport::Quic),
+        "tcp" => Ok(ForcedTransport::Tcp),
+        "sftp" => Ok(ForcedTransport::Sftp),
+        other => anyhow::bail!("config transport must be quic, tcp, or sftp (got {other:?})"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let file_cfg = Config::load()?;
 
     let filter = match cli.verbose {
         0 => "warn",
@@ -271,17 +295,41 @@ async fn main() -> Result<()> {
             preserve,
             remote_binary_sha256,
         } => {
-            let tcp_rtt_threshold = std::time::Duration::from_secs_f64(cli.tcp_below_rtt / 1000.0);
+            // Merge persistent tuning knobs: explicit CLI flag > config file >
+            // built-in default.  Each `cli.*` Option is `None` only when the
+            // flag was omitted, so `.or(...)` makes the CLI win cleanly.
+            let tcp_below_rtt = cli
+                .tcp_below_rtt
+                .or(file_cfg.tcp_below_rtt)
+                .unwrap_or(DEFAULT_TCP_BELOW_RTT_MS);
+            let tcp_rtt_threshold = std::time::Duration::from_secs_f64(tcp_below_rtt / 1000.0);
+
+            // `--transport` (Option) wins; otherwise fall back to the config's
+            // string form, which is parsed (and validated) here.
             let forced_transport = match cli.transport {
                 Some(Transport::Quic) => Some(ForcedTransport::Quic),
                 Some(Transport::Tcp) => Some(ForcedTransport::Tcp),
                 Some(Transport::Sftp) => Some(ForcedTransport::Sftp),
-                None => None,
+                None => match file_cfg.transport.as_deref() {
+                    Some(s) => Some(parse_transport(s)?),
+                    None => None,
+                },
             };
-            let fec = match cli.fec.as_deref() {
+
+            let fec = match cli.fec.as_deref().or(file_cfg.fec.as_deref()) {
                 Some(s) => Some(parse_fec(s)?),
                 None => None,
             };
+
+            // `--no-compress` is a one-way flag: passing it on the CLI or
+            // setting it in the config disables compression.  There is no CLI
+            // way to force compression back on, so OR is the correct merge.
+            let compress = !(cli.no_compress || file_cfg.no_compress);
+
+            let streams = cli.streams.or(file_cfg.streams);
+            let chunk_size = cli.chunk_size.or(file_cfg.chunk_size);
+            let port = port.or(file_cfg.port);
+
             // Validate -r / directory combination early to give a clear error.
             if file.is_dir() && !recursive {
                 anyhow::bail!(
@@ -290,9 +338,9 @@ async fn main() -> Result<()> {
                 );
             }
             let config = sender::SendConfig {
-                streams: cli.streams,
-                chunk_size: cli.chunk_size,
-                compress: !cli.no_compress,
+                streams,
+                chunk_size,
+                compress,
                 compress_level: 3,
                 trusted_fingerprint: trust,
                 forced_transport,
