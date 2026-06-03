@@ -241,7 +241,10 @@ impl DeferredDontneed {
             return;
         };
         let evict: Vec<(i64, i64)> = {
-            let mut s = inner.state.lock().unwrap();
+            let mut s = inner
+                .state
+                .lock()
+                .expect("deferred-flush state mutex poisoned");
             s.pending.push_back((offset, len));
             s.pending_bytes += len as u64;
             let mut out = Vec::new();
@@ -269,7 +272,10 @@ impl DeferredDontneed {
                 return;
             };
             let entries: Vec<(i64, i64)> = {
-                let mut s = inner.state.lock().unwrap();
+                let mut s = inner
+                    .state
+                    .lock()
+                    .expect("deferred-flush state mutex poisoned");
                 s.pending_bytes = 0;
                 s.pending.drain(..).collect()
             };

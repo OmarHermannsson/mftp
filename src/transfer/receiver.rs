@@ -54,13 +54,19 @@ pub mod test_hooks {
 
     /// Mark chunk indices to drop once each on next receipt (test only).
     pub fn drop_chunks_once(indices: &[u64]) {
-        set().lock().unwrap().extend(indices.iter().copied());
+        set()
+            .lock()
+            .expect("test-hook drop set mutex poisoned")
+            .extend(indices.iter().copied());
         ENABLED.store(true, Ordering::Relaxed);
     }
 
     /// Clear all pending drops and disable the hook.
     pub fn clear() {
-        set().lock().unwrap().clear();
+        set()
+            .lock()
+            .expect("test-hook drop set mutex poisoned")
+            .clear();
         ENABLED.store(false, Ordering::Relaxed);
     }
 
@@ -69,7 +75,10 @@ pub mod test_hooks {
         if !ENABLED.load(Ordering::Relaxed) {
             return false;
         }
-        set().lock().unwrap().remove(&idx)
+        set()
+            .lock()
+            .expect("test-hook drop set mutex poisoned")
+            .remove(&idx)
     }
 }
 
@@ -661,7 +670,7 @@ fn write_fec_chunk(
     let _ = progress_tx.try_send(n);
 
     let snap = {
-        let mut r = resume.lock().unwrap();
+        let mut r = resume.lock().expect("resume-state mutex poisoned");
         r.mark_received(chunk_index);
         if r.incr_dirty() >= RESUME_SAVE_BATCH {
             r.reset_dirty();
@@ -1137,7 +1146,11 @@ where
     // chunks into resume state and is bounded by MAX_REPAIR_ROUNDS — not infinite.
     #[allow(clippy::while_immutable_condition)]
     while repairable {
-        let missing = pt.resume.lock().unwrap().missing_chunks();
+        let missing = pt
+            .resume
+            .lock()
+            .expect("resume-state mutex poisoned")
+            .missing_chunks();
         if missing.is_empty() {
             break;
         }
@@ -1177,7 +1190,11 @@ where
 
     // If chunks are still missing (repair unavailable, exhausted, or too large),
     // report an attributable error before the generic whole-file hash check.
-    let still_missing = pt.resume.lock().unwrap().missing_chunks();
+    let still_missing = pt
+        .resume
+        .lock()
+        .expect("resume-state mutex poisoned")
+        .missing_chunks();
     if !still_missing.is_empty() {
         let e = missing_chunks_error(&still_missing, &manifest);
         let _ = framing::send_message(
@@ -1286,7 +1303,7 @@ async fn write_repair_chunk(
     // Persist the resume bit immediately — repair sets are small, so the
     // per-chunk fsync cost is negligible and it keeps the bitvector accurate.
     let snap = {
-        let mut r = resume.lock().unwrap();
+        let mut r = resume.lock().expect("resume-state mutex poisoned");
         r.mark_received(cd.chunk_index);
         r.snapshot()?
     };
@@ -1419,7 +1436,7 @@ fn prepare_transfer(
         manifest.total_chunks,
     )));
     let (received_bits, bytes_already_received) = {
-        let state = resume.lock().unwrap();
+        let state = resume.lock().expect("resume-state mutex poisoned");
         let bits = state.received_bitvec();
         let bytes: u64 = state
             .received_chunks()
@@ -1748,7 +1765,7 @@ where
     if file_hash != expected_hash {
         // Delete the stale resume file so the next attempt starts fresh
         // rather than re-using chunk data that may have come from a changed file.
-        let _ = resume.lock().unwrap().delete();
+        let _ = resume.lock().expect("resume-state mutex poisoned").delete();
         framing::send_message(
             ctrl_send,
             &ReceiverMessage::Error {
@@ -1774,7 +1791,10 @@ where
 
     framing::send_message(ctrl_send, &ReceiverMessage::Complete { file_hash }).await?;
 
-    resume.lock().unwrap().delete()?;
+    resume
+        .lock()
+        .expect("resume-state mutex poisoned")
+        .delete()?;
     println!(
         "Received: {}",
         output_dir.join(&manifest.file_name).display()
@@ -1944,7 +1964,7 @@ where
             // is reached, releasing the lock *before* the slow fsync so other
             // stream workers are not serialised waiting on disk I/O.
             let snap = {
-                let mut r = resume.lock().unwrap();
+                let mut r = resume.lock().expect("resume-state mutex poisoned");
                 r.mark_received(chunk_index);
                 if r.incr_dirty() >= RESUME_SAVE_BATCH {
                     r.reset_dirty();
@@ -2075,7 +2095,9 @@ where
 
         // Insert shard into the shared buffer; extract the stripe if it is now ready.
         let ready_stripe = {
-            let mut bufs = stripe_bufs.lock().unwrap();
+            let mut bufs = stripe_bufs
+                .lock()
+                .expect("FEC stripe buffer mutex poisoned");
             let real_count = {
                 let first = stripe_index as u64 * data_shards as u64;
                 (total_chunks - first).min(data_shards as u64) as usize

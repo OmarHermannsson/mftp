@@ -86,7 +86,7 @@ impl ChunkHasher {
     /// Returns an error if the pending buffer is full, indicating a malicious
     /// sender withholding early chunks to exhaust receiver memory.
     pub fn feed(&self, chunk_index: u64, hash: [u8; 32]) -> Result<()> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("hash-tree mutex poisoned");
         if chunk_index == g.next {
             g.collected.push(hash);
             g.next += 1;
@@ -120,7 +120,7 @@ impl ChunkHasher {
     /// while buffered hashes are still in flight).
     pub fn update_stream_count(&self, new_count: usize) {
         let new_limit = (new_count * 16).max(64);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().expect("hash-tree mutex poisoned");
         if new_limit > g.max_pending {
             g.max_pending = new_limit;
         }
