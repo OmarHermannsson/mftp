@@ -49,9 +49,12 @@ fn decompress_within_limit_roundtrips() {
 
 // ── 2. Unreconstructable FEC stripe ─────────────────────────────────────────────
 
+/// `(shards-with-holes, per-shard lengths, original data shards)`.
+type StripeShards = (Vec<Option<Vec<u8>>>, Vec<u32>, Vec<Vec<u8>>);
+
 /// Build an 8:2 stripe and present its (data + parity) shards with `missing`
 /// of them set to `None`, all others padded to `stripe_max`.
-fn build_82_shards(missing: &[usize]) -> (Vec<Option<Vec<u8>>>, Vec<u32>, Vec<Vec<u8>>) {
+fn build_82_shards(missing: &[usize]) -> StripeShards {
     let enc = FecEncoder::new(8, 2).unwrap();
     // Distinct, equal-length data shards.
     let data: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i.wrapping_add(1); 128]).collect();
