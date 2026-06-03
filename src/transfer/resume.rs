@@ -6,13 +6,19 @@
 //!
 //! # File format
 //! ```text
-//! [8 bytes]  magic + version: b"mftpres\x01"
+//! [8 bytes]  magic + version: b"mftpres\x02"
+//! [8 bytes]  integrity tag: first 8 bytes of BLAKE3(bincode payload)
 //! [N bytes]  bincode-serialised ResumeData { transfer_id, total_chunks, received }
 //! ```
 //!
 //! The file is written atomically: data is written to `<path>.tmp` then
 //! renamed to `<path>`, so a crash during save never produces a corrupt file.
 //! On completion the resume file is deleted.
+//!
+//! The atomic rename guards against torn writes, but not against on-disk bit-rot
+//! or partial corruption from unrelated causes. The integrity tag catches those:
+//! a mismatch on load is treated like any other unusable resume file — discarded,
+//! with a fresh transfer started (see [`ResumeState::load_or_new`]).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +32,10 @@ pub const RESUME_SAVE_BATCH: u64 = 64;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const RESUME_MAGIC: &[u8; 8] = b"mftpres\x01";
+const RESUME_MAGIC: &[u8; 8] = b"mftpres\x02";
+
+/// Length of the integrity tag (truncated BLAKE3 of the bincode payload).
+const RESUME_TAG_LEN: usize = 8;
 
 #[derive(Serialize, Deserialize)]
 struct ResumeData {
@@ -145,8 +154,16 @@ impl ResumeState {
             anyhow::bail!("unrecognised magic bytes");
         }
 
+        let mut tag = [0u8; RESUME_TAG_LEN];
+        f.read_exact(&mut tag).context("read integrity tag")?;
+
         let mut payload = Vec::new();
         f.read_to_end(&mut payload).context("read payload")?;
+
+        let computed = blake3::hash(&payload);
+        if tag != computed.as_bytes()[..RESUME_TAG_LEN] {
+            anyhow::bail!("integrity tag mismatch (resume file corrupt)");
+        }
 
         let data: ResumeData = bincode::deserialize(&payload).context("deserialise")?;
 
@@ -245,8 +262,11 @@ impl ResumeState {
             received: self.received.clone(),
         };
         let bincode_payload = bincode::serialize(&data).context("serialise resume state")?;
-        let mut payload = Vec::with_capacity(RESUME_MAGIC.len() + bincode_payload.len());
+        let tag = blake3::hash(&bincode_payload);
+        let mut payload =
+            Vec::with_capacity(RESUME_MAGIC.len() + RESUME_TAG_LEN + bincode_payload.len());
         payload.extend_from_slice(RESUME_MAGIC);
+        payload.extend_from_slice(&tag.as_bytes()[..RESUME_TAG_LEN]);
         payload.extend_from_slice(&bincode_payload);
         Ok(ResumeSnapshot {
             path: self.path.clone(),
@@ -270,5 +290,48 @@ impl ResumeState {
                 .with_context(|| format!("delete {}", self.path.display()))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_reloads_received_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [7u8; 16];
+        let mut s = ResumeState::new(dir.path(), &id, 200);
+        s.mark_received(0);
+        s.mark_received(63);
+        s.mark_received(199);
+        s.save().unwrap();
+
+        let loaded = ResumeState::try_load(dir.path(), &id, 200).unwrap();
+        assert!(loaded.is_received(0));
+        assert!(loaded.is_received(63));
+        assert!(loaded.is_received(199));
+        assert!(!loaded.is_received(1));
+    }
+
+    #[test]
+    fn corrupt_payload_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [9u8; 16];
+        let mut s = ResumeState::new(dir.path(), &id, 64);
+        s.mark_received(5);
+        s.save().unwrap();
+
+        // Flip a byte in the bincode payload (past the 8-byte magic + 8-byte tag).
+        let path = dir.path().join(format!("{}.mftp-resume", hex::encode(id)));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // load_or_new must discard the corrupt file and start fresh.
+        let fresh = ResumeState::load_or_new(dir.path(), &id, 64);
+        assert!(!fresh.is_received(5));
+        assert_eq!(fresh.received_chunks().len(), 0);
     }
 }
