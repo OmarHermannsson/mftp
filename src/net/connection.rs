@@ -97,16 +97,70 @@ fn bbr_config() -> quinn::congestion::BbrConfig {
     cfg
 }
 
+/// Congestion-controller selection.
+///
+/// Ideally we would pick the controller from the *measured* RTT (improvement
+/// #6: BBR for high-RTT/high-BDP paths, a loss-based controller for short,
+/// lossy LAN paths).  RTT, however, is only available *after* the QUIC
+/// handshake — `negotiate.rs` reads it from `conn.stats().path.rtt`, and the
+/// stream-count / chunk-size negotiation already runs at that point.  quinn's
+/// `TransportConfig` (where the CC factory must be installed) is, by contrast,
+/// fixed *before* the connection is opened, so no RTT estimate exists yet at
+/// the moment we build it.  Rebuilding the controller mid-connection is not
+/// something quinn 0.11 exposes without tearing down and re-establishing the
+/// connection — a risky lifecycle change we deliberately avoid here.
+///
+/// So instead of an RTT-driven choice we make a deliberate, well-justified
+/// *static* choice:
+///
+/// - **Default: BBR.**  mftp's entire reason for existing is high-BDP links
+///   (satellite, intercontinental).  BBR measures bandwidth and RTT directly
+///   instead of inferring congestion from packet loss, avoiding the throughput
+///   sawtooth CUBIC/Reno exhibit at high latency.  On low-RTT LAN paths mftp
+///   already switches to TCP+TLS (see `--tcp-below-rtt`), so the QUIC path is
+///   essentially *always* the high-BDP case BBR is best at — making BBR the
+///   correct default regardless of RTT.
+///
+/// - **Override: `MFTP_CC`.**  For paths where the operator knows better
+///   (e.g. a measurably lossy link where a loss-based controller behaves more
+///   conservatively), `MFTP_CC=cubic` / `=reno` / `=bbr` selects the
+///   controller explicitly.  This matches the existing `MFTP_*` env-var
+///   convention (`MFTP_INITIAL_CWND`, `MFTP_SOCKET_BUFFER`,
+///   `MFTP_ACK_ELICITING_THRESHOLD`) and needs no new CLI flag, per the
+///   improvement's "internal/auto only" scope.  Unknown/empty values fall
+///   back to the BBR default.
+fn set_congestion_controller(t: &mut quinn::TransportConfig) {
+    match std::env::var("MFTP_CC")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cubic" => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
+        }
+        "reno" | "newreno" => {
+            t.congestion_controller_factory(Arc::new(quinn::congestion::NewRenoConfig::default()));
+        }
+        // "bbr", "", or anything unrecognized → BBR (the high-BDP default).
+        _ => {
+            t.congestion_controller_factory(Arc::new(bbr_config()));
+        }
+    }
+}
+
 fn transport_base() -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(quinn::VarInt::from_u32(MAX_IDLE_TIMEOUT_MS).into()));
-    // BBR congestion control: measures bandwidth and RTT directly rather than
-    // inferring congestion from packet loss (CUBIC default).  This avoids the
-    // sawtooth throughput pattern that CUBIC exhibits at high latency and makes
-    // better use of the pipe on satellite / intercontinental links.  Initial
-    // window raised above quinn's ~234 KiB default to shorten STARTUP on
-    // high-BDP links (see DEFAULT_INITIAL_WINDOW).
-    t.congestion_controller_factory(Arc::new(bbr_config()));
+    // Congestion control: BBR by default (overridable via MFTP_CC).  BBR
+    // measures bandwidth and RTT directly rather than inferring congestion from
+    // packet loss, avoiding the sawtooth throughput pattern that loss-based
+    // controllers exhibit at high latency and making better use of the pipe on
+    // satellite / intercontinental links.  Its initial window is raised above
+    // quinn's ~234 KiB default to shorten STARTUP on high-BDP links (see
+    // DEFAULT_INITIAL_WINDOW).  See `set_congestion_controller` for why this is
+    // a static choice rather than an RTT-driven one.
+    set_congestion_controller(&mut t);
     // Start at 1350 B instead of the quinn default of 1200 B.  MTU discovery
     // is already enabled by default and will probe higher; raising the floor
     // skips the lowest portion of the probe range on most real-world paths
@@ -590,6 +644,22 @@ mod tests {
         // Still rejects genuinely wrong input.
         assert!(PinnedFingerprintVerifier::new("deadbeef").is_err());
         assert!(PinnedFingerprintVerifier::new(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn congestion_controller_selection_does_not_panic() {
+        // Exercises all MFTP_CC branches: each must construct a valid
+        // TransportConfig without panicking.  (Env var is process-global, so we
+        // keep this to one test to avoid cross-test interference.)
+        for v in ["bbr", "cubic", "reno", "newreno", "BBR", "", "garbage"] {
+            std::env::set_var("MFTP_CC", v);
+            let mut t = quinn::TransportConfig::default();
+            set_congestion_controller(&mut t);
+        }
+        std::env::remove_var("MFTP_CC");
+        // Default path (var unset) must also work.
+        let mut t = quinn::TransportConfig::default();
+        set_congestion_controller(&mut t);
     }
 
     #[test]
