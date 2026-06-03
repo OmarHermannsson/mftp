@@ -92,6 +92,40 @@ mftp send bigfile.tar.gz remote-host:7777 --trust a3f9...
 
 The receiver port (7777 by default) must be reachable: UDP for QUIC, TCP for TCP+TLS, or both. There is no SFTP fallback in direct `host:port` mode.
 
+### Examples by link type
+
+mftp auto-tunes for the measured RTT, so the defaults are usually right. These show the flags worth setting when you know the link in advance.
+
+**Satellite / very high latency (RTT ≳ 300 ms, some loss).**
+Keep QUIC (it shines on long fat pipes), and add FEC so lost chunks are repaired from parity instead of waiting a full RTT for retransmission:
+
+```sh
+# 8:2 = 25% parity overhead, tolerates 2 lost chunks per stripe
+mftp send dataset.tar user@ground-station:/data/ --fec 8:2
+```
+
+**Intercontinental fibre (RTT ~150 ms, low loss).**
+The defaults are tuned for exactly this. Pin a higher stream count only if you have spare CPU and the single-flow rate is capped by per-stream flow control:
+
+```sh
+mftp send dataset.tar user@remote:/data/ -n 16
+```
+
+**LAN / datacenter (RTT ≤ 15 ms).**
+mftp automatically prefers TCP+TLS below `--tcp-below-rtt` (15 ms) since QUIC's ramp loses to TCP on fast links. Compression usually just burns CPU on a fast LAN, so disable it for already-incompressible data:
+
+```sh
+mftp send disk.img user@nas:/pool/ --no-compress
+# force the transport explicitly if RTT estimation is unreliable:
+mftp send disk.img user@nas:/pool/ --transport tcp --no-compress
+```
+
+**Sending a whole directory** (any link): add `-r`, and `--preserve` to keep mtimes and permissions:
+
+```sh
+mftp send ./project user@remote:/backups/ -r --preserve
+```
+
 ---
 
 ## Usage
