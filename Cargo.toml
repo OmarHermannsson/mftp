@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.1.133"
+version = "0.1.134"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"
@@ -58,7 +58,6 @@ console = "0.15"
 
 # Error handling
 anyhow = "1"
-thiserror = "1"
 
 # Logging
 tracing = "0.1"
@@ -73,6 +72,10 @@ base64 = "0.22"
 # HMAC-SHA1 for hashed known_hosts verification
 hmac = "0.12"
 sha1 = "0.10"
+
+# Config file (~/.config/mftp/config.toml)
+toml = "0.8"
+dirs = "5"
 
 # Misc
 async-channel = "2"
