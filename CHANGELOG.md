@@ -5,7 +5,15 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
-_Nothing user-facing yet._
+### Fixed
+- **Out-of-space destinations now fail fast and cleanly.** The receiver checks
+  free space against the file size before allocating and, if it won't fit,
+  rejects with a clear "destination is out of space: N free, needs M" error
+  instead of pre-allocating with `fallocate` (which could strand its partial
+  reservation and fill the disk) and then dying mid-transfer with an opaque
+  "connection reset by peer" on the sender. SSH mode no longer falls back to a
+  doomed SFTP retry on such a rejection, and a failed `fallocate` now releases
+  its partial reservation before falling back to a sparse file.
 
 ## [0.2.0] — 2026-06-04
 

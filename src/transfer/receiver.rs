@@ -1461,6 +1461,39 @@ fn prepare_transfer(
     dir_entries: Option<&[FileEntry]>,
     output_dir: &std::path::Path,
 ) -> Result<PreparedTransfer> {
+    // ── Free-space precondition (checked first, before allocating anything) ─────
+    // Refuse if the destination filesystem can't hold the file. Otherwise
+    // open_and_preallocate's fallocate would reserve (and, on ENOSPC, strand) the
+    // remaining free space — filling the disk and killing the transfer mid-flight
+    // with an opaque "connection reset" on the sender. `already` lets a resume of
+    // an already-preallocated file pass (its space is reserved).
+    {
+        let target = output_dir.join(&manifest.file_name);
+        let already: u64 = if dir_entries.is_some() {
+            walkdir::WalkDir::new(&target)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| crate::fs_ext::allocated_size(e.path()))
+                .sum()
+        } else {
+            crate::fs_ext::allocated_size(&target)
+        };
+        let needed = manifest.file_size.saturating_sub(already);
+        let avail = crate::fs_ext::available_space(output_dir);
+        if avail < needed {
+            anyhow::bail!(
+                "destination is out of space: {} free at {}, but \"{}\" needs {} more \
+                 (total {}). Free space or choose another destination.",
+                indicatif::HumanBytes(avail),
+                output_dir.display(),
+                manifest.file_name,
+                indicatif::HumanBytes(needed),
+                indicatif::HumanBytes(manifest.file_size),
+            );
+        }
+    }
+
     let resume = Arc::new(Mutex::new(ResumeState::load_or_new(
         output_dir,
         &manifest.transfer_id,
@@ -1546,6 +1579,10 @@ fn open_and_preallocate(path: &std::path::Path, size: u64) -> Result<std::fs::Fi
         let isize = i64::try_from(size).context("file too large for this platform")?;
         let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, isize) };
         if rc != 0 {
+            // fallocate can leave a partial reservation behind on ENOSPC; release
+            // it (truncate to 0) before falling back to a sparse file so a failed
+            // allocation doesn't strand blocks and fill the disk.
+            let _ = f.set_len(0);
             f.set_len(size)?;
         }
     }
@@ -2452,6 +2489,25 @@ mod tests {
             num_streams: 1,
             compression: Compression::None,
             fec: None,
+        }
+    }
+
+    #[test]
+    fn prepare_transfer_refuses_when_destination_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = base_manifest();
+        m.file_name = "huge.bin".to_string();
+        m.chunk_size = 8 * 1024 * 1024;
+        // 100 TiB — larger than any real test disk, so the free-space check must
+        // reject before allocating, with a clear out-of-space error.
+        m.file_size = 100 * 1024 * 1024 * 1024 * 1024;
+        m.total_chunks = m.file_size.div_ceil(m.chunk_size as u64);
+        match prepare_transfer(&m, None, dir.path()) {
+            Ok(_) => panic!("expected an out-of-space rejection"),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(msg.contains("out of space"), "unexpected error: {msg}");
+            }
         }
     }
 

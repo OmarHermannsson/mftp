@@ -65,6 +65,64 @@ pub fn read_exact_at_vec(file: &File, len: usize, offset: u64) -> io::Result<Vec
     Ok(buf)
 }
 
+/// Bytes available to an unprivileged process on the filesystem holding `path`
+/// (or its nearest existing ancestor — the target file usually doesn't exist yet).
+///
+/// Returns `u64::MAX` on platforms without `statvfs` or on any error, so callers
+/// using this for a precondition simply don't enforce it there rather than
+/// blocking a transfer on a failed probe.
+pub fn available_space(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut probe = path;
+        let existing = loop {
+            if probe.exists() {
+                break probe;
+            }
+            match probe.parent() {
+                Some(p) => probe = p,
+                None => break probe,
+            }
+        };
+        let Ok(c) = std::ffi::CString::new(existing.as_os_str().as_bytes()) else {
+            return u64::MAX;
+        };
+        // SAFETY: statvfs fills a zeroed struct; its fields are read only on rc == 0.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return u64::MAX;
+        }
+        // f_bavail / f_frsize are u32 on 32-bit targets and u64 on 64-bit; the
+        // casts are needed for portability even where clippy sees them as no-ops.
+        #[allow(clippy::unnecessary_cast)]
+        let bytes = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+        bytes
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        u64::MAX
+    }
+}
+
+/// Bytes actually allocated on disk for `path` (`st_blocks` × 512); 0 if it does
+/// not exist. Lets a free-space precondition account for space a partially
+/// transferred (already-preallocated) file has reserved when resuming.
+pub fn allocated_size(path: &std::path::Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path)
+            .map(|m| m.blocks().saturating_mul(512))
+            .unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
 /// Write all of `buf` to `file` at `offset`.
 ///
 /// Equivalent to `write_all_at` on Unix; loops over `seek_write` on Windows.

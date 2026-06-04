@@ -73,6 +73,21 @@ impl std::fmt::Display for AckTimeoutAfterComplete {
 
 impl std::error::Error for AckTimeoutAfterComplete {}
 
+/// Marker: the receiver actively rejected the transfer before any data was sent
+/// (e.g. the destination filesystem is out of space).  Falling back to SFTP would
+/// hit the same destination and fail identically, so the caller should surface the
+/// error instead of retrying.
+#[derive(Debug)]
+pub(crate) struct ReceiverRejected;
+
+impl std::fmt::Display for ReceiverRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "receiver rejected the transfer (not retryable)")
+    }
+}
+
+impl std::error::Error for ReceiverRejected {}
+
 /// Aggregate compression statistics shared across all worker tasks.
 ///
 /// `.0` — total raw (uncompressed) bytes processed.
@@ -882,7 +897,11 @@ where
             received_bits,
             total_chunks,
         } => bits_to_chunk_set(&received_bits, total_chunks),
-        ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
+        ReceiverMessage::Error { message, .. } => {
+            // The receiver refused before data started (e.g. out of space) — mark
+            // it non-retryable so SSH mode doesn't fall back to a doomed SFTP run.
+            return Err(anyhow::anyhow!("receiver error: {message}").context(ReceiverRejected));
+        }
         other => bail!("unexpected message from receiver: {other:?}"),
     };
     let skip_count = have.len() as u64;
@@ -2530,7 +2549,11 @@ where
             );
             s
         }
-        ReceiverMessage::Error { message, .. } => bail!("receiver error: {message}"),
+        ReceiverMessage::Error { message, .. } => {
+            // The receiver refused before data started (e.g. out of space) — mark
+            // it non-retryable so SSH mode doesn't fall back to a doomed SFTP run.
+            return Err(anyhow::anyhow!("receiver error: {message}").context(ReceiverRejected));
+        }
         other => bail!("unexpected message from receiver: {other:?}"),
     };
 

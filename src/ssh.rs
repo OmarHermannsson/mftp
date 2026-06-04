@@ -677,6 +677,14 @@ pub async fn send_via_ssh(
     };
 
     if let Err(e) = first_result {
+        // The receiver actively rejected the transfer (e.g. destination out of
+        // space) — SFTP writes to the same destination and would fail the same
+        // way, so surface the error instead of a pointless slow retry.
+        if e.downcast_ref::<crate::transfer::sender::ReceiverRejected>()
+            .is_some()
+        {
+            return Err(e);
+        }
         // A forced transport means the user explicitly chose QUIC or TCP+TLS —
         // do not silently fall back to SFTP.
         if config.forced_transport.is_some() {
