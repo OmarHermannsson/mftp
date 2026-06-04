@@ -5,6 +5,34 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Config file** at `~/.config/mftp/config.toml` for persistent per-link
+  defaults: `streams`, `chunk_size`, `no_compress`, `transport`,
+  `tcp_below_rtt`, `fec`, `port`. Precedence is explicit CLI flag > config file
+  > built-in default; an absent file is not an error.
+- **`MFTP_CC` environment variable** to override the QUIC congestion controller
+  (`bbr` / `cubic` / `reno`); the default remains BBR, which suits mftp's
+  high-BDP target.
+
+### Performance
+- **Adaptive compression now caps at zstd level 3** instead of escalating to
+  level 6 on highly-compressible data. Level 6 cost roughly 2× the CPU for only
+  ~7% better ratio, so whenever compression rather than the network was the
+  bottleneck it *reduced* throughput. On a 50 ms-RTT transfer of compressible
+  (JSON-log) data, throughput roughly doubled (~67 → ~135 MiB/s) after the
+  change. Incompressible data is unaffected (still drops to level 1 / skips).
+
+### Reliability
+- **In-band incremental repair now covers directory transfers** (previously
+  single-file only). A missing/corrupt chunk or unreconstructable FEC stripe in
+  a directory transfer is repaired over the existing connection — the sender
+  reverse-maps the global chunk index across the concatenated file set and the
+  receiver scatter-writes it — instead of aborting and resuming. No wire-format
+  change.
+- **Resume files now carry an integrity tag** (format v2): a corrupt or
+  bit-rotted resume file is detected on load and discarded (clean restart)
+  rather than trusted.
+
 ### Fixed
 - **Stream-scaling deadlock near end-of-transfer.** When adaptive stream scaling
   added streams just as the transfer was finishing, the sender could hang
@@ -15,14 +43,6 @@ All notable changes to mftp are documented here. The format is based on
   transfers at ~50 ms RTT under the default (adaptive-streams) configuration;
   pinning `-n N` was a workaround. The dispatch loop now re-checks completion
   after every event, and the case has a regression test.
-
-### Performance
-- **Adaptive compression now caps at zstd level 3** instead of escalating to
-  level 6 on highly-compressible data. Level 6 cost roughly 2× the CPU for only
-  ~7% better ratio, so whenever compression rather than the network was the
-  bottleneck it *reduced* throughput. On a 50 ms-RTT transfer of compressible
-  (JSON-log) data, throughput roughly doubled (~67 → ~135 MiB/s) after the
-  change. Incompressible data is unaffected (still drops to level 1 / skips).
 
 ## [0.1.130] — 2026-06-02
 
