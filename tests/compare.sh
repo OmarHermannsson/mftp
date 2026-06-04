@@ -40,6 +40,10 @@
 #   FILE_SMALL    smaller incompressible (loss)    (default /tmp/test_256m_random.bin)
 #   FILE_LOGS     compressible log source          (default /tmp/test_1g_logs.bin)
 #   SAMPLES       samples per cell                  (default 3)
+#   SYNC_REMOTE   if set, fsync the received file (timed) so all tools pay the
+#                 writeback cost equally — otherwise a fast tool reports
+#                 RAM-write speed while its bytes are still dirty in page cache.
+#                 (Alternatively set REMOTE_DIR=/dev/shm/... for a tmpfs dest.)
 set -uo pipefail
 
 REMOTE_USER=${REMOTE_USER:?set REMOTE_USER (e.g. export REMOTE_USER=myuser)}
@@ -87,6 +91,12 @@ run_tool(){
         mftp)     timeout "$to" "$MFTP_LOCAL" send --remote-mftp "$REMOTE_MFTP" "$file" "$REMOTE:$REMOTE_DIR/" >/dev/null 2>&1; rc=$? ;;
         mftp-fec) timeout "$to" "$MFTP_LOCAL" send --fec 8:2 --remote-mftp "$REMOTE_MFTP" "$file" "$REMOTE:$REMOTE_DIR/" >/dev/null 2>&1; rc=$? ;;
     esac
+    # SYNC_REMOTE: flush the received file to disk and count it in the time, so
+    # every tool pays the writeback cost equally — otherwise a fast tool returns
+    # while its bytes are still dirty in the receiver's page cache and reports
+    # RAM-write speed (the scp-on-LAN artifact). Credits mftp's streaming
+    # writeback (its final sync is cheap; scp/zap must flush the whole file).
+    [ $rc -eq 0 ] && [ -n "${SYNC_REMOTE:-}" ] && ssh_q "sync $REMOTE_DIR/$base" 2>/dev/null
     t1=$(date +%s.%N)
     [ $rc -ne 0 ] && { echo "FAIL 0"; return; }
     rsize=$(ssh_q "stat -c %s $REMOTE_DIR/$base 2>/dev/null" || echo 0)
