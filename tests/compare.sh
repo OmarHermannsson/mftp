@@ -40,10 +40,13 @@
 #   FILE_SMALL    smaller incompressible (loss)    (default /tmp/test_256m_random.bin)
 #   FILE_LOGS     compressible log source          (default /tmp/test_1g_logs.bin)
 #   SAMPLES       samples per cell                  (default 3)
-#   SYNC_REMOTE   if set, fsync the received file (timed) so all tools pay the
-#                 writeback cost equally — otherwise a fast tool reports
-#                 RAM-write speed while its bytes are still dirty in page cache.
-#                 (Alternatively set REMOTE_DIR=/dev/shm/... for a tmpfs dest.)
+#   SYNC_REMOTE   fsync the received file into the timing so all tools pay the
+#                 writeback cost equally (DEFAULT 1). Without it a fast tool
+#                 reports RAM-write speed while its bytes are still dirty in the
+#                 receiver's page cache (e.g. scp on a LAN measured 711 MiB/s
+#                 unsynced vs 64 synced). Set SYNC_REMOTE=0 for the old
+#                 cache-warm behaviour. (REMOTE_DIR=/dev/shm/... — a tmpfs dest —
+#                 is an alternative way to remove disk-write variance.)
 set -uo pipefail
 
 REMOTE_USER=${REMOTE_USER:?set REMOTE_USER (e.g. export REMOTE_USER=myuser)}
@@ -58,6 +61,7 @@ FILE_RANDOM=${FILE_RANDOM:-/tmp/test_1g_random.bin}
 FILE_SMALL=${FILE_SMALL:-/tmp/test_256m_random.bin}
 FILE_LOGS=${FILE_LOGS:-/tmp/test_1g_logs.bin}
 SAMPLES=${SAMPLES:-3}
+SYNC_REMOTE=${SYNC_REMOTE:-1}   # 1 = fsync received file into the timing (default); 0 = off
 
 # Job matrix: "label|file|netem|timeout|comma,separated,tools"
 JOBS=(
@@ -96,7 +100,7 @@ run_tool(){
     # while its bytes are still dirty in the receiver's page cache and reports
     # RAM-write speed (the scp-on-LAN artifact). Credits mftp's streaming
     # writeback (its final sync is cheap; scp/zap must flush the whole file).
-    [ $rc -eq 0 ] && [ -n "${SYNC_REMOTE:-}" ] && ssh_q "sync $REMOTE_DIR/$base" 2>/dev/null
+    [ $rc -eq 0 ] && [ "$SYNC_REMOTE" != 0 ] && ssh_q "sync $REMOTE_DIR/$base" 2>/dev/null
     t1=$(date +%s.%N)
     [ $rc -ne 0 ] && { echo "FAIL 0"; return; }
     rsize=$(ssh_q "stat -c %s $REMOTE_DIR/$base 2>/dev/null" || echo 0)
