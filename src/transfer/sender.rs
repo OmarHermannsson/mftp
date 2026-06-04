@@ -1137,7 +1137,6 @@ where
     // Interleave worker completions with scale signals from the reader task.
     // On ScaleMsg::Target: send AdjustStreams to the receiver.
     // On ScaleMsg::Ack:    spawn new workers (scale-up) using work_rx.clone().
-    let mut pending_scale: Option<u8> = None; // target we sent; waiting for Ack
     loop {
         tokio::select! {
             biased;
@@ -1169,9 +1168,6 @@ where
                     Err(e) => return Err(e),
                 }
                 active_workers -= 1;
-                if active_workers == 0 && pending_scale.is_none() {
-                    break;
-                }
             }
 
             // Scale signal from the reader task.
@@ -1184,7 +1180,6 @@ where
                             &SenderMessage::AdjustStreams { target_count: target },
                         )
                         .await?;
-                        pending_scale = Some(target);
                         // Scale-up: open new streams NOW, before the receiver acks.
                         // The receiver calls accept_stream() as soon as it processes
                         // AdjustStreams; if we wait for the ack first, the two sides
@@ -1238,12 +1233,20 @@ where
                         } else if new_count == current {
                             tracing::info!(now = new_count, "scaled up to {new_count} streams");
                         }
-                        pending_scale = None;
                     }
                     // FEC path, ignored variant, or channel closed — fall through.
                     _ => {}
                 }
             }
+        }
+        // All stream workers have exited ⇒ every chunk was dispatched and the
+        // work channel drained.  Re-checked after EVERY select! iteration (not
+        // only on a worker join) so a scale-up Ack that arrives AFTER the final
+        // worker already exited still terminates the loop.  Otherwise the loop
+        // would block forever on scale_rx with no workers left to join — the
+        // intermittent end-of-transfer deadlock when scaling fired late.
+        if active_workers == 0 {
+            break;
         }
     }
 
