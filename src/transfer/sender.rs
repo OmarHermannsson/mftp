@@ -616,6 +616,148 @@ fn build_manifest(
     }
 }
 
+/// Message from the control-stream reader task to the dispatch loop.
+enum ScaleMsg {
+    /// Recommended stream target (scale-up or scale-down).
+    Target(u8),
+    /// Receiver confirmed new stream count.
+    Ack(u8),
+}
+
+/// The dispatch/scaling coordination loop, extracted from `run_transfer` so its
+/// termination logic is unit-testable.
+///
+/// Runs until every worker in `tasks` has exited — which happens once the work
+/// channel is closed and drained (all chunks dispatched).  Services scale-up and
+/// scale-down requests from `scale_rx`, and aborts on a fatal receiver error from
+/// `early_abort_rx`.  `spawn_one(tasks)` spawns exactly one new stream worker,
+/// used for scale-up; it is moved in and dropped on return.
+///
+/// The termination check runs after EVERY `select!` iteration, not only on a
+/// worker join: a scale-up Ack (or any scale message) can arrive AFTER the final
+/// worker already exited, and the loop must still terminate rather than block
+/// forever on `scale_rx` with no workers left to join.  That gap was an
+/// intermittent end-of-transfer deadlock when scaling fired late (RTT-dependent).
+#[allow(clippy::too_many_arguments)]
+async fn run_dispatch_loop<CW, F>(
+    tasks: &mut JoinSet<Result<()>>,
+    mut active_workers: usize,
+    ctrl_send: &mut CW,
+    early_abort_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    scale_rx: &mut tokio::sync::mpsc::Receiver<ScaleMsg>,
+    current_streams: &AtomicUsize,
+    excess_stop: &AtomicUsize,
+    file_hasher: &Option<Arc<ChunkHasher>>,
+    fec_enabled: bool,
+    mut spawn_one: F,
+) -> Result<()>
+where
+    CW: AsyncWrite + Unpin,
+    F: FnMut(&mut JoinSet<Result<()>>),
+{
+    loop {
+        tokio::select! {
+            biased;
+
+            // B2: receiver signalled a fatal error via the control stream.
+            // Abort immediately — no point sending more chunks.
+            Some(msg) = early_abort_rx.recv() => {
+                bail!("receiver fatal error: {msg}");
+            }
+
+            // Drain completed workers first so active_workers stays accurate.
+            Some(res) = tasks.join_next() => {
+                match res? {
+                    Ok(()) => {}
+                    // B1: a single stream was stopped by the receiver (QUIC
+                    // STOP_SENDING) when one receiver worker died (hash mismatch,
+                    // disk error, …) and dropped its RecvStream.  The other
+                    // streams are still healthy — tolerate it and let resume fill
+                    // the gap rather than aborting the whole transfer.
+                    Err(e) if is_stream_stopped_by_peer(&e) && active_workers > 1 => {
+                        warn!(
+                            error = format!("{e:#}"),
+                            remaining = active_workers - 1,
+                            "QUIC stream stopped by receiver; \
+                             continuing on remaining streams (resume will fill gap)"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+                active_workers -= 1;
+            }
+
+            // Scale signal from the reader task.
+            msg = scale_rx.recv() => {
+                match msg {
+                    Some(ScaleMsg::Target(target)) if !fec_enabled => {
+                        // Send scale request to receiver.
+                        framing::send_message(
+                            ctrl_send,
+                            &SenderMessage::AdjustStreams { target_count: target },
+                        )
+                        .await?;
+                        // Scale-up: open new streams NOW, before the receiver acks.
+                        // The receiver calls accept_stream() as soon as it processes
+                        // AdjustStreams; if we wait for the ack first, the two sides
+                        // deadlock (receiver blocks on accept, sender blocks on ack).
+                        let current = current_streams.load(AtomicOrd::Relaxed);
+                        if target as usize > current {
+                            let extra = target as usize - current;
+                            for _ in 0..extra {
+                                spawn_one(tasks);
+                                active_workers += 1;
+                            }
+                            current_streams.store(target as usize, AtomicOrd::Relaxed);
+                            if let Some(h) = file_hasher {
+                                h.update_stream_count(target as usize);
+                            }
+                            tracing::info!(
+                                previous = current,
+                                now = target,
+                                "scaling up: connecting {extra} new streams"
+                            );
+                        }
+                    }
+                    Some(ScaleMsg::Ack(accepted)) if !fec_enabled => {
+                        let current = current_streams.load(AtomicOrd::Relaxed);
+                        let new_count = accepted as usize;
+                        if new_count < current {
+                            // Receiver accepted fewer streams than we opened — either a
+                            // scale-down ack or a partial scale-up (some accepts failed).
+                            // Signal excess workers to stop after their current chunk.
+                            // active_workers is NOT decremented here; it decrements via
+                            // tasks.join_next() as each worker exits.
+                            let excess = current - new_count;
+                            excess_stop.store(excess, AtomicOrd::Release);
+                            current_streams.store(new_count, AtomicOrd::Relaxed);
+                            if let Some(h) = file_hasher {
+                                h.update_stream_count(new_count);
+                            }
+                            tracing::info!(
+                                previous = current,
+                                now = new_count,
+                                "scaling down: {excess} workers will exit after current chunk"
+                            );
+                        } else if new_count == current {
+                            tracing::info!(now = new_count, "scaled up to {new_count} streams");
+                        }
+                    }
+                    // FEC path, ignored variant, or channel closed — fall through.
+                    _ => {}
+                }
+            }
+        }
+        // All stream workers have exited ⇒ every chunk was dispatched and the
+        // work channel drained.  Re-checked after EVERY select! iteration (see
+        // the doc comment) — this is the fix for the late-scaling deadlock.
+        if active_workers == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Core transfer logic shared by both the QUIC and TCP paths.
 ///
@@ -801,14 +943,6 @@ where
     // • AdjustStreamsAck — forwarded as ScaleMsg::Ack so the main loop can spawn
     //               new workers.
     // • Complete / Error — forwarded via `completion_tx` (terminal message).
-
-    /// Message sent from the reader task to the main transfer loop.
-    enum ScaleMsg {
-        /// Recommended stream target (scale-up or scale-down).
-        Target(u8),
-        /// Receiver confirmed new stream count.
-        Ack(u8),
-    }
 
     let pb_for_reader = pb.clone();
     // mpsc (not oneshot): the reader forwards Retransmit requests non-terminally
@@ -1116,139 +1250,47 @@ where
         })]
     };
 
-    // Spawn N stream workers.  Each worker gets a clone of the shared receiver
-    // (MPMC — all clones drain the same queue) and an Arc of the file hasher.
+    // Spawn N stream workers, and reuse the same spawner for scale-up.  Each
+    // worker gets a clone of the shared MPMC receiver (all clones drain the same
+    // queue) and an Arc of the file hasher.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    let mut active_workers = actual_streams;
+    let spawn_one = {
+        let work_rx = work_rx.clone();
+        let compression = compression.clone();
+        let file_hasher = file_hasher.clone();
+        let excess_stop = excess_stop.clone();
+        let cs = (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1));
+        move |tasks: &mut JoinSet<Result<()>>| {
+            tasks.spawn(spawn_worker(
+                work_rx.clone(),
+                transfer_id,
+                compression.clone(),
+                file_hasher.clone(),
+                excess_stop.clone(),
+                (Arc::clone(&cs.0), Arc::clone(&cs.1)),
+            ));
+        }
+    };
     for _ in 0..actual_streams {
-        let h = file_hasher.clone();
-        tasks.spawn(spawn_worker(
-            work_rx.clone(),
-            transfer_id,
-            compression.clone(),
-            h,
-            excess_stop.clone(),
-            (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1)),
-        ));
+        spawn_one(&mut tasks);
     }
 
-    // ── Dynamic scaling main loop ─────────────────────────────────────────────
-    //
-    // Interleave worker completions with scale signals from the reader task.
-    // On ScaleMsg::Target: send AdjustStreams to the receiver.
-    // On ScaleMsg::Ack:    spawn new workers (scale-up) using work_rx.clone().
-    loop {
-        tokio::select! {
-            biased;
-
-            // B2: receiver signalled a fatal error via the control stream.
-            // Abort immediately — no point sending more chunks.
-            Some(msg) = early_abort_rx.recv() => {
-                bail!("receiver fatal error: {msg}");
-            }
-
-            // Drain completed workers first so active_workers stays accurate.
-            Some(res) = tasks.join_next() => {
-                match res? {
-                    Ok(()) => {}
-                    // B1: a single stream was stopped by the receiver (QUIC
-                    // STOP_SENDING).  This happens when one receiver worker
-                    // dies (hash mismatch, disk error, etc.) and drops its
-                    // RecvStream with unread data.  The other streams are
-                    // still healthy — tolerate this and let resume fill the
-                    // gap rather than aborting the whole transfer.
-                    Err(e) if is_stream_stopped_by_peer(&e) && active_workers > 1 => {
-                        warn!(
-                            error = format!("{e:#}"),
-                            remaining = active_workers - 1,
-                            "QUIC stream stopped by receiver; \
-                             continuing on remaining streams (resume will fill gap)"
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-                active_workers -= 1;
-            }
-
-            // Scale signal from the reader task.
-            msg = scale_rx.recv() => {
-                match msg {
-                    Some(ScaleMsg::Target(target)) if config.fec.is_none() => {
-                        // Send scale request to receiver.
-                        framing::send_message(
-                            ctrl_send,
-                            &SenderMessage::AdjustStreams { target_count: target },
-                        )
-                        .await?;
-                        // Scale-up: open new streams NOW, before the receiver acks.
-                        // The receiver calls accept_stream() as soon as it processes
-                        // AdjustStreams; if we wait for the ack first, the two sides
-                        // deadlock (receiver blocks on accept, sender blocks on ack).
-                        let current = current_streams_arc.load(AtomicOrd::Relaxed);
-                        if target as usize > current {
-                            let extra = target as usize - current;
-                            for _ in 0..extra {
-                                let h = file_hasher.clone();
-                                tasks.spawn(spawn_worker(
-                                    work_rx.clone(),
-                                    transfer_id,
-                                    compression.clone(),
-                                    h,
-                                    excess_stop.clone(),
-                                    (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1)),
-                                ));
-                                active_workers += 1;
-                            }
-                            current_streams_arc.store(target as usize, AtomicOrd::Relaxed);
-                            if let Some(h) = &file_hasher {
-                                h.update_stream_count(target as usize);
-                            }
-                            tracing::info!(
-                                previous = current,
-                                now = target,
-                                "scaling up: connecting {extra} new streams"
-                            );
-                        }
-                    }
-                    Some(ScaleMsg::Ack(accepted)) if config.fec.is_none() => {
-                        let current = current_streams_arc.load(AtomicOrd::Relaxed);
-                        let new_count = accepted as usize;
-                        if new_count < current {
-                            // Receiver accepted fewer streams than we opened — either a
-                            // scale-down ack or a partial scale-up (some accepts failed).
-                            // Signal excess workers to stop after their current chunk.
-                            // active_workers is NOT decremented here; it decrements via
-                            // tasks.join_next() as each worker exits.
-                            let excess = current - new_count;
-                            excess_stop.store(excess, AtomicOrd::Release);
-                            current_streams_arc.store(new_count, AtomicOrd::Relaxed);
-                            if let Some(h) = &file_hasher {
-                                h.update_stream_count(new_count);
-                            }
-                            tracing::info!(
-                                previous = current,
-                                now = new_count,
-                                "scaling down: {excess} workers will exit after current chunk"
-                            );
-                        } else if new_count == current {
-                            tracing::info!(now = new_count, "scaled up to {new_count} streams");
-                        }
-                    }
-                    // FEC path, ignored variant, or channel closed — fall through.
-                    _ => {}
-                }
-            }
-        }
-        // All stream workers have exited ⇒ every chunk was dispatched and the
-        // work channel drained.  Re-checked after EVERY select! iteration (not
-        // only on a worker join) so a scale-up Ack that arrives AFTER the final
-        // worker already exited still terminates the loop.  Otherwise the loop
-        // would block forever on scale_rx with no workers left to join — the
-        // intermittent end-of-transfer deadlock when scaling fired late.
-        if active_workers == 0 {
-            break;
-        }
-    }
+    // Dynamic scaling main loop (extracted to run_dispatch_loop for testability).
+    // `spawn_one` is moved in and dropped on return, releasing the file-hasher
+    // Arc clone it holds before the try_unwrap below.
+    run_dispatch_loop(
+        &mut tasks,
+        actual_streams,
+        ctrl_send,
+        &mut early_abort_rx,
+        &mut scale_rx,
+        &current_streams_arc,
+        &excess_stop,
+        &file_hasher,
+        config.fec.is_some(),
+        spawn_one,
+    )
+    .await?;
 
     // Workers done; all feeders should have finished by now (channel closed).
     for feeder in feeders {
@@ -2699,4 +2741,95 @@ where
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Semaphore};
+
+    /// Regression test for the late-scaling end-of-transfer deadlock.
+    ///
+    /// Reproduces the ordering where the final worker exits while a scale-up is
+    /// still in flight.  The fixed loop terminates on `active_workers == 0`; the
+    /// buggy version (termination checked only in the worker-join arm, gated on a
+    /// since-removed `pending_scale`) blocked forever on `scale_rx` with no
+    /// workers left to join.
+    #[tokio::test]
+    async fn dispatch_loop_terminates_when_worker_drains_during_scale_up() {
+        // Workers are gated on this semaphore so they cannot finish until we
+        // release them — guaranteeing the scale-up Target is processed first.
+        let sem = Arc::new(Semaphore::new(0));
+        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+        {
+            let sem = sem.clone();
+            tasks.spawn(async move {
+                let _p = sem.acquire().await.unwrap();
+                Ok(())
+            });
+        }
+
+        // Keep the tx ends alive for the whole test so the channels stay open
+        // (a closed scale_rx would let even the buggy loop fall through).
+        let (_ea_tx, mut ea_rx) = mpsc::channel::<String>(1);
+        let (scale_tx, mut scale_rx) = mpsc::channel::<ScaleMsg>(8);
+        let current = AtomicUsize::new(1);
+        let excess = AtomicUsize::new(0);
+        let hasher: Option<Arc<ChunkHasher>> = None;
+        let mut sink = tokio::io::sink();
+
+        // Queue a scale-up Target (1 → 2); deliberately send NO Ack.  After the
+        // workers drain, a correct loop breaks on active_workers == 0.
+        scale_tx.send(ScaleMsg::Target(2)).await.unwrap();
+
+        // Scale-up spawner: adds another gated worker.
+        let spawn_one = {
+            let sem = sem.clone();
+            move |ts: &mut JoinSet<Result<()>>| {
+                let sem = sem.clone();
+                ts.spawn(async move {
+                    let _p = sem.acquire().await.unwrap();
+                    Ok(())
+                });
+            }
+        };
+
+        let loop_fut = run_dispatch_loop(
+            &mut tasks,
+            1,
+            &mut sink,
+            &mut ea_rx,
+            &mut scale_rx,
+            &current,
+            &excess,
+            &hasher,
+            false,
+            spawn_one,
+        );
+
+        // Let the loop process the Target (spawning worker #2), then release both
+        // workers.  The fixed loop returns; the buggy one hangs on scale_rx.
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sem.add_permits(2);
+            std::future::pending::<()>().await
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                r = loop_fut => r,
+                _ = driver => unreachable!("driver future never resolves"),
+            }
+        })
+        .await;
+
+        // scale_tx stays alive until here so scale_rx never closes.
+        let _keep_tx = &scale_tx;
+
+        outcome
+            .expect("run_dispatch_loop deadlocked after a late scale-up (regression)")
+            .expect("run_dispatch_loop returned an error");
+    }
 }
