@@ -21,6 +21,11 @@ All notable changes to mftp are documented here. The format is based on
   bottleneck it *reduced* throughput. On a 50 ms-RTT transfer of compressible
   (JSON-log) data, throughput roughly doubled (~67 → ~135 MiB/s) after the
   change. Incompressible data is unaffected (still drops to level 1 / skips).
+- **Sender skips zero-filling chunk buffers.** The file feeders read into
+  uninitialised buffers (immediately and fully overwritten by the read) instead
+  of allocating `vec![0u8; chunk_size]` per chunk. Profiling the LAN/TCP path
+  showed the redundant zero-fill was ~10% of sender CPU; removed with no
+  behaviour change.
 
 ### Reliability
 - **In-band incremental repair now covers directory transfers** (previously

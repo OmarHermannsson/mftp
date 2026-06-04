@@ -1546,8 +1546,7 @@ fn feed_chunks(
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
 
-        let mut raw = vec![0u8; len];
-        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
+        let raw = crate::fs_ext::read_exact_at_vec(&file, len, offset)
             .with_context(|| format!("read chunk {idx}"))?;
 
         // send_blocking provides backpressure: if the channel is full the
@@ -1880,8 +1879,7 @@ fn feed_chunks_range(
         }
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
-        let mut raw = vec![0u8; len];
-        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
+        let raw = crate::fs_ext::read_exact_at_vec(&file, len, offset)
             .with_context(|| format!("read chunk {idx}"))?;
         if tx.send_blocking((idx, raw)).is_err() {
             break;
@@ -2260,8 +2258,7 @@ fn feed_chunks_single(
         }
         let offset = idx * chunk_size as u64;
         let len = (chunk_size as u64).min(file_size - offset) as usize;
-        let mut raw = vec![0u8; len];
-        crate::fs_ext::read_exact_at(&file, &mut raw, offset)
+        let raw = crate::fs_ext::read_exact_at_vec(&file, len, offset)
             .with_context(|| format!("read chunk {idx}"))?;
         if tx.blocking_send((idx, raw)).is_err() {
             break; // encoder side dropped (failed) — feeder exits cleanly
