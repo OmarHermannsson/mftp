@@ -5,6 +5,19 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
+_Nothing user-facing yet._
+
+## [0.2.0] — 2026-06-04
+
+First release since 0.1.130. Headline: a fix for an intermittent end-of-transfer
+hang, directory in-band repair, a config file, and compression/CPU performance
+wins.
+
+### Protocol
+- **Wire-compatible with 0.1.130** — `PROTOCOL_VERSION` is unchanged (6), so
+  0.1.130 and 0.2.0 peers interoperate over the QUIC/TCP direct path. No forced
+  upgrade.
+
 ### Added
 - **Config file** at `~/.config/mftp/config.toml` for persistent per-link
   defaults: `streams`, `chunk_size`, `no_compress`, `transport`,
