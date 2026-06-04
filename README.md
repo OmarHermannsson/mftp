@@ -447,17 +447,31 @@ Socket buffers are set to 32 MiB (`SO_SNDBUF` / `SO_RCVBUF`) on both ends. QUIC 
 
 ## Performance
 
-Benchmarked against `scp` on a 10 GbE link, 1 GiB random (incompressible) file:
+mftp vs `scp` vs `zap` (parallel-SSH copy), 1 GiB incompressible file, netem-shaped
+latency/loss on a gigabit-class link. Median of 3 runs; page cache dropped on both
+ends and the received file fsync'd **into** the timing ("durability-fair", so no tool
+is flattered by the receiver's write cache — see [`tests/compare.sh`](tests/compare.sh)).
+MiB/s of the original file size:
 
-| Link | scp | mftp (auto) | speedup |
-|------|-----|-------------|---------|
-| LAN (< 5 ms) | ~440 MiB/s | ~440 MiB/s | 1× |
-| 50 ms RTT | 36 MiB/s | **71 MiB/s** | **2× faster** |
-| 150 ms RTT | 12 MiB/s | **82 MiB/s** | **7× faster** |
-| 400 ms RTT | 4.6 MiB/s | **43 MiB/s** | **9× faster** |
-| 600 ms + 1% loss | 2.6 MiB/s | **29 MiB/s** | **11× faster** |
+| Link | scp | zap | mftp (auto) |
+|------|----:|----:|------------:|
+| 50 ms RTT | 34 | 62 | **111** |
+| 150 ms RTT | 12 | 40 | **106** |
+| 150 ms + 1% loss | 9 | 20 | **39** |
 
-LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and beyond, QUIC BBR with parallel streams dominates.
+scp's single TCP stream collapses as latency rises; zap's parallel SSH streams hold a
+middle band; mftp's QUIC + adaptive streams stays near-flat (~110 MiB/s from 50→150 ms)
+— **~2.6× zap and ~9× scp at 150 ms**, and the gap widens with RTT.
+
+On a sub-15 ms LAN mftp uses the auto TCP+TLS path, and the receiver's *disk write*
+becomes the bottleneck, not the protocol — durability-fair, mftp sustains ~150+ MiB/s
+because it overlaps writeback with the transfer, while a cache-warm measurement can make
+scp look momentarily faster simply by buffering into RAM (it then pays a long fsync). For
+compressible data mftp pulls further ahead (adaptive zstd ships fewer bytes); `--fec` does
+**not** help at any loss rate — see [Reed-Solomon FEC](#reed-solomon-fec).
+
+> Absolute numbers are testbed- and disk-dependent; the ratios and the RTT-flatness are
+> the point. Reproduce with `tests/compare.sh` (set `REMOTE_USER`/`REMOTE_HOST`).
 
 ---
 
@@ -473,7 +487,7 @@ LAN performance uses the auto TCP+TLS path (same speed as scp). At 50 ms and bey
 ## Performance tips
 
 - **Satellite / high-latency links**: mftp is designed for these. Let RTT negotiation pick the parameters; don't override unless you have a reason.
-- **Lossy links**: add `--fec 8:2` (or `--fec 4:1` for lighter overhead) to tolerate burst loss without retransmission. FEC shines on links where 1–5% packet loss is common.
+- **Lossy links**: no action needed — QUIC's own retransmission handles packet loss. Do **not** add `--fec`: benchmarking up to 30% loss shows it doesn't improve throughput (QUIC already recovers loss, so parity is pure overhead) and heavy parity is slower. See [Reed-Solomon FEC](#reed-solomon-fec).
 - **LAN / datacenter transfers**: mftp auto-switches to TCP+TLS when it measures RTT ≤ 15 ms. No flags needed — just run the same command.
 - **Pre-compressed data** (videos, archives, already-zstd files): mftp auto-detects these and skips compression. No `--no-compress` needed.
 - **Open port required**: in SSH mode, use `--port <N>` with a firewall-allowed port to avoid the automatic fallback to SFTP. The SFTP path is reliable but slower.
