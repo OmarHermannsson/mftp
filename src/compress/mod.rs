@@ -24,8 +24,15 @@ const SAMPLE_SIZE: usize = 64 * 1024;
 /// ratio seen across recent chunks and adjusts the zstd level accordingly:
 ///
 /// - ratio < 8 %  → level 1 (near-incompressible data; spend minimal CPU)
-/// - ratio > 35 % → level 6 (highly compressible; worth the extra CPU)
-/// - otherwise    → level 3 (default mid-range)
+/// - otherwise    → level 3
+///
+/// We deliberately do NOT escalate to level 6 on highly-compressible data.
+/// Measured on realistic JSON logs, level 6 buys only ~7% better ratio than
+/// level 3 (5.38× → 5.79×) for roughly 2× the CPU.  Whenever compression is
+/// anywhere near the throughput bottleneck — which, on a fast link, it is —
+/// that extra CPU *reduces* end-to-end throughput: a 50 ms-RTT transfer of
+/// compressible data ran at 38 MiB/s at level 6 vs 90 MiB/s uncompressed.
+/// Level 3 keeps nearly all the bandwidth saving at far lower CPU cost.
 ///
 /// The level is held constant for the first 4 chunks so the EMA has time to
 /// warm up before any adjustment.  Each worker owns its own instance, so
@@ -62,10 +69,9 @@ impl AdaptiveLevel {
         if self.chunks_seen >= 4 {
             self.level = if self.ema_ratio < 0.08 {
                 1 // Near-incompressible — use the fastest level to save CPU.
-            } else if self.ema_ratio > 0.35 {
-                6 // Highly compressible — invest more CPU for better ratio.
             } else {
-                3 // Default mid-range.
+                3 // Compressible — level 3 is the best ratio/CPU trade-off
+                  // (see the type doc for why we don't escalate to level 6).
             };
         }
     }
