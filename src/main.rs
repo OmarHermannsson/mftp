@@ -83,9 +83,12 @@ struct Cli {
 
     /// Enable Reed-Solomon forward error correction.
     ///
-    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead but
-    /// tolerates up to 2 lost chunks per 8-chunk stripe without retransmission).
-    /// Most useful on high-latency lossy links (satellite, intercontinental).
+    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead).
+    /// NOTE: this does NOT improve throughput. mftp's chunks ride reliable QUIC
+    /// streams, which already retransmit lost packets, so the parity is pure
+    /// overhead competing for the link (benchmarked a wash-to-worse up to 30%
+    /// loss). Leave it off unless you specifically want the receiver to
+    /// reconstruct an occasional corrupt chunk without an in-band repair round.
     /// Automatically disabled when the transport falls back to TCP (reliable delivery).
     #[arg(long, global = true, value_name = "DATA:PARITY")]
     fec: Option<String>,

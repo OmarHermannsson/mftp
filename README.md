@@ -22,7 +22,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **SSH-assisted launch** | Spawns the receiver on the remote via SSH — no manual setup |
 | **SFTP fallback** | If both QUIC and TCP+TLS are blocked, falls back to N parallel SFTP connections through port 22 — only this path requires no open port beyond SSH. **Significantly slower** (~22–32 MiB/s cap) due to SSH SFTP protocol overhead |
 | **Adaptive compression** | Per-chunk zstd; skips chunks that don't compress (already-compressed formats auto-detected) |
-| **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`) for lossy links; tolerates burst loss without retransmission |
+| **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`). Note: does *not* improve throughput over QUIC (which already recovers loss) — see [Reed-Solomon FEC](#reed-solomon-fec) |
 | **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
@@ -97,12 +97,17 @@ The receiver port (7777 by default) must be reachable: UDP for QUIC, TCP for TCP
 mftp auto-tunes for the measured RTT, so the defaults are usually right. These show the flags worth setting when you know the link in advance.
 
 **Satellite / very high latency (RTT ≳ 300 ms, some loss).**
-Keep QUIC (it shines on long fat pipes), and add FEC so lost chunks are repaired from parity instead of waiting a full RTT for retransmission:
+The defaults are right: QUIC shines on long fat pipes and recovers loss via its own
+retransmission. Just let it run:
 
 ```sh
-# 8:2 = 25% parity overhead, tolerates 2 lost chunks per stripe
-mftp send dataset.tar user@ground-station:/data/ --fec 8:2
+mftp send dataset.tar user@ground-station:/data/
 ```
+
+> **Don't reach for `--fec` here.** Benchmarking up to 30% loss shows FEC does *not*
+> improve throughput over QUIC — QUIC already retransmits lost packets reliably, so the
+> parity shards are pure overhead competing for the loss-limited link. See
+> [Reed-Solomon FEC](#reed-solomon-fec).
 
 **Intercontinental fibre (RTT ~150 ms, low loss).**
 The defaults are tuned for exactly this. Pin a higher stream count only if you have spare CPU and the single-flow rate is capped by per-stream flow control:
@@ -168,10 +173,14 @@ Options:
       --preserve           Preserve source file permissions and modification time
                            on the receiver. No effect on Windows receivers.
       --fec <DATA:PARITY>  Enable Reed-Solomon forward error correction.
-                           e.g. --fec 8:2 adds 25% overhead but tolerates up to 2
-                           lost chunks per stripe without retransmission.
-                           Automatically disabled when the transport falls back to
-                           TCP (reliable delivery).
+                           e.g. --fec 8:2 adds 25% bandwidth overhead.
+                           NOTE: this does NOT improve throughput — QUIC already
+                           retransmits lost packets reliably, so the parity is
+                           pure overhead (benchmarked a wash-to-worse up to 30%
+                           loss). Leave it off unless you specifically want a
+                           receiver to reconstruct an occasional corrupt chunk
+                           without an in-band repair round. Auto-disabled on the
+                           TCP fallback (reliable delivery).
       --transport <TRANSPORT>
                            Force a specific transport path:
                            quic — QUIC only; fails immediately if UDP is blocked
@@ -369,7 +378,18 @@ Enable with `--fec DATA:PARITY` on the sender (e.g. `--fec 8:2`). The receiver a
 
 **Ordering**: compression happens before FEC encoding, so parity shards are computed over (and are the same size as) compressed data shards. FEC is automatically disabled when the transport falls back to TCP, since TCP guarantees delivery.
 
-**Overhead**: `--fec 8:2` adds 25% to the wire size (`2/8`). Use it when packet loss is high enough that retransmission round-trips would dominate transfer time (satellite, intercontinental, congested links).
+**Overhead**: `--fec 8:2` adds 25% to the wire size (`2/8`).
+
+> **FEC does not improve throughput over QUIC — leave it off.** Because mftp's chunks
+> ride **reliable QUIC streams**, QUIC already retransmits every lost packet, so chunks
+> always arrive intact and there is no permanent gap for parity to fill. The parity shards
+> are simply extra bytes competing for the (loss-limited) link, and they are subject to the
+> same loss + retransmission. Benchmarks bear this out: across 1%, 5%, 10%, 20% and 30%
+> loss (and 300 ms RTT), `--fec` is a wash-to-worse versus plain QUIC, and heavy parity
+> (`4:4`) is reliably *slower*. FEC's only real value is letting the receiver reconstruct
+> the occasional chunk that fails its BLAKE3 check (or rode a reset stream) without a
+> repair round-trip — a niche reliability edge, not a throughput lever. It would pay off
+> over an *unreliable/datagram* transport, which mftp does not use.
 
 ### Compression
 
@@ -378,10 +398,10 @@ mftp compresses each chunk independently with zstd:
 1. **Magic-byte check** — if the first 4 bytes match a known compressed format (gzip, zstd, bzip2, zip, 7-zip, xz, jpeg, png, mp4, mkv/webm…), compression is skipped entirely.
 2. **Sample probe** — a 64 KiB leading sample is compressed first; if it doesn't shrink by ≥ 5%, the chunk is sent raw without compressing the rest, so incompressible data not caught by the magic-byte table costs only the sample, not the full chunk.
 3. **Full-chunk compression** — if the sample compresses well, the whole chunk is compressed; a final 5% threshold still applies (only the leading portion may have been compressible), and the compressed bytes are discarded if it isn't met.
-4. **Adaptive level** — a per-worker EMA of the achieved ratio shifts the zstd level between 1 / 3 / 6 to trade CPU for ratio.
+4. **Adaptive level** — a per-worker EMA of the achieved ratio picks the zstd level: 1 for near-incompressible data, 3 otherwise. It deliberately does **not** escalate to level 6 — measured, that costs ~2× the CPU for only ~7% better ratio, which *reduces* throughput whenever compression (not the network) is the bottleneck.
 5. **Per-chunk flag** — `ChunkData.compressed` tells the receiver whether to decompress.
 
-`--no-compress` skips the whole path.
+`--no-compress` skips the whole path. On a fast link (LAN / fast datacenter) compression can be the bottleneck — its CPU cost outweighs the bandwidth saved — so prefer `--no-compress` there; mftp's auto TCP switch below `--tcp-below-rtt` doesn't disable compression for you.
 
 ### Integrity
 
