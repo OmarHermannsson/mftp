@@ -2492,6 +2492,9 @@ mod tests {
         }
     }
 
+    // The free-space precondition relies on statvfs, so it only enforces on unix;
+    // on other targets `available_space` returns u64::MAX (check disabled).
+    #[cfg(unix)]
     #[test]
     fn prepare_transfer_refuses_when_destination_too_small() {
         let dir = tempfile::tempdir().unwrap();
