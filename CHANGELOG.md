@@ -5,6 +5,13 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
+_Nothing user-facing yet._
+
+## [0.2.2] — 2026-06-05
+
+Patch release: robustness fix for out-of-space destinations. Wire-compatible
+with 0.2.0 / 0.1.130.
+
 ### Fixed
 - **Out-of-space destinations now fail fast and cleanly.** The receiver checks
   free space against the file size before allocating and, if it won't fit,
