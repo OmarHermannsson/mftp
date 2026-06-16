@@ -259,13 +259,11 @@ pub fn make_server_endpoint_with_cert(
 /// the user is prompted on the first connection to a new server.
 pub fn make_client_endpoint(
     trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
     server_addr: SocketAddr,
 ) -> Result<Endpoint> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
-        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-        None => Arc::new(TofuVerifier::new(server_addr)),
-    };
+    let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
 
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -351,13 +349,11 @@ pub fn make_server_tls_config(
 /// Build a rustls `ClientConfig` for the TCP+TLS path (no QUIC-specific settings).
 pub fn make_client_tls_config(
     trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
     server_addr: SocketAddr,
 ) -> Result<rustls::ClientConfig> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
-        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-        None => Arc::new(TofuVerifier::new(server_addr)),
-    };
+    let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
     Ok(rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -545,6 +541,106 @@ impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Accepts only a certificate whose Ed25519 DeviceId matches a pre-shared value.
+///
+/// Unlike [`PinnedFingerprintVerifier`] (which pins the whole certificate),
+/// this pins the device's public key, so it keeps matching even if the device
+/// re-issues its certificate. The DeviceId is the hex SHA-256 of the cert's
+/// Ed25519 SubjectPublicKeyInfo (see [`crate::identity::device_id_from_cert`]).
+#[derive(Debug)]
+struct PinnedDeviceVerifier {
+    expected: String,
+}
+
+impl PinnedDeviceVerifier {
+    fn new(device_id: &str) -> Result<Self> {
+        let normalized = normalize_fingerprint(device_id);
+        if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!(
+                "invalid --trust-device id (expected 64 hex chars, got {} usable): {device_id:?}",
+                normalized.len()
+            );
+        }
+        Ok(Self {
+            expected: normalized,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedDeviceVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let got = crate::identity::device_id_from_cert(end_entity).ok_or_else(|| {
+            rustls::Error::General(
+                "peer certificate has no Ed25519 device key — cannot match --trust-device".into(),
+            )
+        })?;
+        if got != self.expected {
+            return Err(rustls::Error::General(format!(
+                "device id mismatch\n  got:      {got}\n  expected: {}",
+                self.expected
+            )));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build the client-side certificate verifier from the trust options.
+///
+/// Precedence: a pinned DeviceId (`--trust-device`) wins over a pinned cert
+/// fingerprint (`--trust`), which wins over interactive TOFU.
+fn build_client_verifier(
+    trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    server_addr: SocketAddr,
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>> {
+    Ok(match (trusted_device, trusted_fingerprint) {
+        (Some(dev), _) => Arc::new(PinnedDeviceVerifier::new(dev)?),
+        (None, Some(fp)) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
+        (None, None) => Arc::new(TofuVerifier::new(server_addr)),
+    })
 }
 
 // ── TOFU known-hosts helpers ──────────────────────────────────────────────────

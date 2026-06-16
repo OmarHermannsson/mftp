@@ -57,6 +57,7 @@ async fn roundtrip(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -152,6 +153,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             compress: true,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -219,6 +221,7 @@ async fn roundtrip_tcp(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -289,7 +292,7 @@ async fn test_tls_two_streams_raw() -> anyhow::Result<()> {
     // Client: open 2 TLS connections and write DATA_SIZE bytes each
     for i in 0..2 {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
-        let config = make_client_tls_config(Some(&fingerprint), addr)?;
+        let config = make_client_tls_config(Some(&fingerprint), None, addr)?;
         let connector = TlsConnector::from(Arc::new(config));
         let server_name = ServerName::IpAddress(addr.ip().into());
         let mut tls = connector.connect(server_name, tcp).await?;
@@ -353,6 +356,7 @@ async fn roundtrip_fec(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: Some(FecParams {
@@ -451,6 +455,7 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
             compress: false,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             // FEC requested but should be silently discarded for TCP
@@ -507,6 +512,7 @@ async fn roundtrip_dir(
             compress,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -722,6 +728,7 @@ async fn test_require_recursive_flag() {
             compress: false,
             compress_level: 3,
             trusted_fingerprint: None,
+            trusted_device: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -747,4 +754,83 @@ async fn test_single_file_v3_no_entries() -> anyhow::Result<()> {
     let src = make_test_file(send_dir.path(), "solo.bin", 512 * 1024);
     // Use the standard roundtrip — the test just ensures no regression.
     roundtrip(src, &recv_dir, 2, 256 * 1024, false).await
+}
+
+// ── M2: persistent identity / --trust-device ───────────────────────────────────
+
+/// Helper: bind a QUIC receiver serving a persistent Ed25519 identity, returning
+/// the bound server and the identity (for its DeviceId / fingerprint).
+fn bind_identity_server(
+    recv_dir: &Path,
+    cfg_dir: &Path,
+) -> anyhow::Result<(Server, mftp::identity::Identity)> {
+    use mftp::net::connection::make_private_key;
+    let id = mftp::identity::load_or_create_in(cfg_dir)?;
+    let key = make_private_key(id.key_bytes.clone())?;
+    let server = Server::bind_with_cert(
+        "127.0.0.1:0".parse()?,
+        recv_dir.to_owned(),
+        id.cert.clone(),
+        key,
+        id.fingerprint.clone(),
+    )?;
+    Ok((server, id))
+}
+
+fn device_pin_config(device_id: Option<String>) -> SendConfig {
+    SendConfig {
+        streams: Some(2),
+        chunk_size: Some(256 * 1024),
+        compress: false,
+        compress_level: 3,
+        trusted_fingerprint: None,
+        trusted_device: device_id,
+        // Force QUIC so the DeviceId verifier runs against the Ed25519 cert
+        // (loopback RTT would otherwise switch to TCP).
+        forced_transport: Some(ForcedTransport::Quic),
+        tcp_rtt_threshold: std::time::Duration::ZERO,
+        fec: None,
+        parallel_reads: false,
+        recursive: false,
+        preserve: false,
+    }
+}
+
+/// Pinning the receiver's correct Ed25519 DeviceId completes the transfer.
+#[tokio::test]
+async fn test_trust_device_correct_id_succeeds() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let cfg_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "dev.bin", 600 * 1024);
+
+    let (server, id) = bind_identity_server(recv_dir.path(), cfg_dir.path())?;
+    let addr = server.local_addr;
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    sender::send(src.clone(), addr, device_pin_config(Some(id.device_id))).await?;
+    recv_task.await??;
+
+    let received = recv_dir.path().join(src.file_name().unwrap());
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}
+
+/// Pinning the wrong DeviceId is rejected at the TLS handshake (no MITM slips by).
+#[tokio::test]
+async fn test_trust_device_wrong_id_rejected() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let cfg_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "dev.bin", 256 * 1024);
+
+    let (server, _id) = bind_identity_server(recv_dir.path(), cfg_dir.path())?;
+    let addr = server.local_addr;
+    // Receiver may accept the connection but the client must reject the cert.
+    let _recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    let wrong = "0".repeat(64);
+    let result = sender::send(src, addr, device_pin_config(Some(wrong))).await;
+    assert!(result.is_err(), "wrong DeviceId pin must fail the transfer");
+    Ok(())
 }

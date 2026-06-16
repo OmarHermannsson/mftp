@@ -136,6 +136,9 @@ pub struct SendConfig {
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
     pub trusted_fingerprint: Option<String>,
+    /// Hex Ed25519 DeviceId to pin (`--trust-device`); takes precedence over
+    /// `trusted_fingerprint`. Survives the peer re-issuing its certificate.
+    pub trusted_device: Option<String>,
     /// Force a specific transport path; `None` = auto (QUIC → TCP+TLS → SFTP).
     pub forced_transport: Option<ForcedTransport>,
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this
@@ -188,7 +191,11 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     // Try QUIC first (or QUIC only if forced); fall back to TCP+TLS in auto mode if:
     //   • UDP is blocked or the handshake times out, OR
     //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter).
-    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref(), destination)?;
+    let endpoint = make_client_endpoint(
+        config.trusted_fingerprint.as_deref(),
+        config.trusted_device.as_deref(),
+        destination,
+    )?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
     let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
         let connecting = endpoint
@@ -538,7 +545,12 @@ async fn send_tcp(
         .unwrap_or(4) as u32;
 
     info!("connecting to {destination} (TCP+TLS)");
-    let ctrl = connect_tls(destination, config.trusted_fingerprint.as_deref()).await?;
+    let ctrl = connect_tls(
+        destination,
+        config.trusted_fingerprint.as_deref(),
+        config.trusted_device.as_deref(),
+    )
+    .await?;
     let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl);
     info!("connected");
 
@@ -557,6 +569,7 @@ async fn send_tcp(
     let rtt = rtt_start.elapsed();
 
     let trusted_fp = config.trusted_fingerprint.clone();
+    let trusted_dev = config.trusted_device.clone();
     let peer_version = neg_resp.protocol_version;
     let send_hello = peer_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
 
@@ -578,8 +591,9 @@ async fn send_tcp(
         None, // TCP can't pipeline: it measures RTT via the negotiate round-trip
         move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
             let fp = trusted_fp.clone();
+            let dev = trusted_dev.clone();
             async move {
-                let stream = connect_tls(destination, fp.as_deref())
+                let stream = connect_tls(destination, fp.as_deref(), dev.as_deref())
                     .await
                     .context("open TCP data stream")?;
                 tcp_stream_worker(

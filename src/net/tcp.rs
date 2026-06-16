@@ -116,11 +116,12 @@ pub fn make_tls_acceptor(
 pub async fn connect_tls(
     addr: SocketAddr,
     trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
 ) -> Result<ClientTlsStream<TcpStream>> {
     use crate::net::connection::make_client_tls_config;
 
     let tcp = connect_raw(addr).await?;
-    let config = make_client_tls_config(trusted_fingerprint, addr)?;
+    let config = make_client_tls_config(trusted_fingerprint, trusted_device, addr)?;
     let connector = TlsConnector::from(Arc::new(config));
     // Use the server's IP address as the TLS SNI — our custom verifiers don't
     // validate the name, but TLS requires one.

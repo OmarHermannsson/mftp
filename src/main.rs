@@ -154,6 +154,12 @@ enum Command {
         /// Ignored in SSH mode — fingerprint is obtained automatically.
         #[arg(long)]
         trust: Option<String>,
+        /// Pin the receiver's Ed25519 DeviceId (hex), as printed by `mftp receive`
+        /// ("Device ID: …"). Unlike --trust this survives the receiver re-issuing
+        /// its certificate, and takes precedence over --trust when both are given.
+        /// Ignored in SSH mode.
+        #[arg(long, value_name = "HEX")]
+        trust_device: Option<String>,
         /// Path to a pre-installed mftp binary on the remote (SSH mode only).
         /// By default mftp pipes itself over SSH stdin and caches it at
         /// ~/.cache/mftp-<hash> on the remote; subsequent transfers with the
@@ -290,6 +296,7 @@ async fn main() -> Result<()> {
             file,
             destination,
             trust,
+            trust_device,
             remote_mftp,
             port,
             download,
@@ -346,6 +353,7 @@ async fn main() -> Result<()> {
                 compress,
                 compress_level: 3,
                 trusted_fingerprint: trust,
+                trusted_device: trust_device,
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,

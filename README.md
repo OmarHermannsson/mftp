@@ -27,6 +27,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
+| **Persistent device identity** | The receiver keeps a stable Ed25519 key + certificate in `~/.config/mftp/`, so its fingerprint no longer changes across restarts. `mftp receive` prints a stable **Device ID**; `--trust-device <id>` pins the device key (survives certificate re-issuance, unlike `--trust`) |
 
 ---
 

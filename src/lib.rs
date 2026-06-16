@@ -2,6 +2,7 @@ pub mod compress;
 pub mod config;
 pub mod fec;
 pub mod fs_ext;
+pub mod identity;
 pub mod net;
 pub mod progress;
 pub mod protocol;

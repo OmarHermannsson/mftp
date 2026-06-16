@@ -280,29 +280,37 @@ impl TcpServer {
 /// The sender auto-detects which transport is available: it tries QUIC first
 /// (with a short timeout) and falls back to TCP+TLS if UDP is blocked.
 pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
-    // Generate one cert — used by both QUIC and TCP so the fingerprint is the same.
-    let (cert, key_bytes) = generate_self_signed_cert()?;
-    let fingerprint = cert_fingerprint(&cert);
+    // Persistent device identity: one cert shared by QUIC and TCP, stable across
+    // restarts so a pinned/TOFU fingerprint keeps matching (see crate::identity).
+    let id = crate::identity::load_or_create()?;
+    let fingerprint = id.fingerprint.clone();
+    let device_id = id.device_id.clone();
 
-    let quic_key = make_private_key(key_bytes.clone())?;
-    let tcp_key = make_private_key(key_bytes)?;
+    let quic_key = make_private_key(id.key_bytes.clone())?;
+    let tcp_key = make_private_key(id.key_bytes)?;
 
     let quic_server = Server::bind_with_cert(
         bind,
         config.output_dir.clone(),
-        cert.clone(),
+        id.cert.clone(),
         quic_key,
         fingerprint.clone(),
     )?;
-    let tcp_server =
-        TcpServer::bind_with_cert(bind, config.output_dir, cert, tcp_key, fingerprint.clone())
-            .await?;
+    let tcp_server = TcpServer::bind_with_cert(
+        bind,
+        config.output_dir,
+        id.cert,
+        tcp_key,
+        fingerprint.clone(),
+    )
+    .await?;
 
     println!(
         "Listening on {} (QUIC + TCP+TLS, auto-fallback)",
         quic_server.local_addr
     );
     println!("Certificate fingerprint (share with sender --trust):\n  {fingerprint}");
+    println!("Device ID: {device_id}");
 
     tokio::try_join!(quic_server.serve(), tcp_server.serve())?;
     Ok(())
@@ -310,12 +318,24 @@ pub async fn listen(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 
 /// Bind and serve TCP+TLS only (explicit `--tcp` mode).
 pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
-    let server = TcpServer::bind(bind, config.output_dir).await?;
+    // Use the persistent device identity so the fingerprint is stable across
+    // restarts, matching the QUIC+TCP `listen` path.
+    let id = crate::identity::load_or_create()?;
+    let tcp_key = make_private_key(id.key_bytes)?;
+    let server = TcpServer::bind_with_cert(
+        bind,
+        config.output_dir,
+        id.cert,
+        tcp_key,
+        id.fingerprint.clone(),
+    )
+    .await?;
     println!("Listening on {} (TCP+TLS)", server.local_addr);
     println!(
         "Certificate fingerprint (share with sender --trust):\n  {}",
         server.fingerprint
     );
+    println!("Device ID: {}", id.device_id);
     server.serve().await
 }
 
@@ -328,11 +348,13 @@ pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<()> {
     use std::net::SocketAddr;
 
-    let (cert, key_bytes) = generate_self_signed_cert()?;
-    let fingerprint = cert_fingerprint(&cert);
+    // Persistent device identity (stable across SSH-launched runs too).
+    let id = crate::identity::load_or_create()?;
+    let cert = id.cert;
+    let fingerprint = id.fingerprint;
 
-    let quic_key = make_private_key(key_bytes.clone())?;
-    let tcp_key = make_private_key(key_bytes)?;
+    let quic_key = make_private_key(id.key_bytes.clone())?;
+    let tcp_key = make_private_key(id.key_bytes)?;
 
     let bind_port = port.unwrap_or(0);
 
