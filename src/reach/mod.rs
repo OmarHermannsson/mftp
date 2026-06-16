@@ -33,6 +33,8 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::protocol::framing;
 
+pub mod relay;
+
 /// Signaling messages exchanged with the rendezvous broker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SignalMsg {

@@ -273,6 +273,17 @@ enum Command {
         #[arg(default_value = "0.0.0.0:7779")]
         bind: String,
     },
+    /// Run a zero-knowledge UDP relay: blindly forward QUIC datagrams to a
+    /// receiver when hole punching fails. End-to-end TLS keeps the relay from
+    /// seeing file data. Senders aim `mftp send <file> <relay-addr>` at it.
+    Relay {
+        /// Address to listen on for sender datagrams
+        #[arg(default_value = "0.0.0.0:7780")]
+        bind: String,
+        /// Receiver address to forward to (host:port)
+        #[arg(long, value_name = "HOST:PORT")]
+        to: String,
+    },
     /// Manage the daemon's authorized-sender DeviceId allowlist.
     #[cfg(unix)]
     DaemonTrust {
@@ -517,6 +528,20 @@ async fn main() -> Result<()> {
             let server = mftp::reach::RendezvousServer::bind(addr).await?;
             println!("rendezvous broker listening on {}", server.local_addr()?);
             server.serve().await
+        }
+        Command::Relay { bind, to } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let to_addr = to
+                .parse()
+                .with_context(|| format!("invalid --to address: {to}"))?;
+            let relay = mftp::reach::relay::RelayServer::bind(addr, to_addr).await?;
+            println!(
+                "relay listening on {} → forwarding to {to_addr}",
+                relay.local_addr()
+            );
+            relay.run().await
         }
         #[cfg(unix)]
         Command::Daemon {

@@ -32,6 +32,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **`mftpd` daemon (Unix)** | `mftp daemon` runs a persistent accept-many receiver with a local control socket (`mftp daemon-status`, `mftp daemon-trust add/remove/list`). Adding authorized sender Device IDs enforces **mutual-TLS identity auth** — only allowlisted devices can send |
 | **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP, and auto-pins its discovered Device ID |
 | **Rendezvous (NAT traversal)** | `mftp rendezvous` runs a signaling-only broker; receivers register by Device ID and senders reach them with `mftp send <file> <device-id> --rendezvous <broker>`. Candidates are exchanged for UDP hole punching; the broker never sees file data |
+| **Zero-knowledge relay** | When hole punching fails (symmetric NAT), `mftp relay --to <receiver>` blindly forwards the QUIC datagrams. End-to-end TLS means the relay only ever sees ciphertext — it cannot read or alter the transfer |
 
 ---
 

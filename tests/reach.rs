@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use mftp::net::connection::make_private_key;
+use mftp::reach::relay::RelayServer;
 use mftp::reach::{lookup, register, RendezvousServer};
 use mftp::transfer::receiver::Server;
 use mftp::transfer::sender::{self, ForcedTransport, SendConfig};
@@ -82,6 +83,56 @@ async fn rendezvous_resolves_and_transfers() -> anyhow::Result<()> {
     )
     .await?;
     recv_task.await??;
+
+    let received = recv_dir.path().join(src.file_name().unwrap());
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}
+
+/// A full mftp QUIC transfer routed through the zero-knowledge UDP relay (M7).
+/// The sender aims QUIC at the relay; the relay blindly forwards datagrams to
+/// the receiver and back. End-to-end TLS means the relay only ever sees
+/// ciphertext. Loopback stands in for the symmetric-NAT case.
+#[tokio::test]
+async fn transfer_through_relay() -> anyhow::Result<()> {
+    let recv_dir = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+
+    // Receiver on loopback.
+    let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+    let recv_addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    // Relay forwarding to the receiver; the sender will aim at the relay.
+    let relay = RelayServer::bind("127.0.0.1:0".parse()?, recv_addr).await?;
+    let relay_addr = relay.local_addr();
+    let relay_task = tokio::spawn(async move { relay.run().await });
+
+    let src = make_file(send_dir.path(), "relayed.bin", 768 * 1024);
+    sender::send(
+        src.clone(),
+        relay_addr, // connect to the relay, not the receiver directly
+        SendConfig {
+            streams: Some(2),
+            chunk_size: Some(256 * 1024),
+            compress: false,
+            compress_level: 3,
+            trusted_fingerprint: Some(fingerprint), // TLS is end-to-end to the receiver
+            trusted_device: None,
+            client_identity: None,
+            forced_transport: Some(ForcedTransport::Quic),
+            tcp_rtt_threshold: Duration::ZERO,
+            fec: None,
+            parallel_reads: false,
+            paths: 1,
+            recursive: false,
+            preserve: false,
+        },
+    )
+    .await?;
+    recv_task.await??;
+    relay_task.abort();
 
     let received = recv_dir.path().join(src.file_name().unwrap());
     assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
