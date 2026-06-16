@@ -820,6 +820,10 @@ where
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
+    // v7+ senders prefix each data stream with a StreamHello frame; only read it
+    // when the sender actually negotiated ≥ v7 (older senders never send it).
+    let expect_hello =
+        neg_req.protocol_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
     let receiver_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -992,13 +996,25 @@ where
                     st,
                     wsem,
                     dd,
+                    expect_hello,
                 )
                 .await
             });
         } else {
             tasks.spawn(async move {
                 recv_stream_worker(
-                    stream, out_file, layout, resume, manifest_c, pb, hasher, ptx, st, wsem, dd,
+                    stream,
+                    out_file,
+                    layout,
+                    resume,
+                    manifest_c,
+                    pb,
+                    hasher,
+                    ptx,
+                    st,
+                    wsem,
+                    dd,
+                    expect_hello,
                 )
                 .await
             });
@@ -1071,7 +1087,7 @@ where
                                 tasks.spawn(async move {
                                     recv_stream_worker(
                                         stream, out_file, layout, resume, manifest_c, pb, hasher,
-                                        ptx, st, wsem, dd,
+                                        ptx, st, wsem, dd, expect_hello,
                                     )
                                     .await
                                 });
@@ -1873,6 +1889,36 @@ where
 // ── Stream worker (generic over any AsyncRead) ────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+/// Read and validate the v7 [`StreamHello`] preamble at the start of a data
+/// stream, when the sender negotiated protocol ≥ 7. Rejects a stream whose
+/// `transfer_id` doesn't match the manifest (the cross-transfer guard that
+/// makes multi-connection transfers safe). No-op against a < v7 sender.
+async fn maybe_recv_stream_hello<R>(
+    stream: &mut R,
+    expected_transfer_id: [u8; 16],
+    expect_hello: bool,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    if !expect_hello {
+        return Ok(());
+    }
+    let hello: crate::protocol::messages::StreamHello = framing::recv_message_required(stream)
+        .await
+        .context("read StreamHello preamble")?;
+    if hello.transfer_id != expected_transfer_id {
+        bail!(
+            "StreamHello transfer_id mismatch (got {}, expected {}) — \
+             stream belongs to a different transfer",
+            hex::encode(hello.transfer_id),
+            hex::encode(expected_transfer_id),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn recv_stream_worker<R>(
     mut stream: R,
     out_file: Option<Arc<std::fs::File>>,
@@ -1885,10 +1931,12 @@ async fn recv_stream_worker<R>(
     stats: Arc<ReceiverStats>,
     write_sem: Arc<tokio::sync::Semaphore>,
     deferred: crate::fs_ext::DeferredDontneed,
+    expect_hello: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    maybe_recv_stream_hello(&mut stream, manifest.transfer_id, expect_hello).await?;
     // Keep at most this many chunk-processing tasks in flight per stream worker.
     // Processing (SHA-256 + optional decompress + pwrite) is typically 10-30×
     // faster than receiving at the network rate per stream, so a pipeline depth
@@ -2089,10 +2137,12 @@ async fn recv_fec_stream_worker<R>(
     stats: Arc<ReceiverStats>,
     write_sem: Arc<tokio::sync::Semaphore>,
     deferred: crate::fs_ext::DeferredDontneed,
+    expect_hello: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    maybe_recv_stream_hello(&mut stream, manifest.transfer_id, expect_hello).await?;
     const MAX_IN_FLIGHT: usize = 4;
     let mut processing: JoinSet<Result<()>> = JoinSet::new();
     let fec_params = manifest
@@ -2477,7 +2527,63 @@ fn resolve_relative_path(base_dir: &str, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::messages::{Compression, FecParams};
+    use crate::protocol::messages::{Compression, FecParams, StreamHello};
+
+    #[tokio::test]
+    async fn stream_hello_skipped_when_not_expected() {
+        // expect_hello = false: nothing is read, even if bytes are waiting.
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        framing::send_message(
+            &mut a,
+            &StreamHello {
+                transfer_id: [9u8; 16],
+                stream_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+        // Should return Ok without consuming, since expect_hello is false.
+        maybe_recv_stream_hello(&mut b, [1u8; 16], false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_hello_accepts_matching_transfer_id() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let id = [7u8; 16];
+        framing::send_message(
+            &mut a,
+            &StreamHello {
+                transfer_id: id,
+                stream_seq: 3,
+            },
+        )
+        .await
+        .unwrap();
+        maybe_recv_stream_hello(&mut b, id, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_hello_rejects_mismatched_transfer_id() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        framing::send_message(
+            &mut a,
+            &StreamHello {
+                transfer_id: [2u8; 16],
+                stream_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let err = maybe_recv_stream_hello(&mut b, [1u8; 16], true)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("transfer_id mismatch"),
+            "expected transfer_id mismatch error, got: {err:#}"
+        );
+    }
 
     fn base_manifest() -> TransferManifest {
         TransferManifest {

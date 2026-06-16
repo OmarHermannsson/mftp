@@ -372,6 +372,9 @@ async fn send_quic_with_conn(
 
     let conn_for_workers = conn.clone();
     let peer_version = neg_resp.protocol_version;
+    // v7+: prefix each data stream with a StreamHello frame. Skipped against an
+    // older receiver so the wire stays identical to v6.
+    let send_hello = peer_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
 
     if config.fec.is_some() {
         run_transfer_fec(
@@ -384,11 +387,11 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             &config,
             manifest,
-            move |rx, transfer_id| {
+            move |rx, transfer_id, stream_seq| {
                 let conn = conn_for_workers.clone();
                 async move {
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
-                    quic_fec_stream_worker(stream, rx, transfer_id).await
+                    quic_fec_stream_worker(stream, rx, transfer_id, stream_seq, send_hello).await
                 }
             },
         )
@@ -411,7 +414,7 @@ async fn send_quic_with_conn(
             Some(Arc::new(crate::transport::QuicTransport::new(conn.clone()))
                 as Arc<dyn crate::transport::Transport>),
             Some(manifest),
-            move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
+            move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
                 let conn = conn_for_workers.clone();
                 async move {
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
@@ -423,6 +426,8 @@ async fn send_quic_with_conn(
                         file_hasher,
                         excess_stop,
                         stats,
+                        stream_seq,
+                        send_hello,
                     )
                     .await
                 }
@@ -439,6 +444,32 @@ async fn send_quic_with_conn(
     Ok(())
 }
 
+/// Write the v7 [`StreamHello`] preamble at the start of a data stream, if the
+/// peer negotiated protocol ≥ 7. No-op otherwise (wire stays v6-identical).
+async fn maybe_send_stream_hello<W>(
+    stream: &mut W,
+    transfer_id: [u8; 16],
+    stream_seq: u32,
+    send_hello: bool,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if send_hello {
+        framing::send_message(
+            stream,
+            &crate::protocol::messages::StreamHello {
+                transfer_id,
+                stream_seq,
+            },
+        )
+        .await
+        .context("send StreamHello preamble")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn quic_stream_worker(
     mut stream: quinn::SendStream,
     rx: ac::Receiver<(u64, Vec<u8>)>,
@@ -447,7 +478,10 @@ async fn quic_stream_worker(
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
     stats: CompressionStats,
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_from_channel(
         &mut stream,
         rx,
@@ -465,8 +499,11 @@ async fn quic_stream_worker(
 async fn quic_fec_stream_worker(
     mut stream: quinn::SendStream,
     rx: tokio::sync::mpsc::Receiver<FecChunkData>,
-    _transfer_id: [u8; 16],
+    transfer_id: [u8; 16],
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_fec_from_channel(&mut stream, rx).await?;
     stream.finish()?;
     Ok(())
@@ -521,6 +558,7 @@ async fn send_tcp(
 
     let trusted_fp = config.trusted_fingerprint.clone();
     let peer_version = neg_resp.protocol_version;
+    let send_hello = peer_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
 
     run_transfer(
         &file,
@@ -538,7 +576,7 @@ async fn send_tcp(
         Some(Arc::new(crate::transport::TcpTransport::new(rtt))
             as Arc<dyn crate::transport::Transport>),
         None, // TCP can't pipeline: it measures RTT via the negotiate round-trip
-        move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
+        move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
             let fp = trusted_fp.clone();
             async move {
                 let stream = connect_tls(destination, fp.as_deref())
@@ -552,6 +590,8 @@ async fn send_tcp(
                     file_hasher,
                     excess_stop,
                     stats,
+                    stream_seq,
+                    send_hello,
                 )
                 .await
             }
@@ -561,6 +601,7 @@ async fn send_tcp(
     // ctrl_send and ctrl_recv drop here, closing the TCP control connection.
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tcp_stream_worker(
     mut stream: crate::net::tcp::ClientTlsStream<tokio::net::TcpStream>,
     rx: ac::Receiver<(u64, Vec<u8>)>,
@@ -569,8 +610,11 @@ async fn tcp_stream_worker(
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
     stats: CompressionStats,
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_from_channel(
         &mut stream,
         rx,
@@ -821,6 +865,7 @@ where
         Option<Arc<ChunkHasher>>,
         Arc<AtomicUsize>,
         CompressionStats,
+        u32, // stream_seq: 0-based index of this stream within the transfer
     ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
@@ -1282,13 +1327,19 @@ where
     // worker gets a clone of the shared MPMC receiver (all clones drain the same
     // queue) and an Arc of the file hasher.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    // Monotonic per-stream sequence number, handed to each worker for its
+    // StreamHello preamble (v7+). Survives scale-down/scale-up: a re-added
+    // stream gets a fresh number, which is fine — seq is informational.
+    let stream_seq_ctr = Arc::new(AtomicU32::new(0));
     let spawn_one = {
         let work_rx = work_rx.clone();
         let compression = compression.clone();
         let file_hasher = file_hasher.clone();
         let excess_stop = excess_stop.clone();
         let cs = (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1));
+        let stream_seq_ctr = Arc::clone(&stream_seq_ctr);
         move |tasks: &mut JoinSet<Result<()>>| {
+            let stream_seq = stream_seq_ctr.fetch_add(1, AtomicOrd::Relaxed);
             tasks.spawn(spawn_worker(
                 work_rx.clone(),
                 transfer_id,
@@ -1296,6 +1347,7 @@ where
                 file_hasher.clone(),
                 excess_stop.clone(),
                 (Arc::clone(&cs.0), Arc::clone(&cs.1)),
+                stream_seq,
             ));
         }
     };
@@ -2505,7 +2557,7 @@ async fn run_transfer_fec<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16]) -> Fut,
+    F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16], u32) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let fec_params = manifest
@@ -2704,8 +2756,8 @@ where
 
     // Spawn N QUIC stream workers.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    for rx in worker_rxs {
-        tasks.spawn(spawn_worker(rx, transfer_id));
+    for (stream_seq, rx) in worker_rxs.into_iter().enumerate() {
+        tasks.spawn(spawn_worker(rx, transfer_id, stream_seq as u32));
     }
     while let Some(res) = tasks.join_next().await {
         match res? {

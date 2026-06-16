@@ -27,7 +27,18 @@ use serde::{Deserialize, Serialize};
 ///       same order regardless of sender await timing), so it requires no
 ///       receiver change; the bump is a marker and documents that the QUIC fast
 ///       path assumes a peer ≥ v3 (directory transfers already require it).
-pub const PROTOCOL_VERSION: u32 = 6;
+///   7 — each data stream begins with a `StreamHello { transfer_id, stream_seq }`
+///       frame before any `ChunkData`. The receiver reads it first and rejects a
+///       stream whose `transfer_id` doesn't match the negotiated manifest. This
+///       lets data streams be attributed to a transfer regardless of which
+///       connection or path they arrive on — the prerequisite for multipath
+///       (M3) and relayed (M7) transfers, where streams no longer all share one
+///       connection. Only sent/expected when BOTH peers are ≥ v7; against an
+///       older peer the preamble is omitted and behaviour is identical to v6.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// First version that sends/expects the [`StreamHello`] data-stream preamble.
+pub const STREAM_HELLO_MIN_VERSION: u32 = 7;
 
 /// Maximum number of completion→repair round-trips before the sender/receiver
 /// give up and fall back to abort + resume.  A deterministic sender-side fault
@@ -135,6 +146,24 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntries {
     pub entries: Option<Vec<FileEntry>>,
+}
+
+/// Preamble frame sent by the sender at the very start of each data stream
+/// (protocol version ≥ [`STREAM_HELLO_MIN_VERSION`]), before any `ChunkData`.
+///
+/// Lets the receiver attribute a data stream to a transfer independently of the
+/// connection it arrived on — the foundation for multipath (M3) and relayed
+/// (M7) transfers. For single-connection transfers it is a cheap correctness
+/// check: the receiver rejects any stream whose `transfer_id` doesn't match the
+/// manifest it negotiated on the control stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamHello {
+    /// Must equal the `transfer_id` from the `TransferManifest`.
+    pub transfer_id: [u8; 16],
+    /// 0-based index of this stream within the transfer. Informational
+    /// (logging / future per-path scheduling); not required for correctness
+    /// because each `ChunkData` already carries its own `chunk_index`.
+    pub stream_seq: u32,
 }
 
 /// One chunk of file data, sent on a data stream.
