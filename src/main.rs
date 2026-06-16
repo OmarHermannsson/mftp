@@ -249,6 +249,10 @@ enum Command {
         /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+        /// LAN discovery name to announce as (default: this host's hostname).
+        /// Senders can then use `mftp send <file> <name>`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Query a running daemon's status / identity over its control socket.
     #[cfg(unix)]
@@ -390,7 +394,7 @@ async fn main() -> Result<()> {
                     file.display()
                 );
             }
-            let config = sender::SendConfig {
+            let mut config = sender::SendConfig {
                 streams,
                 chunk_size,
                 compress,
@@ -424,11 +428,34 @@ async fn main() -> Result<()> {
                     remote_binary_sha256,
                 )
                 .await
-            } else {
-                let addr = destination
-                    .parse()
-                    .with_context(|| format!("invalid address: {destination}"))?;
+            } else if let Ok(addr) = destination.parse::<std::net::SocketAddr>() {
                 sender::send(file, addr, config).await
+            } else {
+                // Not host:port and not an SSH dest — treat it as a LAN name and
+                // resolve it via mftp discovery (M5).
+                let resolved = mftp::discovery::resolve(
+                    &destination,
+                    mftp::discovery::multicast_target(),
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .with_context(|| format!("discovery for {destination:?}"))?
+                .with_context(|| {
+                    format!(
+                        "no mftp receiver named {destination:?} found on the LAN \
+                         (is `mftp daemon`/`receive --name` running there?), and it is \
+                         not a valid host:port or SSH destination"
+                    )
+                })?;
+                eprintln!(
+                    "[mftp] resolved {destination:?} → {} (device {})",
+                    resolved.addr, resolved.device_id
+                );
+                // Auto-pin the discovered DeviceId unless the user pinned trust.
+                if config.trusted_fingerprint.is_none() && config.trusted_device.is_none() {
+                    config.trusted_device = Some(resolved.device_id);
+                }
+                sender::send(file, resolved.addr, config).await
             }
         }
         Command::Receive { bind, output_dir } => {
@@ -443,6 +470,7 @@ async fn main() -> Result<()> {
             bind,
             output_dir,
             socket,
+            name,
         } => {
             let addr = bind
                 .parse()
@@ -450,7 +478,8 @@ async fn main() -> Result<()> {
             let socket = socket
                 .or_else(mftp::daemon::default_socket_path)
                 .context("cannot determine control socket path")?;
-            mftp::daemon::run(addr, output_dir, socket).await
+            let name = name.unwrap_or_else(mftp::discovery::hostname);
+            mftp::daemon::run(addr, output_dir, socket, name).await
         }
         #[cfg(unix)]
         Command::DaemonStatus { socket } => {

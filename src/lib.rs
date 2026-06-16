@@ -1,6 +1,7 @@
 pub mod compress;
 pub mod config;
 pub mod daemon;
+pub mod discovery;
 pub mod fec;
 pub mod fs_ext;
 pub mod identity;

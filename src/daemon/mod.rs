@@ -191,6 +191,7 @@ pub async fn run(
     bind: std::net::SocketAddr,
     output_dir: PathBuf,
     socket_path: PathBuf,
+    announce_name: String,
 ) -> Result<()> {
     let config_dir =
         crate::identity::config_dir().context("cannot locate config dir ($HOME unset)")?;
@@ -225,6 +226,24 @@ pub async fn run(
         println!("Identity auth: open (add devices with `mftp daemon-trust add <id>`)");
     }
     println!("Control socket: {}", socket_path.display());
+
+    // LAN discovery responder (M5): announce ourselves so senders can reach us
+    // by name. Best-effort — if the host can't join the multicast group (e.g.
+    // no multicast-capable interface) the daemon still serves normally.
+    let announce_port = server.local_addr.port();
+    let announce_device = id.device_id.clone();
+    match crate::discovery::bind_responder() {
+        Ok(sock) => {
+            println!("Discovery: announcing as {announce_name:?} on the LAN");
+            tokio::spawn(crate::discovery::respond_loop(
+                sock,
+                announce_name,
+                announce_port,
+                announce_device,
+            ));
+        }
+        Err(e) => tracing::warn!("LAN discovery disabled (could not bind responder): {e:#}"),
+    }
 
     let listener = bind_control_socket(&socket_path)?;
     let state = Arc::new(DaemonState::new(config_dir, listening_on));

@@ -30,6 +30,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
 | **Persistent device identity** | The receiver keeps a stable Ed25519 key + certificate in `~/.config/mftp/`, so its fingerprint no longer changes across restarts. `mftp receive` prints a stable **Device ID**; `--trust-device <id>` pins the device key (survives certificate re-issuance, unlike `--trust`) |
 | **`mftpd` daemon (Unix)** | `mftp daemon` runs a persistent accept-many receiver with a local control socket (`mftp daemon-status`, `mftp daemon-trust add/remove/list`). Adding authorized sender Device IDs enforces **mutual-TLS identity auth** — only allowlisted devices can send |
+| **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP, and auto-pins its discovered Device ID |
 
 ---
 
