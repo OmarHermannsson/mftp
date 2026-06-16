@@ -235,6 +235,39 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Run the persistent receiver daemon (accept-many) with a local control
+    /// socket. Add authorized sender DeviceIds with `mftp daemon-trust` to
+    /// enforce mutual-TLS identity auth.
+    #[cfg(unix)]
+    Daemon {
+        /// Address to listen on
+        #[arg(default_value = "0.0.0.0:7777")]
+        bind: String,
+        /// Directory to write received files into
+        #[arg(short, long, default_value = ".")]
+        output_dir: std::path::PathBuf,
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Query a running daemon's status / identity over its control socket.
+    #[cfg(unix)]
+    DaemonStatus {
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Manage the daemon's authorized-sender DeviceId allowlist.
+    #[cfg(unix)]
+    DaemonTrust {
+        /// add <id> | remove <id> | list
+        action: String,
+        /// DeviceId (hex) for add/remove
+        device_id: Option<String>,
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
 }
 
 /// Parse a `--fec DATA:PARITY` argument (e.g. `8:2`).
@@ -364,6 +397,9 @@ async fn main() -> Result<()> {
                 compress_level: 3,
                 trusted_fingerprint: trust,
                 trusted_device: trust_device,
+                // Present our persistent device identity as a client certificate
+                // so daemons enforcing DeviceId auth can verify this sender.
+                client_identity: mftp::identity::load_or_create().ok(),
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,
@@ -402,7 +438,98 @@ async fn main() -> Result<()> {
             receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
         Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
+        #[cfg(unix)]
+        Command::Daemon {
+            bind,
+            output_dir,
+            socket,
+        } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            mftp::daemon::run(addr, output_dir, socket).await
+        }
+        #[cfg(unix)]
+        Command::DaemonStatus { socket } => {
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            run_daemon_ctl(&socket, mftp::daemon::DaemonRequest::Status).await?;
+            run_daemon_ctl(&socket, mftp::daemon::DaemonRequest::Identity).await
+        }
+        #[cfg(unix)]
+        Command::DaemonTrust {
+            action,
+            device_id,
+            socket,
+        } => {
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            let req = match action.as_str() {
+                "list" => mftp::daemon::DaemonRequest::ListTrust,
+                "add" => mftp::daemon::DaemonRequest::AddTrust {
+                    device_id: device_id.context("`add` requires a device id")?,
+                },
+                "remove" => mftp::daemon::DaemonRequest::RemoveTrust {
+                    device_id: device_id.context("`remove` requires a device id")?,
+                },
+                other => anyhow::bail!("unknown trust action {other:?} (use add|remove|list)"),
+            };
+            run_daemon_ctl(&socket, req).await
+        }
     }
+}
+
+/// Send one control request to the daemon and print the reply.
+#[cfg(unix)]
+async fn run_daemon_ctl(socket: &std::path::Path, req: mftp::daemon::DaemonRequest) -> Result<()> {
+    use mftp::daemon::DaemonResponse;
+    match mftp::daemon::client_request(socket, req).await? {
+        DaemonResponse::Pong => println!("pong"),
+        DaemonResponse::Identity {
+            device_id,
+            fingerprint,
+        } => {
+            println!("Device ID:   {device_id}");
+            println!("Fingerprint: {fingerprint}");
+        }
+        DaemonResponse::Trust { devices } => {
+            if devices.is_empty() {
+                println!("(no authorized devices — receiver is open)");
+            } else {
+                for d in devices {
+                    println!("{d}");
+                }
+            }
+        }
+        DaemonResponse::TrustChanged { changed } => {
+            println!(
+                "{}",
+                if changed {
+                    "ok (changed)"
+                } else {
+                    "ok (no change)"
+                }
+            );
+        }
+        DaemonResponse::Status {
+            listening_on,
+            auth_enforced,
+            authorized_count,
+            transfers_completed,
+        } => {
+            println!("listening_on:        {listening_on}");
+            println!("auth_enforced:       {auth_enforced}");
+            println!("authorized_devices:  {authorized_count}");
+            println!("transfers_completed: {transfers_completed}");
+        }
+        DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -139,6 +139,10 @@ pub struct SendConfig {
     /// Hex Ed25519 DeviceId to pin (`--trust-device`); takes precedence over
     /// `trusted_fingerprint`. Survives the peer re-issuing its certificate.
     pub trusted_device: Option<String>,
+    /// This sender's device identity, presented as a client certificate so a
+    /// daemon enforcing DeviceId auth can verify us (M4). `None` = present no
+    /// client cert (classic). Only used on the QUIC path.
+    pub client_identity: Option<crate::identity::Identity>,
     /// Force a specific transport path; `None` = auto (QUIC → TCP+TLS → SFTP).
     pub forced_transport: Option<ForcedTransport>,
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this
@@ -200,6 +204,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     let endpoint = make_client_endpoint(
         config.trusted_fingerprint.as_deref(),
         config.trusted_device.as_deref(),
+        config.client_identity.as_ref(),
         destination,
     )?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");

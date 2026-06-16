@@ -58,6 +58,7 @@ async fn roundtrip(
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -155,6 +156,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -224,6 +226,7 @@ async fn roundtrip_tcp(
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -360,6 +363,7 @@ async fn roundtrip_fec(
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: Some(FecParams {
@@ -460,6 +464,7 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: Some(ForcedTransport::Tcp),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             // FEC requested but should be silently discarded for TCP
@@ -518,6 +523,7 @@ async fn roundtrip_dir(
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -735,6 +741,7 @@ async fn test_require_recursive_flag() {
             compress_level: 3,
             trusted_fingerprint: None,
             trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -792,6 +799,7 @@ fn device_pin_config(device_id: Option<String>) -> SendConfig {
         compress_level: 3,
         trusted_fingerprint: None,
         trusted_device: device_id,
+        client_identity: None,
         // Force QUIC so the DeviceId verifier runs against the Ed25519 cert
         // (loopback RTT would otherwise switch to TCP).
         forced_transport: Some(ForcedTransport::Quic),
@@ -871,6 +879,7 @@ async fn test_multipath_two_paths_quic() -> anyhow::Result<()> {
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: Some(ForcedTransport::Quic),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -910,6 +919,7 @@ async fn test_multipath_single_path_still_works() -> anyhow::Result<()> {
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
             trusted_device: None,
+            client_identity: None,
             forced_transport: Some(ForcedTransport::Quic),
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
@@ -924,5 +934,100 @@ async fn test_multipath_single_path_still_works() -> anyhow::Result<()> {
 
     let received = recv_dir.path().join(src.file_name().unwrap());
     assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}
+
+// ── M4: daemon identity auth (mutual-TLS DeviceId allowlist) ────────────────────
+
+fn auth_send_config(fingerprint: String, identity: mftp::identity::Identity) -> SendConfig {
+    SendConfig {
+        streams: Some(2),
+        chunk_size: Some(256 * 1024),
+        compress: false,
+        compress_level: 3,
+        trusted_fingerprint: Some(fingerprint),
+        trusted_device: None,
+        client_identity: Some(identity),
+        forced_transport: Some(ForcedTransport::Quic),
+        tcp_rtt_threshold: std::time::Duration::ZERO,
+        fec: None,
+        parallel_reads: false,
+        paths: 1,
+        recursive: false,
+        preserve: false,
+    }
+}
+
+/// A sender whose DeviceId is on the allowlist completes the transfer.
+#[tokio::test]
+async fn test_daemon_auth_authorized_sender_succeeds() -> anyhow::Result<()> {
+    use mftp::net::connection::make_private_key;
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let rcfg = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "auth.bin", 512 * 1024);
+
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let server_id = mftp::identity::load_or_create_in(rcfg.path())?;
+
+    let server = Server::bind_with_cert_auth(
+        "127.0.0.1:0".parse()?,
+        recv_dir.path().to_owned(),
+        server_id.cert.clone(),
+        make_private_key(server_id.key_bytes.clone())?,
+        server_id.fingerprint.clone(),
+        Some(vec![sender_id.device_id.clone()]), // sender is authorized
+    )?;
+    let addr = server.local_addr;
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    sender::send(
+        src.clone(),
+        addr,
+        auth_send_config(server_id.fingerprint.clone(), sender_id),
+    )
+    .await?;
+    recv_task.await??;
+
+    let received = recv_dir.path().join(src.file_name().unwrap());
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}
+
+/// A sender whose DeviceId is NOT on the allowlist is rejected at the handshake.
+#[tokio::test]
+async fn test_daemon_auth_unauthorized_sender_rejected() -> anyhow::Result<()> {
+    use mftp::net::connection::make_private_key;
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let rcfg = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "auth.bin", 256 * 1024);
+
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let server_id = mftp::identity::load_or_create_in(rcfg.path())?;
+
+    let server = Server::bind_with_cert_auth(
+        "127.0.0.1:0".parse()?,
+        recv_dir.path().to_owned(),
+        server_id.cert.clone(),
+        make_private_key(server_id.key_bytes.clone())?,
+        server_id.fingerprint.clone(),
+        Some(vec!["c".repeat(64)]), // some OTHER device — sender is not authorized
+    )?;
+    let addr = server.local_addr;
+    let _recv_task = tokio::spawn(async move { server.accept_one().await });
+
+    let result = sender::send(
+        src,
+        addr,
+        auth_send_config(server_id.fingerprint.clone(), sender_id),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "unauthorized sender must be rejected at the TLS handshake"
+    );
     Ok(())
 }

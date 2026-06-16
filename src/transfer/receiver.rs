@@ -139,8 +139,22 @@ impl Server {
         key: PrivateKeyDer<'static>,
         fingerprint: String,
     ) -> Result<Self> {
-        use crate::net::connection::make_server_endpoint_with_cert;
-        let endpoint = make_server_endpoint_with_cert(addr, cert, key)?;
+        Self::bind_with_cert_auth(addr, output_dir, cert, key, fingerprint, None)
+    }
+
+    /// Like [`Server::bind_with_cert`], but when `authorized` is `Some(list)` the
+    /// server requires mutual-TLS DeviceId auth and only accepts senders whose
+    /// Ed25519 DeviceId is allowlisted (M4 daemon identity auth).
+    pub fn bind_with_cert_auth(
+        addr: SocketAddr,
+        output_dir: PathBuf,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+        authorized: Option<Vec<String>>,
+    ) -> Result<Self> {
+        use crate::net::connection::make_server_endpoint_with_cert_auth;
+        let endpoint = make_server_endpoint_with_cert_auth(addr, cert, key, authorized)?;
         let local_addr = endpoint.local_addr()?;
         Ok(Self {
             endpoint,

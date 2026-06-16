@@ -59,7 +59,9 @@ pub fn device_id_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
     Some(hex::encode(Sha256::digest(spki)))
 }
 
-fn config_dir() -> Option<PathBuf> {
+/// The mftp config directory (`~/.config/mftp`), where the device identity and
+/// authorized-devices list live. `None` if `$HOME` is unset.
+pub fn config_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config/mftp"))
 }
@@ -181,6 +183,74 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) {
     let _ = std::fs::write(path, bytes);
 }
 
+// ── Authorized-devices store (M4: daemon identity auth) ─────────────────────────
+//
+// A newline-delimited list of trusted peer DeviceIds at
+// `~/.config/mftp/authorized_devices`. When present and non-empty, the daemon
+// requires an incoming sender to present a client certificate whose DeviceId is
+// listed (mutual TLS); when absent/empty, the receiver is open (classic).
+
+fn authorized_path(dir: &std::path::Path) -> PathBuf {
+    dir.join("authorized_devices")
+}
+
+/// Load the set of authorized DeviceIds from `dir` (empty if the file is absent).
+pub fn load_authorized_in(dir: &std::path::Path) -> Vec<String> {
+    match std::fs::read_to_string(authorized_path(dir)) {
+        Ok(s) => s
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.to_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Default-location load (`~/.config/mftp/authorized_devices`).
+pub fn load_authorized() -> Vec<String> {
+    config_dir()
+        .map(|d| load_authorized_in(&d))
+        .unwrap_or_default()
+}
+
+/// Add a DeviceId to the authorized list in `dir` (idempotent). Returns whether
+/// it was newly added.
+pub fn add_authorized_in(dir: &std::path::Path, device_id: &str) -> Result<bool> {
+    let id = device_id.trim().to_lowercase();
+    if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid device id (expected 64 hex chars): {device_id:?}");
+    }
+    let mut list = load_authorized_in(dir);
+    if list.iter().any(|e| e == &id) {
+        return Ok(false);
+    }
+    list.push(id);
+    write_authorized(dir, &list)?;
+    Ok(true)
+}
+
+/// Remove a DeviceId from the authorized list in `dir`. Returns whether it was
+/// present.
+pub fn remove_authorized_in(dir: &std::path::Path, device_id: &str) -> Result<bool> {
+    let id = device_id.trim().to_lowercase();
+    let mut list = load_authorized_in(dir);
+    let before = list.len();
+    list.retain(|e| e != &id);
+    let removed = list.len() != before;
+    if removed {
+        write_authorized(dir, &list)?;
+    }
+    Ok(removed)
+}
+
+fn write_authorized(dir: &std::path::Path, list: &[String]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let body = list.join("\n");
+    std::fs::write(authorized_path(dir), body).context("write authorized_devices")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +290,20 @@ mod tests {
         let id = load_or_create_in(dir.path()).unwrap();
         let from_cert = device_id_from_cert(&id.cert).expect("Ed25519 SPKI present in cert");
         assert_eq!(from_cert, id.device_id);
+    }
+
+    #[test]
+    fn authorized_devices_add_load_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_authorized_in(dir.path()).is_empty());
+        let id = "a".repeat(64);
+        assert!(add_authorized_in(dir.path(), &id).unwrap(), "newly added");
+        assert!(!add_authorized_in(dir.path(), &id).unwrap(), "idempotent");
+        assert_eq!(load_authorized_in(dir.path()), vec![id.clone()]);
+        assert!(remove_authorized_in(dir.path(), &id).unwrap());
+        assert!(load_authorized_in(dir.path()).is_empty());
+        // Invalid ids are rejected.
+        assert!(add_authorized_in(dir.path(), "nothex").is_err());
     }
 
     #[test]

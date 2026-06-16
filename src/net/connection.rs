@@ -216,6 +216,73 @@ pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)>
     Ok((endpoint, fingerprint))
 }
 
+/// Verifies an incoming client certificate by its Ed25519 DeviceId against an
+/// allowlist (M4 daemon identity auth). A client whose DeviceId is not listed —
+/// or that presents no Ed25519 key — is rejected at the TLS handshake.
+#[derive(Debug)]
+pub struct DeviceAllowlistVerifier {
+    authorized: Vec<String>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl DeviceAllowlistVerifier {
+    pub fn new(authorized: Vec<String>) -> Self {
+        DeviceAllowlistVerifier {
+            authorized: authorized
+                .into_iter()
+                .map(|s| s.trim().to_lowercase())
+                .collect(),
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for DeviceAllowlistVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let id = crate::identity::device_id_from_cert(end_entity).ok_or_else(|| {
+            rustls::Error::General("client certificate has no Ed25519 device key".into())
+        })?;
+        if self.authorized.iter().any(|a| a == &id) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "client device {id} is not authorized"
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
 // ── Server (shared cert) ──────────────────────────────────────────────────────
 
 /// Bind a QUIC server endpoint using a pre-generated certificate.
@@ -227,12 +294,32 @@ pub fn make_server_endpoint_with_cert(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint> {
+    make_server_endpoint_with_cert_auth(bind_addr, cert, key, None)
+}
+
+/// Like [`make_server_endpoint_with_cert`], but when `authorized` is
+/// `Some(list)` the server requires mutual TLS and only accepts senders whose
+/// Ed25519 DeviceId is in `list` (M4 daemon identity auth). `None` keeps the
+/// open, server-auth-only behaviour.
+pub fn make_server_endpoint_with_cert_auth(
+    bind_addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    authorized: Option<Vec<String>>,
+) -> Result<Endpoint> {
     install_crypto_provider();
 
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .context("failed to build rustls server config")?;
+    let builder = rustls::ServerConfig::builder();
+    let server_crypto = match authorized {
+        Some(list) => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config (client auth)")?,
+        None => builder
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config")?,
+    };
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -260,15 +347,27 @@ pub fn make_server_endpoint_with_cert(
 pub fn make_client_endpoint(
     trusted_fingerprint: Option<&str>,
     trusted_device: Option<&str>,
+    client_identity: Option<&crate::identity::Identity>,
     server_addr: SocketAddr,
 ) -> Result<Endpoint> {
     install_crypto_provider();
     let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
 
-    let client_crypto = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier);
+    // Present our device identity as a client certificate so daemons enforcing
+    // DeviceId auth can verify us. A server that doesn't request client auth
+    // never asks for it, so this is invisible to non-auth receivers.
+    let client_crypto = match client_identity {
+        Some(id) => builder
+            .with_client_auth_cert(
+                vec![id.cert.clone()],
+                make_private_key(id.key_bytes.clone())?,
+            )
+            .context("attach client identity certificate")?,
+        None => builder.with_no_client_auth(),
+    };
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
