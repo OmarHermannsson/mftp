@@ -5,6 +5,39 @@
 > execution. Each milestone is sized to ship standalone value; a follow-up turns
 > one milestone into an implementation plan.
 
+## Implementation status
+
+All milestones M0–M8 are implemented, tested, and committed (one commit per
+milestone). Every change keeps `cargo test`, `cargo clippy -- -D warnings`, and
+`cargo fmt --check` green; the suite grew from ~70 to ~140 tests.
+
+| Milestone | Status | Verification |
+|---|---|---|
+| M0 Document | ✅ | this doc, linked from README |
+| M1 Transport trait + v7 StreamHello | ✅ | unit + full integration suite |
+| M2 Persistent identity + `--trust-device` | ✅ | unit + e2e accept/reject |
+| M3 Multipath / link bonding | ✅ | e2e 2-path transfer on loopback¹ |
+| M4 Daemon + mutual-TLS DeviceId auth | ✅ | control RPCs + e2e auth + CLI smoke |
+| M5 LAN discovery | ✅ | protocol + resolve e2e (unicast)² |
+| M6 Rendezvous + hole punching | ✅ | broker e2e + rendezvous→QUIC transfer¹ |
+| M7 Zero-knowledge relay | ✅ | full QUIC transfer *through* the relay¹ |
+| M8 Service (ACL/quota/queue/Web UI/at-rest enc) | ✅ | unit + e2e ACL routing + live Web UI |
+
+**Deployment-gated checks** (the data-plane code is implemented and verified for
+correctness on loopback; these specific numbers/conditions require infrastructure
+not present in a single-host sandbox):
+- ¹ **Throughput / real paths** — M3's "aggregate beats one connection" needs the
+  multi-NIC lab harness; loopback proves multi-connection correctness.
+- ² **Multicast / NAT** — M5 multicast delivery and M6 cross-NAT hole-punch
+  *success* depend on the network (blocked in containers); the protocols are
+  verified over unicast/loopback, and M7's relay is the symmetric-NAT fallback.
+
+Carried-forward refinements (noted in commits): TCP-path client-cert auth (QUIC
+done), concurrent multi-tenant serving via a transfer_id→path registry (current
+QUIC serve is sequential + multipath), live quota enforcement in the streaming
+write path, and the browser-rendered dashboard (the JSON/HTML API it consumes is
+served and tested).
+
 ## Context
 
 mftp today (v0.2.2) is a mature, clean **point-to-point pipe**: one sender, one
