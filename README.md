@@ -25,6 +25,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`). Note: does *not* improve throughput over QUIC (which already recovers loss) — see [Reed-Solomon FEC](#reed-solomon-fec) |
 | **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
+| **Multipath / link bonding** | `--paths N` bonds N QUIC connections for one transfer and stripes the data streams across them; each path runs its own congestion control, so a faster link naturally carries more chunks. For multi-homed hosts (Wi-Fi + wired, dual WAN). QUIC only |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
 | **Persistent device identity** | The receiver keeps a stable Ed25519 key + certificate in `~/.config/mftp/`, so its fingerprint no longer changes across restarts. `mftp receive` prints a stable **Device ID**; `--trust-device <id>` pins the device key (survives certificate re-issuance, unlike `--trust`) |

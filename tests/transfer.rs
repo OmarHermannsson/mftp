@@ -62,6 +62,7 @@ async fn roundtrip(
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: false,
             preserve: false,
         },
@@ -158,6 +159,7 @@ async fn test_compressible_data() -> anyhow::Result<()> {
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: false,
             preserve: false,
         },
@@ -226,6 +228,7 @@ async fn roundtrip_tcp(
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: false,
             preserve: false,
         },
@@ -364,6 +367,7 @@ async fn roundtrip_fec(
                 parity_shards,
             }),
             parallel_reads: false,
+            paths: 1,
             recursive: false,
             preserve: false,
         },
@@ -464,6 +468,7 @@ async fn test_fec_disabled_on_tcp() -> anyhow::Result<()> {
                 parity_shards: 1,
             }),
             parallel_reads: false,
+            paths: 1,
             recursive: false,
             preserve: false,
         },
@@ -517,6 +522,7 @@ async fn roundtrip_dir(
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: true,
             preserve,
         },
@@ -733,6 +739,7 @@ async fn test_require_recursive_flag() {
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: false, // <-- not set
             preserve: false,
         },
@@ -791,6 +798,7 @@ fn device_pin_config(device_id: Option<String>) -> SendConfig {
         tcp_rtt_threshold: std::time::Duration::ZERO,
         fec: None,
         parallel_reads: false,
+        paths: 1,
         recursive: false,
         preserve: false,
     }
@@ -832,5 +840,89 @@ async fn test_trust_device_wrong_id_rejected() -> anyhow::Result<()> {
     let wrong = "0".repeat(64);
     let result = sender::send(src, addr, device_pin_config(Some(wrong))).await;
     assert!(result.is_err(), "wrong DeviceId pin must fail the transfer");
+    Ok(())
+}
+
+// ── M3: multipath / link bonding ────────────────────────────────────────────────
+
+/// A transfer striped across 2 bonded QUIC connections completes byte-for-byte.
+/// Loopback exercises the full multi-connection data plane (the throughput win
+/// requires distinct NICs and is measured in the lab harness).
+#[tokio::test]
+async fn test_multipath_two_paths_quic() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    // Several chunks across several streams so work spreads over both paths.
+    let src = make_test_file(send_dir.path(), "bonded.bin", 4 * 1024 * 1024);
+
+    let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+    let addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
+    // Multipath-aware accept: extra connections bond as additional paths.
+    let recv_task = tokio::spawn(async move { server.accept_one_multipath().await });
+
+    sender::send(
+        src.clone(),
+        addr,
+        SendConfig {
+            streams: Some(4),
+            chunk_size: Some(256 * 1024),
+            compress: false,
+            compress_level: 3,
+            trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
+            forced_transport: Some(ForcedTransport::Quic),
+            tcp_rtt_threshold: std::time::Duration::ZERO,
+            fec: None,
+            parallel_reads: false,
+            paths: 2,
+            recursive: false,
+            preserve: false,
+        },
+    )
+    .await?;
+    recv_task.await??;
+
+    let received = recv_dir.path().join(src.file_name().unwrap());
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}
+
+/// paths=1 over the multipath-aware receiver still works (single connection).
+#[tokio::test]
+async fn test_multipath_single_path_still_works() -> anyhow::Result<()> {
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "solo.bin", 1024 * 1024);
+
+    let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+    let addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
+    let recv_task = tokio::spawn(async move { server.accept_one_multipath().await });
+
+    sender::send(
+        src.clone(),
+        addr,
+        SendConfig {
+            streams: Some(3),
+            chunk_size: Some(256 * 1024),
+            compress: false,
+            compress_level: 3,
+            trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
+            forced_transport: Some(ForcedTransport::Quic),
+            tcp_rtt_threshold: std::time::Duration::ZERO,
+            fec: None,
+            parallel_reads: false,
+            paths: 1,
+            recursive: false,
+            preserve: false,
+        },
+    )
+    .await?;
+    recv_task.await??;
+
+    let received = recv_dir.path().join(src.file_name().unwrap());
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
     Ok(())
 }

@@ -77,6 +77,16 @@ struct Cli {
     #[arg(long, global = true)]
     chunk_size: Option<usize>,
 
+    /// Number of QUIC connections (paths) to bond for one transfer (default 1).
+    ///
+    /// Values above 1 open that many connections to the receiver and stripe the
+    /// data streams across them — link bonding for multi-homed hosts (e.g. Wi-Fi
+    /// plus wired, or two WAN uplinks). Each path runs its own congestion
+    /// control, so a faster path naturally carries more chunks. QUIC only;
+    /// ignored on the TCP and SFTP paths.
+    #[arg(long, global = true, value_name = "N")]
+    paths: Option<usize>,
+
     /// Disable adaptive zstd compression
     #[arg(long, global = true)]
     no_compress: bool,
@@ -358,6 +368,7 @@ async fn main() -> Result<()> {
                 tcp_rtt_threshold,
                 fec,
                 parallel_reads: cli.parallel_reads,
+                paths: cli.paths.unwrap_or(1).max(1),
                 recursive,
                 preserve,
             };

@@ -54,6 +54,7 @@ async fn transfer_ok(
         tcp_rtt_threshold: std::time::Duration::ZERO,
         fec,
         parallel_reads: false,
+        paths: 1,
         recursive: false,
         preserve: false,
     };
@@ -143,6 +144,7 @@ async fn incremental_repair_end_to_end() {
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: true,
             preserve: false,
         };

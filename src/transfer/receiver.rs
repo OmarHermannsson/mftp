@@ -150,8 +150,8 @@ impl Server {
         })
     }
 
-    /// Accept and handle exactly one incoming connection, then return.
-    /// Intended for integration tests.
+    /// Accept and handle exactly one incoming connection (single-path), then
+    /// return. Intended for integration tests.
     pub async fn accept_one(&self) -> Result<()> {
         let incoming = self
             .endpoint
@@ -160,24 +160,47 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("endpoint closed before any connection arrived"))?;
         let conn = incoming.await.context("connection setup failed")?;
         info!("connection from {}", conn.remote_address());
-        handle_quic_connection(conn, self.output_dir.clone()).await
+        handle_quic_connection(conn, None, self.output_dir.clone()).await
     }
 
-    /// Accept and handle connections indefinitely (QUIC only; use `listen` for auto mode).
+    /// Accept one transfer, treating any additional connections that arrive
+    /// during it as bonded multipath paths (M3). Intended for integration tests.
+    pub async fn accept_one_multipath(&self) -> Result<()> {
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("endpoint closed before any connection arrived"))?;
+        let conn = incoming.await.context("connection setup failed")?;
+        info!("connection from {} (multipath)", conn.remote_address());
+        handle_quic_connection(conn, Some(self.endpoint.clone()), self.output_dir.clone()).await
+    }
+
+    /// Accept and handle transfers indefinitely (QUIC only; use `listen` for
+    /// auto mode). Multipath-aware: transfers are served sequentially and any
+    /// extra connections arriving during a transfer bond as additional paths.
+    /// (Concurrent multi-tenant serving with a path registry arrives in M4.)
     pub async fn serve(self) -> Result<()> {
         while let Some(incoming) = self.endpoint.accept().await {
-            let out = self.output_dir.clone();
-            tokio::spawn(async move {
-                match incoming.await {
-                    Ok(conn) => {
-                        info!("connection from {}", conn.remote_address());
-                        if let Err(e) = handle_quic_connection(conn, out).await {
+            match incoming.await {
+                Ok(conn) => {
+                    info!("connection from {}", conn.remote_address());
+                    let r = handle_quic_connection(
+                        conn,
+                        Some(self.endpoint.clone()),
+                        self.output_dir.clone(),
+                    )
+                    .await;
+                    if let Err(e) = r {
+                        if e.downcast_ref::<SwitchToTcp>().is_some() {
+                            debug!("sender switched to TCP+TLS");
+                        } else {
                             tracing::error!("transfer error: {e:#}");
                         }
                     }
-                    Err(e) => warn!("incoming connection failed: {e}"),
                 }
-            });
+                Err(e) => warn!("incoming connection failed: {e}"),
+            }
         }
         Ok(())
     }
@@ -454,7 +477,42 @@ impl std::fmt::Display for SwitchToTcp {
 }
 impl std::error::Error for SwitchToTcp {}
 
-async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) -> Result<()> {
+/// Continuously accept unidirectional data streams from `conn`, boxing each and
+/// forwarding it to `tx`. Exits when the connection closes or `tx` is dropped.
+/// Used by the multipath feeder to merge data streams across bonded connections.
+async fn drain_uni_streams(
+    conn: quinn::Connection,
+    tx: async_channel::Sender<Box<dyn AsyncRead + Unpin + Send + 'static>>,
+) {
+    // Exits when the connection errors/closes (accept_uni returns Err) or the
+    // receiver has finished with all streams (send returns Err on a closed rx).
+    while let Ok(s) = conn.accept_uni().await {
+        if tx
+            .send(Box::new(s) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Handle one QUIC transfer.
+///
+/// `endpoint` enables **multipath** (M3): when `Some`, additional connections
+/// arriving at the endpoint during this transfer are treated as extra bonded
+/// paths — their data streams are merged with the primary connection's, so a
+/// transfer can be striped across several connections. When `None`, only the
+/// primary connection's data streams are used (classic single-path).
+///
+/// Multipath here is sequential: while this transfer runs, the feeder owns the
+/// endpoint's incoming-connection accept. Concurrent multi-tenant transfers
+/// (which need a transfer_id→path registry) arrive with the M4 daemon.
+async fn handle_quic_connection(
+    conn: quinn::Connection,
+    endpoint: Option<quinn::Endpoint>,
+    output_dir: PathBuf,
+) -> Result<()> {
     let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
         Ok(s) => s,
         // Sender connected only to measure RTT, found it was within the LAN
@@ -473,31 +531,64 @@ async fn handle_quic_connection(conn: quinn::Connection, output_dir: PathBuf) ->
     // QUIC handshake is close enough for window sizing before data starts.
     let rtt = conn.stats().path.rtt;
     let bdp_window = crate::net::connection::compute_bdp_window(rtt);
-    if bdp_window > crate::net::connection::CONNECTION_RECEIVE_WINDOW as u64 {
-        if let Ok(w) = quinn::VarInt::from_u64(bdp_window) {
-            conn.set_receive_window(w);
-            tracing::debug!(
-                bdp_window,
-                rtt_ms = rtt.as_secs_f64() * 1000.0,
-                "enlarged receive window for BDP"
-            );
+    let apply_window = |c: &quinn::Connection| {
+        if bdp_window > crate::net::connection::CONNECTION_RECEIVE_WINDOW as u64 {
+            if let Ok(w) = quinn::VarInt::from_u64(bdp_window) {
+                c.set_receive_window(w);
+            }
         }
-    }
+    };
+    apply_window(&conn);
 
-    let conn_for_accept = conn.clone();
-    let mut ctrl_send = run_receive(ctrl_send, ctrl_recv, output_dir, move || {
-        let conn = conn_for_accept.clone();
+    // Feeder: a channel of accepted data streams, fed by the primary connection
+    // and (for multipath) any additional connections that arrive at the endpoint.
+    let (tx, rx) = async_channel::unbounded::<Box<dyn AsyncRead + Unpin + Send + 'static>>();
+    let mut feeders: JoinSet<()> = JoinSet::new();
+    feeders.spawn(drain_uni_streams(conn.clone(), tx.clone()));
+    if let Some(ep) = endpoint {
+        // Accept extra bonded connections and drain their data streams too.
+        let tx_extra = tx.clone();
+        feeders.spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let tx = tx_extra.clone();
+                tokio::spawn(async move {
+                    if let Ok(c) = incoming.await {
+                        apply_extra_path_window(&c);
+                        drain_uni_streams(c, tx).await;
+                    }
+                });
+            }
+        });
+    }
+    drop(tx); // feeders hold their own clones; rx closes when they all exit
+
+    let result = run_receive(ctrl_send, ctrl_recv, output_dir, move || {
+        let rx = rx.clone();
         async move {
-            let stream = conn.accept_uni().await.context("accept QUIC data stream")?;
-            Ok(Box::new(stream) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+            rx.recv()
+                .await
+                .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
         }
     })
-    .await?;
+    .await;
+    feeders.abort_all();
+    let mut ctrl_send = result?;
 
     // Gracefully close the control stream so the sender sees a clean FIN.
     let _ = ctrl_send.finish();
     let _ = conn.closed().await;
     Ok(())
+}
+
+/// Enlarge the receive window on an extra bonded path for high-BDP links.
+fn apply_extra_path_window(c: &quinn::Connection) {
+    let rtt = c.stats().path.rtt;
+    let bdp_window = crate::net::connection::compute_bdp_window(rtt);
+    if bdp_window > crate::net::connection::CONNECTION_RECEIVE_WINDOW as u64 {
+        if let Ok(w) = quinn::VarInt::from_u64(bdp_window) {
+            c.set_receive_window(w);
+        }
+    }
 }
 
 // ── Per-connection logic: TCP+TLS ─────────────────────────────────────────────

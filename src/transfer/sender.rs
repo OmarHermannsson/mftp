@@ -152,6 +152,12 @@ pub struct SendConfig {
     /// Only measurable on local NVMe with queue-depth ≥ 32; no benefit on
     /// network-bound transfers or spinning disks.
     pub parallel_reads: bool,
+    /// Number of independent QUIC connections (paths) to bond for the transfer.
+    /// `1` (default) is the classic single-connection behaviour. `> 1` opens
+    /// that many connections to the destination and stripes the data-stream
+    /// workers across them — link bonding (M3). Only the QUIC path honours this;
+    /// TCP already opens one connection per stream.
+    pub paths: usize,
     /// Transfer directories recursively.  When true and `file` is a directory,
     /// the sender scans the tree, builds a `DirEntries` manifest, and feeds the
     /// virtual concatenated byte stream.  Silently accepted (no-op) for regular
@@ -223,7 +229,11 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
                     "connected via QUIC (RTT {:.1} ms)",
                     rtt.as_secs_f64() * 1000.0
                 );
-                send_quic_with_conn(file, config, conn, dir_entries).await
+                // Multipath (M3): open additional connections to bond as extra
+                // paths. Best-effort — a path that fails to open is skipped and
+                // the transfer proceeds over the connections that did come up.
+                let extra_conns = open_extra_paths(&endpoint, destination, config.paths).await;
+                send_quic_with_conn(file, config, conn, extra_conns, dir_entries).await
             }
         }
         Ok(Err(e)) if forced_quic => {
@@ -278,10 +288,47 @@ fn resolve_source(file: &Path, config: &SendConfig) -> Result<Option<Vec<FileEnt
 
 // ── QUIC path ─────────────────────────────────────────────────────────────────
 
+/// Open up to `paths - 1` additional QUIC connections to `destination` for
+/// link bonding (M3). Returns the connections that came up; failures are logged
+/// and skipped so the transfer still proceeds over whatever paths succeeded.
+async fn open_extra_paths(
+    endpoint: &quinn::Endpoint,
+    destination: SocketAddr,
+    paths: usize,
+) -> Vec<quinn::Connection> {
+    let mut extra = Vec::new();
+    if paths <= 1 {
+        return extra;
+    }
+    for i in 1..paths {
+        match tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
+            endpoint
+                .connect(destination, "mftp")
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .await
+        {
+            Ok(Ok(c)) => {
+                debug!("opened additional path {i} to {destination}");
+                extra.push(c);
+            }
+            Ok(Err(e)) => warn!("multipath: extra path {i} failed to connect: {e:#}"),
+            Err(_) => warn!("multipath: extra path {i} timed out connecting"),
+        }
+    }
+    if !extra.is_empty() {
+        info!("multipath: bonded {} connection(s)", extra.len() + 1);
+    }
+    extra
+}
+
 async fn send_quic_with_conn(
     file: PathBuf,
     config: SendConfig,
     conn: quinn::Connection,
+    extra_conns: Vec<quinn::Connection>,
     dir_entries: Option<Vec<FileEntry>>,
 ) -> Result<()> {
     let file_size = if let Some(ref entries) = dir_entries {
@@ -377,7 +424,20 @@ async fn send_quic_with_conn(
         );
     }
 
-    let conn_for_workers = conn.clone();
+    // All bonded connections (primary first), shared by the data-stream
+    // workers. Worker `stream_seq` opens its uni stream on `paths[seq % len]`,
+    // round-robining streams across paths; the shared work channel then load-
+    // balances chunks naturally (a faster path drains more). Enlarge the send
+    // window on every path for high-BDP links.
+    let mut paths_vec = Vec::with_capacity(1 + extra_conns.len());
+    paths_vec.push(conn.clone());
+    paths_vec.extend(extra_conns.iter().cloned());
+    if bdp_window > crate::net::connection::SEND_WINDOW {
+        for c in &extra_conns {
+            c.set_send_window(bdp_window);
+        }
+    }
+    let paths_for_workers = Arc::new(paths_vec);
     let peer_version = neg_resp.protocol_version;
     // v7+: prefix each data stream with a StreamHello frame. Skipped against an
     // older receiver so the wire stays identical to v6.
@@ -395,8 +455,9 @@ async fn send_quic_with_conn(
             &config,
             manifest,
             move |rx, transfer_id, stream_seq| {
-                let conn = conn_for_workers.clone();
+                let paths = Arc::clone(&paths_for_workers);
                 async move {
+                    let conn = &paths[stream_seq as usize % paths.len()];
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
                     quic_fec_stream_worker(stream, rx, transfer_id, stream_seq, send_hello).await
                 }
@@ -422,8 +483,9 @@ async fn send_quic_with_conn(
                 as Arc<dyn crate::transport::Transport>),
             Some(manifest),
             move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
-                let conn = conn_for_workers.clone();
+                let paths = Arc::clone(&paths_for_workers);
                 async move {
+                    let conn = &paths[stream_seq as usize % paths.len()];
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
                     quic_stream_worker(
                         stream,
@@ -448,6 +510,9 @@ async fn send_quic_with_conn(
 
     let _ = ctrl_send.finish();
     conn.close(0u32.into(), b"done");
+    for c in &extra_conns {
+        c.close(0u32.into(), b"done");
+    }
     Ok(())
 }
 
