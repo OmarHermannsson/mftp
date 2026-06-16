@@ -1031,3 +1031,68 @@ async fn test_daemon_auth_unauthorized_sender_rejected() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── M8: multi-tenant ACL output routing ─────────────────────────────────────────
+
+/// With an ACL, an authorized sender's file lands in that peer's own subdir
+/// (tenant isolation), routed by the DeviceId from its client certificate.
+#[tokio::test]
+async fn test_multitenant_acl_output_routing() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use mftp::net::connection::make_private_key;
+    use mftp::service::acl::{Acl, PeerPolicy};
+
+    let out_root = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let rcfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "t.bin", 300 * 1024);
+
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let server_id = mftp::identity::load_or_create_in(rcfg.path())?;
+
+    let mut acl = Acl::default();
+    acl.set_peer(
+        &sender_id.device_id,
+        PeerPolicy {
+            output_subdir: "alice".into(),
+            quota_bytes: None,
+        },
+    );
+
+    let server = Server::bind_with_cert_auth(
+        "127.0.0.1:0".parse()?,
+        out_root.path().to_owned(),
+        server_id.cert.clone(),
+        make_private_key(server_id.key_bytes.clone())?,
+        server_id.fingerprint.clone(),
+        Some(acl.authorized_ids()),
+    )?;
+    let addr = server.local_addr;
+
+    let out_root_path = out_root.path().to_owned();
+    let acl2 = acl.clone();
+    let serve = tokio::spawn(async move {
+        let _ = server
+            .serve_with_router(move |peer| {
+                let device = peer.context("no peer DeviceId")?;
+                let d = acl2.output_dir_for(&out_root_path, device)?;
+                std::fs::create_dir_all(&d)?;
+                Ok(d)
+            })
+            .await;
+    });
+
+    sender::send(
+        src.clone(),
+        addr,
+        auth_send_config(server_id.fingerprint.clone(), sender_id),
+    )
+    .await?;
+    serve.abort();
+
+    let received = out_root.path().join("alice").join("t.bin");
+    assert!(received.exists(), "file routed into the tenant subdir");
+    assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
+    Ok(())
+}

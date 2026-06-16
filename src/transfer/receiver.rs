@@ -193,18 +193,34 @@ impl Server {
     /// Accept and handle transfers indefinitely (QUIC only; use `listen` for
     /// auto mode). Multipath-aware: transfers are served sequentially and any
     /// extra connections arriving during a transfer bond as additional paths.
-    /// (Concurrent multi-tenant serving with a path registry arrives in M4.)
     pub async fn serve(self) -> Result<()> {
+        let out = self.output_dir.clone();
+        self.serve_with_router(move |_peer| Ok(out.clone())).await
+    }
+
+    /// Like [`Server::serve`], but `router` maps each connection's peer DeviceId
+    /// (extracted from its client certificate under mutual-TLS auth) to the
+    /// output directory its files should land in — the basis for per-peer tenant
+    /// isolation (M8 ACLs). `router` receives `None` when the peer presented no
+    /// usable identity.
+    pub async fn serve_with_router<F>(self, router: F) -> Result<()>
+    where
+        F: Fn(Option<&str>) -> Result<PathBuf>,
+    {
         while let Some(incoming) = self.endpoint.accept().await {
             match incoming.await {
                 Ok(conn) => {
                     info!("connection from {}", conn.remote_address());
-                    let r = handle_quic_connection(
-                        conn,
-                        Some(self.endpoint.clone()),
-                        self.output_dir.clone(),
-                    )
-                    .await;
+                    let peer = peer_device_id(&conn);
+                    let out = match router(peer.as_deref()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::error!("rejecting connection: {e:#}");
+                            conn.close(1u32.into(), b"not authorized");
+                            continue;
+                        }
+                    };
+                    let r = handle_quic_connection(conn, Some(self.endpoint.clone()), out).await;
                     if let Err(e) = r {
                         if e.downcast_ref::<SwitchToTcp>().is_some() {
                             debug!("sender switched to TCP+TLS");
@@ -218,6 +234,15 @@ impl Server {
         }
         Ok(())
     }
+}
+
+/// Extract the peer's Ed25519 DeviceId from its client certificate (mutual TLS).
+/// Returns `None` if the peer presented no certificate or no Ed25519 key.
+pub fn peer_device_id(conn: &quinn::Connection) -> Option<String> {
+    let identity = conn.peer_identity()?;
+    let certs = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    let leaf = certs.first()?;
+    crate::identity::device_id_from_cert(leaf)
 }
 
 // ── TCP+TLS server ────────────────────────────────────────────────────────────

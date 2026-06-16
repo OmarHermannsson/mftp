@@ -9,6 +9,7 @@ pub mod net;
 pub mod progress;
 pub mod protocol;
 pub mod reach;
+pub mod service;
 pub mod sftp;
 pub mod ssh;
 pub mod transfer;

@@ -258,6 +258,9 @@ enum Command {
         /// Senders can then use `mftp send <file> <name>`.
         #[arg(long)]
         name: Option<String>,
+        /// Also serve a read-only Web UI / JSON status API on this address.
+        #[arg(long, value_name = "HOST:PORT")]
+        http: Option<String>,
     },
     /// Query a running daemon's status / identity over its control socket.
     #[cfg(unix)]
@@ -549,6 +552,7 @@ async fn main() -> Result<()> {
             output_dir,
             socket,
             name,
+            http,
         } => {
             let addr = bind
                 .parse()
@@ -557,7 +561,14 @@ async fn main() -> Result<()> {
                 .or_else(mftp::daemon::default_socket_path)
                 .context("cannot determine control socket path")?;
             let name = name.unwrap_or_else(mftp::discovery::hostname);
-            mftp::daemon::run(addr, output_dir, socket, name).await
+            let http = match http {
+                Some(s) => Some(
+                    s.parse()
+                        .with_context(|| format!("invalid --http address: {s}"))?,
+                ),
+                None => None,
+            };
+            mftp::daemon::run(addr, output_dir, socket, name, http).await
         }
         #[cfg(unix)]
         Command::DaemonStatus { socket } => {

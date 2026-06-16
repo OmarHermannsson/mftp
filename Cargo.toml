@@ -1,6 +1,6 @@
 [package]
 name = "mftp"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 description = "High-throughput file transfer over high-latency internet links"
 license = "MIT"

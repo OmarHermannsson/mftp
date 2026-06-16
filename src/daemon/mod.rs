@@ -192,17 +192,27 @@ pub async fn run(
     output_dir: PathBuf,
     socket_path: PathBuf,
     announce_name: String,
+    http: Option<std::net::SocketAddr>,
 ) -> Result<()> {
     let config_dir =
         crate::identity::config_dir().context("cannot locate config dir ($HOME unset)")?;
     let id = crate::identity::load_or_create_in(&config_dir)?;
-    let authorized = crate::identity::load_authorized_in(&config_dir);
+
+    // M8: an ACL (acl.toml), if present, supplies the authorized peers and their
+    // per-tenant output dirs/quotas. Otherwise fall back to the M4 plain
+    // allowlist (authorized_devices).
+    let acl = crate::service::acl::Acl::load(&config_dir).unwrap_or_default();
+    let authorized = if acl.is_empty() {
+        crate::identity::load_authorized_in(&config_dir)
+    } else {
+        acl.authorized_ids()
+    };
     let auth_enforced = !authorized.is_empty();
 
     let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
     let server = crate::transfer::receiver::Server::bind_with_cert_auth(
         bind,
-        output_dir,
+        output_dir.clone(),
         id.cert.clone(),
         key,
         id.fingerprint.clone(),
@@ -218,8 +228,9 @@ pub async fn run(
     println!("Device ID: {}", id.device_id);
     println!("Fingerprint: {}", id.fingerprint);
     if auth_enforced {
+        let mode = if acl.is_empty() { "allowlist" } else { "ACL" };
         println!(
-            "Identity auth: ENFORCED ({} authorized device(s))",
+            "Identity auth: ENFORCED via {mode} ({} authorized device(s))",
             authorized.len()
         );
     } else {
@@ -246,10 +257,39 @@ pub async fn run(
     }
 
     let listener = bind_control_socket(&socket_path)?;
-    let state = Arc::new(DaemonState::new(config_dir, listening_on));
+    let state = Arc::new(DaemonState::new(config_dir.clone(), listening_on.clone()));
+
+    // M8: optional HTTP status API + Web UI dashboard.
+    if let Some(http_addr) = http {
+        let http_listener = tokio::net::TcpListener::bind(http_addr)
+            .await
+            .with_context(|| format!("bind HTTP dashboard on {http_addr}"))?;
+        let real = http_listener.local_addr()?;
+        println!("Web UI / HTTP API: http://{real}/");
+        let http_state = Arc::new(crate::service::http::HttpState {
+            config_dir: config_dir.clone(),
+            listening_on: listening_on.clone(),
+        });
+        tokio::spawn(crate::service::http::serve(http_listener, http_state));
+    }
+
+    // Per-peer output routing (M8): with an ACL, each authorized peer's files
+    // land in its own subdir (tenant isolation); without one, the shared root.
+    let acl_for_router = acl.clone();
+    let output_root = output_dir.clone();
+    let serve_fut = server.serve_with_router(move |peer| {
+        if acl_for_router.is_empty() {
+            return Ok(output_root.clone());
+        }
+        let device = peer.context("ACL enforced but peer presented no DeviceId")?;
+        let dir = acl_for_router.output_dir_for(&output_root, device)?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create tenant dir {}", dir.display()))?;
+        Ok(dir)
+    });
 
     // Serve both forever; if either exits (error), propagate.
-    tokio::try_join!(server.serve(), serve_control(listener, state))?;
+    tokio::try_join!(serve_fut, serve_control(listener, state))?;
     Ok(())
 }
 
