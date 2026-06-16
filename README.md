@@ -568,6 +568,8 @@ MACOSX_DEPLOYMENT_TARGET = "12.0"
 
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
 
+**[mftp v2 — Vision & Roadmap](docs/V2_VISION.md)** sketches the next major shape: a persistent `mftpd` daemon, a pluggable transport layer (multipath/link bonding), NAT traversal + rendezvous/relay for zero-config reach, and a multi-tenant service mode — all reusing today's chunk/BLAKE3/resume data plane, with classic point-to-point mode kept working.
+
 For shipped features and per-release history, see [CHANGELOG.md](CHANGELOG.md) and the [releases page](https://github.com/OmarHermannsson/mftp/releases).
 
 ---
