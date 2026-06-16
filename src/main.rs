@@ -164,6 +164,11 @@ enum Command {
         /// Ignored in SSH mode — fingerprint is obtained automatically.
         #[arg(long)]
         trust: Option<String>,
+        /// Reach the receiver by Ed25519 DeviceId through a rendezvous broker at
+        /// this address, instead of a direct host:port. The broker exchanges
+        /// candidate addresses; the transfer itself stays peer-to-peer.
+        #[arg(long, value_name = "HOST:PORT")]
+        rendezvous: Option<String>,
         /// Pin the receiver's Ed25519 DeviceId (hex), as printed by `mftp receive`
         /// ("Device ID: …"). Unlike --trust this survives the receiver re-issuing
         /// its certificate, and takes precedence over --trust when both are given.
@@ -261,6 +266,13 @@ enum Command {
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
+    /// Run a rendezvous broker so NATed peers can find each other by DeviceId.
+    /// Signaling only — the broker never sees file data.
+    Rendezvous {
+        /// Address to listen on
+        #[arg(default_value = "0.0.0.0:7779")]
+        bind: String,
+    },
     /// Manage the daemon's authorized-sender DeviceId allowlist.
     #[cfg(unix)]
     DaemonTrust {
@@ -343,6 +355,7 @@ async fn main() -> Result<()> {
             file,
             destination,
             trust,
+            rendezvous,
             trust_device,
             remote_mftp,
             port,
@@ -417,7 +430,39 @@ async fn main() -> Result<()> {
                 (_, true) => mftp::ssh::DownloadPolicy::Never,
                 _ => mftp::ssh::DownloadPolicy::Ask,
             };
-            if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
+            if let Some(broker) = rendezvous {
+                // Reach the receiver by DeviceId through the broker (M6).
+                let broker_addr: std::net::SocketAddr = broker
+                    .parse()
+                    .with_context(|| format!("invalid --rendezvous address: {broker}"))?;
+                let candidates = match mftp::reach::lookup(broker_addr, &destination, vec![])
+                    .await
+                    .context("rendezvous lookup")?
+                {
+                    Some(c) => c,
+                    None => anyhow::bail!(
+                        "device {destination:?} is not registered at the rendezvous broker"
+                    ),
+                };
+                if config.trusted_fingerprint.is_none() && config.trusted_device.is_none() {
+                    config.trusted_device = Some(destination.clone());
+                }
+                // Try each candidate (hole-punched/direct path) until one connects.
+                let mut last_err = None;
+                for cand in &candidates {
+                    eprintln!("[mftp] rendezvous: trying candidate {cand}");
+                    match sender::send(file.clone(), *cand, config.clone()).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            eprintln!("[mftp] candidate {cand} failed: {e:#}");
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!("no rendezvous candidates for {destination}")
+                }))
+            } else if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
                 mftp::ssh::send_via_ssh(
                     file,
                     dest,
@@ -465,6 +510,14 @@ async fn main() -> Result<()> {
             receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
         Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
+        Command::Rendezvous { bind } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let server = mftp::reach::RendezvousServer::bind(addr).await?;
+            println!("rendezvous broker listening on {}", server.local_addr()?);
+            server.serve().await
+        }
         #[cfg(unix)]
         Command::Daemon {
             bind,
