@@ -408,7 +408,8 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             peer_version,
             &config,
-            Some(conn.clone()),
+            Some(Arc::new(crate::transport::QuicTransport::new(conn.clone()))
+                as Arc<dyn crate::transport::Transport>),
             Some(manifest),
             move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
                 let conn = conn_for_workers.clone();
@@ -532,7 +533,10 @@ async fn send_tcp(
         neg_resp.cpu_cores,
         peer_version,
         &config,
-        None, // no quinn connection on TCP path
+        // TCP+TLS exposes only the negotiated-RTT estimate (the kernel owns
+        // congestion control); the engine queries it through the same trait.
+        Some(Arc::new(crate::transport::TcpTransport::new(rtt))
+            as Arc<dyn crate::transport::Transport>),
         None, // TCP can't pipeline: it measures RTT via the negotiate round-trip
         move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
             let fp = trusted_fp.clone();
@@ -794,7 +798,12 @@ async fn run_transfer<CW, CR, F, Fut>(
     receiver_cores: u32,
     peer_protocol_version: u32,
     config: &SendConfig,
-    qconn: Option<quinn::Connection>,
+    // The selected transport, queried for live path stats (RTT/loss) by the
+    // background sampler task. `None` for transports that expose no live metrics
+    // (the TCP path passes its negotiated-RTT estimate is reflected via `rtt`).
+    // The engine never references a concrete transport type — see
+    // [`crate::transport::Transport`].
+    transport: Option<Arc<dyn crate::transport::Transport>>,
     // `Some` when the caller already pipelined NegotiateRequest + manifest +
     // DirEntries into one flight (QUIC fast path); `None` to build and send the
     // manifest here (TCP path, which can't compute params before the RTT-probing
@@ -993,16 +1002,16 @@ where
     let stall_ms_for_reader = Arc::new(AtomicU32::new(0u32));
     let rtt_ms_for_reader = Arc::clone(&rtt_ms_atom);
     let loss_for_reader = Arc::clone(&loss_atom);
-    let _stats_task = qconn.map(|c| {
+    let _stats_task = transport.map(|t| {
         let rtt_a = rtt_ms_atom;
         let loss_a = loss_atom;
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 iv.tick().await;
-                let s = c.stats();
-                rtt_a.store(s.path.rtt.as_millis() as u32, AtomicOrd::Relaxed);
-                loss_a.store(s.path.lost_packets, AtomicOrd::Relaxed);
+                let s = t.path_stats();
+                rtt_a.store(s.rtt.as_millis() as u32, AtomicOrd::Relaxed);
+                loss_a.store(s.lost_packets, AtomicOrd::Relaxed);
             }
         })
     });
