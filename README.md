@@ -151,6 +151,8 @@ mftp send [OPTIONS] <FILE> <DESTINATION>
 `DESTINATION` is either:
 - `host:port` — connect to an already-running `mftp receive`. The port must be reachable (UDP for QUIC, TCP for TCP+TLS).
 - `[user@]host:/remote/path` — launch the receiver via SSH (recommended). Falls back through QUIC → TCP+TLS → SFTP automatically.
+- `<name>` — a receiver advertised by name on the LAN (see `mftp daemon --name`); resolved via discovery, its Device ID auto-pinned.
+- `<device-id>` with `--rendezvous <broker>` — reach a NATed receiver by Device ID through a rendezvous broker.
 
 ```
 Options:
@@ -159,6 +161,18 @@ Options:
                            prompted to accept it once per session; it is not
                            automatically stored between sessions).
                            Ignored in SSH mode — fingerprint is read from the server.
+  --trust-device <HEX>     Pin the receiver's Ed25519 Device ID (as printed by
+                           `mftp receive`). Unlike --trust this survives the
+                           receiver re-issuing its certificate, and takes
+                           precedence over --trust. Ignored in SSH mode.
+  --rendezvous <HOST:PORT> Reach the receiver by Device ID (passed as DESTINATION)
+                           through a rendezvous broker at this address instead of a
+                           direct host:port. Candidates are exchanged for hole
+                           punching; the transfer itself stays peer-to-peer.
+  --paths <N>              Bond N QUIC connections for one transfer and stripe the
+                           data streams across them (link bonding for multi-homed
+                           hosts; default 1). Each path runs its own congestion
+                           control. QUIC only; ignored on TCP/SFTP.
   --remote-mftp <PATH>     Path to a pre-installed mftp on the remote host.
                            By default mftp pipes itself over SSH stdin on first use
                            and caches it at ~/.cache/mftp-<hash> on the remote.
@@ -229,6 +243,43 @@ Options:
 ```
 
 FEC parameters are negotiated automatically via the `TransferManifest` — no `--fec` flag needed on the receiver.
+
+### `mftp daemon` (Unix)
+
+```
+mftp daemon [OPTIONS] [BIND]
+```
+
+Runs a persistent **accept-many** receiver plus a local control socket — the v2 service mode. Unlike `mftp receive` (one transfer, then exit), the daemon stays up and serves transfers over time.
+
+```
+Options:
+  -o, --output-dir <DIR>   Directory to write received files into (default: .).
+      --socket <PATH>      Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock).
+      --name <NAME>        LAN discovery name to announce as (default: hostname).
+                           Senders can then use `mftp send <file> <name>`.
+      --http <HOST:PORT>   Also serve a read-only Web UI / JSON status API here.
+```
+
+When the authorized-device allowlist is non-empty (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
+
+### `mftp daemon-status` / `mftp daemon-trust` (Unix)
+
+```
+mftp daemon-status [--socket <PATH>]
+mftp daemon-trust  [--socket <PATH>] <add <id> | remove <id> | list>
+```
+
+`daemon-status` prints the running daemon's listen address, identity, and counters over its control socket. `daemon-trust` manages the authorized-sender Device ID allowlist (`add`/`remove`/`list`).
+
+### `mftp rendezvous` / `mftp relay`
+
+```
+mftp rendezvous [BIND]            # default 0.0.0.0:7779
+mftp relay --to <HOST:PORT> [BIND]  # default 0.0.0.0:7780
+```
+
+`rendezvous` runs a **signaling-only** broker so NATed peers can find each other by Device ID and exchange candidates for UDP hole punching — it never sees file data. `relay` runs a **zero-knowledge** UDP forwarder for when hole punching fails (symmetric NAT): it blindly forwards QUIC datagrams to `--to`, and because TLS terminates at the two endpoints it only ever sees ciphertext. Both are opt-in; direct and SSH transfers need neither.
 
 ### `mftp --version`
 
