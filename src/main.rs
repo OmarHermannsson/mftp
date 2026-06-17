@@ -66,75 +66,6 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of parallel streams.
-    /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
-    /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
-    /// scales linearly — raise to 12 if the remote sshd allows it).
-    #[arg(short = 'n', long, global = true, value_name = "N")]
-    streams: Option<usize>,
-
-    /// Chunk size in bytes (default: auto-negotiated from RTT)
-    #[arg(long, global = true)]
-    chunk_size: Option<usize>,
-
-    /// Number of QUIC connections (paths) to bond for one transfer (default 1).
-    ///
-    /// Values above 1 open that many connections to the receiver and stripe the
-    /// data streams across them — link bonding for multi-homed hosts (e.g. Wi-Fi
-    /// plus wired, or two WAN uplinks). Each path runs its own congestion
-    /// control, so a faster path naturally carries more chunks. QUIC only;
-    /// ignored on the TCP and SFTP paths.
-    #[arg(long, global = true, value_name = "N")]
-    paths: Option<usize>,
-
-    /// Disable adaptive zstd compression
-    #[arg(long, global = true)]
-    no_compress: bool,
-
-    /// Enable Reed-Solomon forward error correction.
-    ///
-    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead).
-    /// NOTE: this does NOT improve throughput. mftp's chunks ride reliable QUIC
-    /// streams, which already retransmit lost packets, so the parity is pure
-    /// overhead competing for the link (benchmarked a wash-to-worse up to 30%
-    /// loss). Leave it off unless you specifically want the receiver to
-    /// reconstruct an occasional corrupt chunk without an in-band repair round.
-    /// Automatically disabled when the transport falls back to TCP (reliable delivery).
-    #[arg(long, global = true, value_name = "DATA:PARITY")]
-    fec: Option<String>,
-
-    /// Force a specific transport path.
-    ///
-    /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
-    ///
-    /// tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
-    ///
-    /// sftp — parallel SFTP through SSH port 22 (SSH mode only; ~22 MiB/s cap).
-    ///        Skips the remote mftp server launch — port 22 is all that's needed.
-    ///
-    /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
-    #[arg(long, global = true, value_name = "TRANSPORT")]
-    transport: Option<Transport>,
-
-    /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
-    /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
-    /// congestion window ramp-up.  Set 0 to always use QUIC, or higher to widen the
-    /// TCP window.  Ignored when --transport is set.
-    ///
-    /// Left as `Option` (rather than a clap `default_value`) so the config file
-    /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
-    /// is applied in `main` after merging CLI > config.
-    #[arg(long, global = true, value_name = "MS")]
-    tcp_below_rtt: Option<f64>,
-
-    /// Use multiple parallel file readers instead of a single sequential reader.
-    ///
-    /// Splits the file into one range per stream and reads them concurrently.
-    /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
-    /// effect on network-bound transfers or spinning disks.
-    #[arg(long, global = true, hide = true)]
-    parallel_reads: bool,
-
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -220,6 +151,67 @@ enum Command {
         /// Has no effect when the receiver runs on Windows.
         #[arg(long)]
         preserve: bool,
+        /// Number of parallel streams.
+        /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
+        /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
+        /// scales linearly — raise to 12 if the remote sshd allows it).
+        #[arg(short = 'n', long, value_name = "N")]
+        streams: Option<usize>,
+        /// Chunk size in bytes (default: auto-negotiated from RTT)
+        #[arg(long)]
+        chunk_size: Option<usize>,
+        /// Number of QUIC connections (paths) to bond for one transfer (default 1).
+        ///
+        /// Values above 1 open that many connections to the receiver and stripe the
+        /// data streams across them — link bonding for multi-homed hosts (e.g. Wi-Fi
+        /// plus wired, or two WAN uplinks). Each path runs its own congestion
+        /// control, so a faster path naturally carries more chunks. QUIC only;
+        /// ignored on the TCP and SFTP paths.
+        #[arg(long, value_name = "N")]
+        paths: Option<usize>,
+        /// Disable adaptive zstd compression
+        #[arg(long)]
+        no_compress: bool,
+        /// Enable Reed-Solomon forward error correction.
+        ///
+        /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead).
+        /// NOTE: this does NOT improve throughput. mftp's chunks ride reliable QUIC
+        /// streams, which already retransmit lost packets, so the parity is pure
+        /// overhead competing for the link (benchmarked a wash-to-worse up to 30%
+        /// loss). Leave it off unless you specifically want the receiver to
+        /// reconstruct an occasional corrupt chunk without an in-band repair round.
+        /// Automatically disabled when the transport falls back to TCP (reliable delivery).
+        #[arg(long, value_name = "DATA:PARITY")]
+        fec: Option<String>,
+        /// Force a specific transport path.
+        ///
+        /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
+        ///
+        /// tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
+        ///
+        /// sftp — parallel SFTP through SSH port 22 (SSH mode only; ~22 MiB/s cap).
+        ///        Skips the remote mftp server launch — port 22 is all that's needed.
+        ///
+        /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
+        #[arg(long, value_name = "TRANSPORT")]
+        transport: Option<Transport>,
+        /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
+        /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
+        /// congestion window ramp-up.  Set 0 to always use QUIC, or higher to widen the
+        /// TCP window.  Ignored when --transport is set.
+        ///
+        /// Left as `Option` (rather than a clap `default_value`) so the config file
+        /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
+        /// is applied in `main` after merging CLI > config.
+        #[arg(long, value_name = "MS")]
+        tcp_below_rtt: Option<f64>,
+        /// Use multiple parallel file readers instead of a single sequential reader.
+        ///
+        /// Splits the file into one range per stream and reads them concurrently.
+        /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
+        /// effect on network-bound transfers or spinning disks.
+        #[arg(long, hide = true)]
+        parallel_reads: bool,
     },
     /// Receive files (run as server)
     Receive {
@@ -378,19 +370,26 @@ async fn main() -> Result<()> {
             recursive,
             preserve,
             remote_binary_sha256,
+            streams,
+            chunk_size,
+            paths,
+            no_compress,
+            fec,
+            transport,
+            tcp_below_rtt,
+            parallel_reads,
         } => {
             // Merge persistent tuning knobs: explicit CLI flag > config file >
-            // built-in default.  Each `cli.*` Option is `None` only when the
-            // flag was omitted, so `.or(...)` makes the CLI win cleanly.
-            let tcp_below_rtt = cli
-                .tcp_below_rtt
+            // built-in default.  Each flag Option is `None` only when it was
+            // omitted, so `.or(...)` makes the CLI win cleanly.
+            let tcp_below_rtt = tcp_below_rtt
                 .or(file_cfg.tcp_below_rtt)
                 .unwrap_or(DEFAULT_TCP_BELOW_RTT_MS);
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(tcp_below_rtt / 1000.0);
 
             // `--transport` (Option) wins; otherwise fall back to the config's
             // string form, which is parsed (and validated) here.
-            let forced_transport = match cli.transport {
+            let forced_transport = match transport {
                 Some(Transport::Quic) => Some(ForcedTransport::Quic),
                 Some(Transport::Tcp) => Some(ForcedTransport::Tcp),
                 Some(Transport::Sftp) => Some(ForcedTransport::Sftp),
@@ -400,7 +399,7 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let fec = match cli.fec.as_deref().or(file_cfg.fec.as_deref()) {
+            let fec = match fec.as_deref().or(file_cfg.fec.as_deref()) {
                 Some(s) => Some(parse_fec(s)?),
                 None => None,
             };
@@ -408,10 +407,10 @@ async fn main() -> Result<()> {
             // `--no-compress` is a one-way flag: passing it on the CLI or
             // setting it in the config disables compression.  There is no CLI
             // way to force compression back on, so OR is the correct merge.
-            let compress = !(cli.no_compress || file_cfg.no_compress);
+            let compress = !(no_compress || file_cfg.no_compress);
 
-            let streams = cli.streams.or(file_cfg.streams);
-            let chunk_size = cli.chunk_size.or(file_cfg.chunk_size);
+            let streams = streams.or(file_cfg.streams);
+            let chunk_size = chunk_size.or(file_cfg.chunk_size);
             let port = port.or(file_cfg.port);
 
             // Validate -r / directory combination early to give a clear error.
@@ -447,8 +446,8 @@ async fn main() -> Result<()> {
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,
-                parallel_reads: cli.parallel_reads,
-                paths: cli.paths.unwrap_or(1).max(1),
+                parallel_reads,
+                paths: paths.unwrap_or(1).max(1),
                 recursive,
                 preserve,
             };
