@@ -41,7 +41,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 
 ### Install
 
-**Download a prebuilt binary** — latest release: **[v0.1.130](https://github.com/OmarHermannsson/mftp/releases/latest)** (Linux x86_64, macOS Intel + Apple Silicon, Windows x86_64; each with a `.sha256`):
+**Download a prebuilt binary** — from the **[latest release](https://github.com/OmarHermannsson/mftp/releases/latest)** (Linux x86_64, macOS Intel + Apple Silicon, Windows x86_64; each with a `.sha256`):
 
 ```sh
 # Linux x86_64 — verify the checksum, then install
@@ -233,7 +233,7 @@ FEC parameters are negotiated automatically via the `TransferManifest` — no `-
 ### `mftp --version`
 
 ```
-mftp 0.1.119
+mftp 0.2.15
 ```
 
 ---
@@ -255,7 +255,7 @@ Sender                                    Receiver
                                              │  requires: SSH port 22 only
 ```
 
-The QUIC and TCP+TLS paths use TLS 1.3 with a freshly generated self-signed certificate shared between both transports (same fingerprint). The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
+The QUIC and TCP+TLS paths use TLS 1.3 with a self-signed certificate shared between both transports (same fingerprint). The certificate is bound to the receiver's persistent Ed25519 device key (`~/.config/mftp/`), so its fingerprint is stable across restarts. The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
 
 ### SSH-assisted launch
 
@@ -439,10 +439,10 @@ The resume file is deleted on successful completion. Resume is not available on 
 
 mftp uses self-signed TLS certificates with a TOFU (Trust On First Use) model, similar to SSH:
 
-- The receiver generates a fresh key pair on every start
-- It prints the SHA-256 fingerprint of its certificate
-- On first connect to a new server the sender prompts for confirmation (requires a TTY; non-interactive invocations without `--trust` are rejected)
-- Pass `--trust <fingerprint>` to pin a fingerprint for scripted or non-interactive use; the fingerprint is not stored between sessions automatically
+- The receiver keeps a **persistent** Ed25519 device key and self-signed certificate in `~/.config/mftp/` (key at mode 0600), generating them on first run and reusing them thereafter
+- It prints the SHA-256 fingerprint of its certificate and a stable **Device ID** (SHA-256 of the Ed25519 public key); because the cert is bound to the persistent key, **both are stable across restarts**
+- On first connect to a new server the sender prompts for confirmation (requires a TTY; non-interactive invocations without `--trust`/`--trust-device` are rejected)
+- Pass `--trust <fingerprint>` to pin the certificate fingerprint, or `--trust-device <id>` to pin the Device ID (which survives the receiver re-issuing its certificate). Neither is stored between sessions automatically; precedence is `--trust-device` > `--trust` > TOFU
 
 For SSH-assisted transfers the fingerprint is obtained automatically over the existing SSH channel — no manual verification step required.
 
