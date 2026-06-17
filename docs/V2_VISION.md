@@ -32,11 +32,23 @@ not present in a single-host sandbox):
   *success* depend on the network (blocked in containers); the protocols are
   verified over unicast/loopback, and M7's relay is the symmetric-NAT fallback.
 
+Post-review hardening (code-review pass): fixed concurrent-transfer isolation
+(the daemon/`serve` path now handles each connection on its own task — a second
+sender can no longer be absorbed into an in-flight transfer); replaced the
+DeviceId byte-scan with structural X.509 SubjectPublicKeyInfo extraction (closes
+an auth-bypass where a planted SPKI could forge an id); bound each relay session
+to its first sender (no third-party hijack); generation-checked broker
+de-registration; broker reports `Found` only when the receiver's presence is
+live; discovery no longer lets a nameless responder wildcard-match a real query;
+ACL byte-quotas are now enforced at connect time; and the sender surfaces a
+device-identity load failure instead of silently dropping its client cert.
+
 Carried-forward refinements (noted in commits): TCP-path client-cert auth (QUIC
-done), concurrent multi-tenant serving via a transfer_id→path registry (current
-QUIC serve is sequential + multipath), live quota enforcement in the streaming
-write path, and the browser-rendered dashboard (the JSON/HTML API it consumes is
-served and tested).
+done), connection-bonding *multipath into one of many concurrent* daemon
+transfers (needs a transfer_id→path registry; bonding is available via the
+dedicated multipath receiver, and concurrent single-connection transfers work),
+per-transfer (vs connect-time) quota precision, and the browser-rendered
+dashboard (the JSON/HTML API it consumes is served and tested).
 
 ## Context
 

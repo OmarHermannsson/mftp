@@ -35,27 +35,70 @@ pub struct Identity {
     pub device_id: String,
 }
 
-/// DER prefix of an Ed25519 `SubjectPublicKeyInfo`, immediately followed by the
-/// 32-byte raw public key. The full 44-byte SPKI is
-/// `[prefix][32-byte key]`. This shape is fixed for Ed25519 (RFC 8410), so we
-/// can locate and reconstruct the SPKI inside a certificate without pulling in
-/// a full X.509 parser.
+/// The full 44-byte DER of an Ed25519 `SubjectPublicKeyInfo`: a 12-byte prefix
+/// (RFC 8410, fixed) immediately followed by the 32-byte raw public key.
 const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
+const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32; // 44
 
-/// Length of a complete Ed25519 SPKI DER (12-byte prefix + 32-byte key).
-const ED25519_SPKI_LEN: usize = ED25519_SPKI_PREFIX.len() + 32;
+/// Read one DER TLV from `data`, returning `(tag, content, rest)`.
+fn der_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *data.first()?;
+    let first_len = *data.get(1)?;
+    let (len, hdr) = if first_len & 0x80 == 0 {
+        (first_len as usize, 2)
+    } else {
+        let n = (first_len & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return None; // unsupported / indefinite length
+        }
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | (*data.get(2 + i)? as usize);
+        }
+        (len, 2 + n)
+    };
+    let end = hdr.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((tag, &data[hdr..end], &data[end..]))
+}
 
-/// Derive the DeviceId (hex SHA-256 of the Ed25519 SPKI) from a presented
-/// certificate, so a client can check a `--trust-device` pin against the cert
-/// it actually received. Returns `None` if the cert carries no Ed25519 key.
+/// Derive the DeviceId (hex SHA-256 of the Ed25519 SubjectPublicKeyInfo) from a
+/// presented certificate by **structurally** navigating the X.509 DER to the
+/// real `subjectPublicKeyInfo` field — *not* by scanning for a byte pattern,
+/// which an attacker could plant earlier in the DER (e.g. in the subject DN) to
+/// forge another device's id. Returns `None` if the cert is malformed or carries
+/// a non-Ed25519 key.
 pub fn device_id_from_cert(cert: &CertificateDer<'_>) -> Option<String> {
-    let der = cert.as_ref();
-    let pos = der
-        .windows(ED25519_SPKI_PREFIX.len())
-        .position(|w| w == ED25519_SPKI_PREFIX)?;
-    let spki = der.get(pos..pos + ED25519_SPKI_LEN)?;
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+    let (_t, cert_seq, _) = der_tlv(cert.as_ref()).filter(|&(t, _, _)| t == 0x30)?;
+    // TBSCertificate ::= SEQUENCE { ... }
+    let (_t, mut tbs, _) = der_tlv(cert_seq).filter(|&(t, _, _)| t == 0x30)?;
+
+    // Optional [0] EXPLICIT version (context tag 0xA0) comes first when present.
+    let (first_tag, _, after_first) = der_tlv(tbs)?;
+    if first_tag == 0xA0 {
+        tbs = after_first;
+    }
+    // Skip serialNumber, signature, issuer, validity, subject (5 fields); the
+    // next field is subjectPublicKeyInfo.
+    for _ in 0..5 {
+        let (_t, _c, rest) = der_tlv(tbs)?;
+        tbs = rest;
+    }
+    // subjectPublicKeyInfo: reconstruct its full TLV slice and require it to be
+    // exactly the canonical 44-byte Ed25519 SPKI.
+    let (spki_tag, _spki_content, rest_after) = der_tlv(tbs)?;
+    if spki_tag != 0x30 {
+        return None;
+    }
+    let spki = &tbs[..tbs.len() - rest_after.len()];
+    if spki.len() != ED25519_SPKI_LEN || spki[..ED25519_SPKI_PREFIX.len()] != ED25519_SPKI_PREFIX {
+        return None; // not an Ed25519 SPKI
+    }
     Some(hex::encode(Sha256::digest(spki)))
 }
 
@@ -102,11 +145,15 @@ pub fn load_or_create_in(dir: &std::path::Path) -> Result<Identity> {
     if let (Ok(cert_der), Ok(key_bytes)) = (std::fs::read(&cert_p), std::fs::read(&key_p)) {
         let cert = CertificateDer::from(cert_der);
         let fingerprint = crate::net::connection::cert_fingerprint(&cert);
-        // device_id is cached on disk; recompute from the cert if missing/stale.
+        // device_id is cached on disk; if the cache is missing/corrupt, recompute
+        // it from the certificate's actual Ed25519 SPKI (NOT the cert fingerprint
+        // — they are different hashes and a wrong value silently breaks
+        // --trust-device pins and the daemon allowlist).
         let device_id = std::fs::read_to_string(device_id_path(dir))
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| s.len() == 64)
+            .or_else(|| device_id_from_cert(&cert))
             .unwrap_or_else(|| fingerprint.clone());
         return Ok(Identity {
             cert,
@@ -279,6 +326,67 @@ mod tests {
         let ib = load_or_create_in(b.path()).unwrap();
         assert_ne!(ia.fingerprint, ib.fingerprint);
         assert_ne!(ia.device_id, ib.device_id);
+    }
+
+    /// A DER `tag||len||content` helper (handles short + 1/2-byte long form).
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        let n = content.len();
+        if n < 128 {
+            v.push(n as u8);
+        } else if n < 256 {
+            v.push(0x81);
+            v.push(n as u8);
+        } else {
+            v.push(0x82);
+            v.push((n >> 8) as u8);
+            v.push((n & 0xff) as u8);
+        }
+        v.extend_from_slice(content);
+        v
+    }
+
+    /// An attacker who plants a valid-looking Ed25519 SPKI earlier in the DER
+    /// (e.g. in the subject field) must NOT be able to forge another device's id:
+    /// the structural parse hashes the *real* subjectPublicKeyInfo, not the
+    /// first byte-pattern match.
+    #[test]
+    fn device_id_uses_real_spki_not_planted_bytes() {
+        let real_spki = {
+            let mut v = ED25519_SPKI_PREFIX.to_vec();
+            v.extend_from_slice(&[0xBB; 32]);
+            v
+        };
+        let spoof_spki = {
+            let mut v = ED25519_SPKI_PREFIX.to_vec();
+            v.extend_from_slice(&[0xAA; 32]);
+            v
+        };
+
+        // TBSCertificate fields (no version): serial, sig, issuer, validity,
+        // subject(holding the spoof bytes), subjectPublicKeyInfo(real).
+        let mut tbs_content = Vec::new();
+        tbs_content.extend(tlv(0x02, &[0x01])); // serialNumber
+        tbs_content.extend(tlv(0x30, &[])); // signature alg
+        tbs_content.extend(tlv(0x30, &[])); // issuer
+        tbs_content.extend(tlv(0x30, &[])); // validity
+        tbs_content.extend(tlv(0x30, &spoof_spki)); // subject (contains spoof)
+        tbs_content.extend_from_slice(&real_spki); // subjectPublicKeyInfo (real)
+
+        let mut cert_content = Vec::new();
+        cert_content.extend(tlv(0x30, &tbs_content)); // tbsCertificate
+        cert_content.extend(tlv(0x30, &[])); // signatureAlgorithm
+        cert_content.extend(tlv(0x03, &[0x00])); // signatureValue
+        let cert_der = tlv(0x30, &cert_content);
+
+        let cert = CertificateDer::from(cert_der);
+        let got = device_id_from_cert(&cert).expect("parses to the real SPKI");
+        assert_eq!(got, hex::encode(Sha256::digest(&real_spki)));
+        assert_ne!(
+            got,
+            hex::encode(Sha256::digest(&spoof_spki)),
+            "must not be fooled by the planted SPKI in the subject"
+        );
     }
 
     #[test]

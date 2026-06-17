@@ -429,8 +429,21 @@ async fn main() -> Result<()> {
                 trusted_fingerprint: trust,
                 trusted_device: trust_device,
                 // Present our persistent device identity as a client certificate
-                // so daemons enforcing DeviceId auth can verify this sender.
-                client_identity: mftp::identity::load_or_create().ok(),
+                // so daemons enforcing DeviceId auth can verify this sender. A
+                // load failure is non-fatal (open receivers don't need it) but is
+                // surfaced, since against an auth-enforcing daemon it turns into
+                // an opaque TLS handshake rejection otherwise.
+                client_identity: match mftp::identity::load_or_create() {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        eprintln!(
+                            "[mftp] warning: could not load device identity ({e:#}); \
+                             sending without a client certificate — an auth-enforcing \
+                             daemon will reject this transfer"
+                        );
+                        None
+                    }
+                },
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,

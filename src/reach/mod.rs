@@ -66,14 +66,44 @@ pub enum SignalMsg {
 struct Registration {
     candidates: Vec<SocketAddr>,
     offer_tx: mpsc::Sender<SignalMsg>,
+    /// Monotonic id of this registration, so a stale presence task only removes
+    /// its OWN entry (a re-registration of the same DeviceId must not be deleted
+    /// when the older connection finally drops).
+    generation: u64,
 }
 
 type Registry = Arc<Mutex<HashMap<String, Registration>>>;
+
+/// Cap on candidate addresses accepted/relayed per peer — bounds the
+/// reflected-probe surface (a Lookup can make a receiver punch toward these).
+const MAX_CANDIDATES: usize = 8;
+
+/// Drop addresses that should never be hole-punch targets (multicast,
+/// unspecified, broadcast, port 0) so the broker can't be coaxed into reflecting
+/// probes at obviously-bogus destinations, and cap the count. Loopback is kept
+/// (harmless as a punch target, and used by tests).
+fn sanitize_candidates(cands: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    cands
+        .into_iter()
+        .filter(|a| {
+            let ip = a.ip();
+            !ip.is_multicast()
+                && !ip.is_unspecified()
+                && a.port() != 0
+                && match ip {
+                    std::net::IpAddr::V4(v4) => !v4.is_broadcast(),
+                    std::net::IpAddr::V6(_) => true,
+                }
+        })
+        .take(MAX_CANDIDATES)
+        .collect()
+}
 
 /// A running rendezvous broker.
 pub struct RendezvousServer {
     listener: TcpListener,
     registry: Registry,
+    next_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RendezvousServer {
@@ -85,6 +115,7 @@ impl RendezvousServer {
         Ok(RendezvousServer {
             listener,
             registry: Arc::new(Mutex::new(HashMap::new())),
+            next_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -97,8 +128,9 @@ impl RendezvousServer {
         loop {
             let (stream, peer) = self.listener.accept().await.context("accept signaling")?;
             let registry = Arc::clone(&self.registry);
+            let next_gen = Arc::clone(&self.next_gen);
             tokio::spawn(async move {
-                if let Err(e) = handle_signaling_conn(stream, peer, registry).await {
+                if let Err(e) = handle_signaling_conn(stream, peer, registry, next_gen).await {
                     tracing::debug!("signaling connection from {peer} ended: {e:#}");
                 }
             });
@@ -110,6 +142,7 @@ async fn handle_signaling_conn(
     stream: TcpStream,
     peer: SocketAddr,
     registry: Registry,
+    next_gen: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     stream.set_nodelay(true).ok();
     let (mut rd, mut wr) = stream.into_split();
@@ -124,11 +157,13 @@ async fn handle_signaling_conn(
         } => {
             // Presence connection: register, then forward Offers until it drops.
             let (offer_tx, mut offer_rx) = mpsc::channel::<SignalMsg>(8);
+            let generation = next_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             registry.lock().await.insert(
                 device_id.clone(),
                 Registration {
-                    candidates,
+                    candidates: sanitize_candidates(candidates),
                     offer_tx,
+                    generation,
                 },
             );
             framing::send_message(&mut wr, &SignalMsg::Registered { observed: peer }).await?;
@@ -138,29 +173,42 @@ async fn handle_signaling_conn(
                     break;
                 }
             }
-            registry.lock().await.remove(&device_id);
+            // Only remove the entry if it is still OURS — a newer registration of
+            // the same DeviceId must survive our teardown.
+            let mut reg = registry.lock().await;
+            if reg.get(&device_id).map(|r| r.generation) == Some(generation) {
+                reg.remove(&device_id);
+            }
             Ok(())
         }
         SignalMsg::Lookup { target, candidates } => {
-            let reg = registry.lock().await;
-            match reg.get(&target) {
-                Some(entry) => {
-                    let reply = SignalMsg::Found {
-                        candidates: entry.candidates.clone(),
-                    };
-                    // Notify the receiver so it punches toward the sender too.
-                    let _ = entry
-                        .offer_tx
+            let candidates = sanitize_candidates(candidates);
+            // Try to deliver the Offer first; only report Found if the receiver's
+            // presence is actually live (so the sender isn't told to punch toward
+            // a peer that will never punch back).
+            let entry = {
+                let reg = registry.lock().await;
+                reg.get(&target)
+                    .map(|e| (e.candidates.clone(), e.offer_tx.clone()))
+            };
+            match entry {
+                Some((cands, offer_tx)) => {
+                    let delivered = offer_tx
                         .send(SignalMsg::Offer {
                             from: "sender".to_string(),
                             candidates,
                         })
-                        .await;
-                    drop(reg);
-                    framing::send_message(&mut wr, &reply).await?;
+                        .await
+                        .is_ok();
+                    if delivered {
+                        framing::send_message(&mut wr, &SignalMsg::Found { candidates: cands })
+                            .await?;
+                    } else {
+                        // Presence channel is dead — treat as not registered.
+                        framing::send_message(&mut wr, &SignalMsg::NotFound).await?;
+                    }
                 }
                 None => {
-                    drop(reg);
                     framing::send_message(&mut wr, &SignalMsg::NotFound).await?;
                 }
             }

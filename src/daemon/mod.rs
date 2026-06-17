@@ -285,12 +285,35 @@ pub async fn run(
         let dir = acl_for_router.output_dir_for(&output_root, device)?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create tenant dir {}", dir.display()))?;
+        // Enforce the peer's byte quota against its current on-disk usage. This
+        // rejects a peer that is already at/over quota at connect time (bounding
+        // its total to ~quota + one in-flight transfer); `incoming` is unknown
+        // here since the manifest hasn't been read yet.
+        let used = dir_size_bytes(&dir);
+        acl_for_router.check_quota(device, used, 0)?;
         Ok(dir)
     });
 
     // Serve both forever; if either exits (error), propagate.
     tokio::try_join!(serve_fut, serve_control(listener, state))?;
     Ok(())
+}
+
+/// Total size in bytes of all regular files under `dir` (0 if absent). Used for
+/// per-peer quota enforcement.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
 }
 
 /// Send a single request to the daemon at `socket_path` and return its reply.

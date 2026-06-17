@@ -1096,3 +1096,58 @@ async fn test_multitenant_acl_output_routing() -> anyhow::Result<()> {
     assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
     Ok(())
 }
+
+// ── Regression: concurrent transfers must be isolated (review finding #1) ────────
+
+/// Two senders transferring at the same time to one `serve()` receiver both
+/// complete byte-for-byte — they are handled on independent tasks and never
+/// absorbed into each other (the multipath-feeder corruption is gone).
+#[tokio::test]
+async fn test_concurrent_transfers_isolated() -> anyhow::Result<()> {
+    let recv_dir = TempDir::new()?;
+    let d1 = TempDir::new()?;
+    let d2 = TempDir::new()?;
+    let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+    let addr = server.local_addr;
+    let fp = server.fingerprint.clone();
+    let serve = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    let s1 = make_test_file(d1.path(), "a.bin", 1024 * 1024);
+    let s2 = make_test_file(d2.path(), "b.bin", 1024 * 1024);
+    let cfg = |fp: String| SendConfig {
+        streams: Some(3),
+        chunk_size: Some(256 * 1024),
+        compress: false,
+        compress_level: 3,
+        trusted_fingerprint: Some(fp),
+        trusted_device: None,
+        client_identity: None,
+        forced_transport: Some(ForcedTransport::Quic),
+        tcp_rtt_threshold: std::time::Duration::ZERO,
+        fec: None,
+        parallel_reads: false,
+        paths: 1,
+        recursive: false,
+        preserve: false,
+    };
+
+    let (r1, r2) = tokio::join!(
+        sender::send(s1.clone(), addr, cfg(fp.clone())),
+        sender::send(s2.clone(), addr, cfg(fp.clone())),
+    );
+    r1?;
+    r2?;
+    serve.abort();
+
+    assert_eq!(
+        std::fs::read(&s1)?,
+        std::fs::read(recv_dir.path().join("a.bin"))?
+    );
+    assert_eq!(
+        std::fs::read(&s2)?,
+        std::fs::read(recv_dir.path().join("b.bin"))?
+    );
+    Ok(())
+}

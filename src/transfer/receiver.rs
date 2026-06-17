@@ -191,8 +191,8 @@ impl Server {
     }
 
     /// Accept and handle transfers indefinitely (QUIC only; use `listen` for
-    /// auto mode). Multipath-aware: transfers are served sequentially and any
-    /// extra connections arriving during a transfer bond as additional paths.
+    /// auto mode). Each connection is handled on its own task, so independent
+    /// senders get concurrent, isolated transfers.
     pub async fn serve(self) -> Result<()> {
         let out = self.output_dir.clone();
         self.serve_with_router(move |_peer| Ok(out.clone())).await
@@ -203,34 +203,49 @@ impl Server {
     /// output directory its files should land in — the basis for per-peer tenant
     /// isolation (M8 ACLs). `router` receives `None` when the peer presented no
     /// usable identity.
+    ///
+    /// Connections are served **concurrently and independently** (one task each).
+    /// Each transfer uses a single connection here — connection bonding
+    /// (multipath) is offered only via [`Server::accept_one_multipath`], where a
+    /// dedicated receiver owns the endpoint; bonding multiple connections into
+    /// one of many *concurrent* transfers needs a transfer_id→path registry and
+    /// is deliberately out of scope for the shared accept loop (mixing the two
+    /// is what let an unrelated connection corrupt an in-flight transfer).
     pub async fn serve_with_router<F>(self, router: F) -> Result<()>
     where
-        F: Fn(Option<&str>) -> Result<PathBuf>,
+        F: Fn(Option<&str>) -> Result<PathBuf> + Send + Sync + 'static,
     {
+        let router = std::sync::Arc::new(router);
         while let Some(incoming) = self.endpoint.accept().await {
-            match incoming.await {
-                Ok(conn) => {
-                    info!("connection from {}", conn.remote_address());
-                    let peer = peer_device_id(&conn);
-                    let out = match router(peer.as_deref()) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!("rejecting connection: {e:#}");
-                            conn.close(1u32.into(), b"not authorized");
-                            continue;
-                        }
-                    };
-                    let r = handle_quic_connection(conn, Some(self.endpoint.clone()), out).await;
-                    if let Err(e) = r {
-                        if e.downcast_ref::<SwitchToTcp>().is_some() {
-                            debug!("sender switched to TCP+TLS");
-                        } else {
-                            tracing::error!("transfer error: {e:#}");
+            let router = std::sync::Arc::clone(&router);
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(conn) => {
+                        info!("connection from {}", conn.remote_address());
+                        let peer = peer_device_id(&conn);
+                        let out = match router(peer.as_deref()) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::error!("rejecting connection: {e:#}");
+                                conn.close(1u32.into(), b"not authorized");
+                                return;
+                            }
+                        };
+                        // Single connection per transfer (endpoint = None): no
+                        // cross-connection feeder, so a second sender can never
+                        // be absorbed into this transfer.
+                        let r = handle_quic_connection(conn, None, out).await;
+                        if let Err(e) = r {
+                            if e.downcast_ref::<SwitchToTcp>().is_some() {
+                                debug!("sender switched to TCP+TLS");
+                            } else {
+                                tracing::error!("transfer error: {e:#}");
+                            }
                         }
                     }
+                    Err(e) => warn!("incoming connection failed: {e}"),
                 }
-                Err(e) => warn!("incoming connection failed: {e}"),
-            }
+            });
         }
         Ok(())
     }

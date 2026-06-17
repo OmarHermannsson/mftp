@@ -57,10 +57,13 @@ fn decode(buf: &[u8]) -> Option<DiscoveryMsg> {
     bincode::deserialize(buf).ok()
 }
 
-/// Does an announcement satisfy a query for `wanted`? An empty query name (or an
-/// empty announcement name) matches anything; otherwise names must be equal.
+/// Does an announcement satisfy a query for `wanted`? An empty query name is a
+/// "browse all" and matches any announcement; otherwise the names must be equal.
+/// An empty *announced* name does NOT wildcard-match a specific query — a
+/// nameless/misconfigured responder must not answer (and thus hijack) lookups
+/// for a real name.
 fn name_matches(wanted: &str, announced: &str) -> bool {
-    wanted.is_empty() || announced.is_empty() || wanted == announced
+    wanted.is_empty() || wanted == announced
 }
 
 /// Run a responder loop: reply to matching [`DiscoveryMsg::Query`]s with an
@@ -198,8 +201,11 @@ mod tests {
 
     #[test]
     fn name_matching_rules() {
-        assert!(name_matches("", "anything"));
-        assert!(name_matches("host", ""));
+        assert!(name_matches("", "anything"), "empty query browses all");
+        assert!(
+            !name_matches("host", ""),
+            "empty announced name must NOT match a specific query"
+        );
         assert!(name_matches("host", "host"));
         assert!(!name_matches("host", "other"));
     }
