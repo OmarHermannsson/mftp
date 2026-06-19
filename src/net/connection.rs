@@ -1124,6 +1124,17 @@ mod tests {
     /// Build a quinn **client** endpoint on an already-created (pre-probed) socket,
     /// pinning the server's cert fingerprint.
     fn client_endpoint_on(socket: std::net::UdpSocket, fingerprint: &str) -> Endpoint {
+        let runtime = quinn::default_runtime().unwrap();
+        let abstract_socket = runtime.wrap_udp_socket(socket).unwrap();
+        client_endpoint_on_abstract(abstract_socket, fingerprint)
+    }
+
+    /// Like [`client_endpoint_on`], but over an arbitrary abstract socket — e.g. a
+    /// `natsim::NatSocket` so the client runs behind a simulated NAT.
+    fn client_endpoint_on_abstract(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        fingerprint: &str,
+    ) -> Endpoint {
         let verifier = Arc::new(PinnedFingerprintVerifier::new(fingerprint).unwrap());
         let client_crypto = rustls::ClientConfig::builder()
             .dangerous()
@@ -1134,8 +1145,13 @@ mod tests {
         ));
         cc.transport_config(sender_transport());
         let runtime = quinn::default_runtime().unwrap();
-        let mut ep =
-            Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime).unwrap();
+        let mut ep = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .unwrap();
         ep.set_default_client_config(cc);
         ep
     }
@@ -1193,6 +1209,61 @@ mod tests {
         assert_eq!(
             &got, b"hello",
             "server received the payload despite a pre-handshake junk datagram"
+        );
+    }
+
+    /// Phase 0b: a real QUIC connection survives running over the NAT simulator —
+    /// the client endpoint sits behind a full-cone `NatSocket`, so its traffic is
+    /// re-sourced through the NAT's mapped external address and the receiver's
+    /// replies come back through it.
+    #[tokio::test]
+    async fn natsim_carries_quic_through_a_cone_nat() {
+        use crate::net::natsim::{NatPolicy, NatSocket};
+
+        install_crypto_provider();
+        let (cert, key_bytes) = generate_self_signed_cert().unwrap();
+        let fingerprint = cert_fingerprint(&cert);
+
+        // Receiver on a plain socket.
+        let recv_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let server = server_endpoint_on(recv_sock, cert, make_private_key(key_bytes).unwrap());
+        let accept = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 5];
+            recv.read_exact(&mut buf).await.unwrap();
+            send.write_all(b"pong").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+            // The receiver sees the connection coming from the NAT's external
+            // (mapped) address, not the client's synthetic internal one.
+            (buf, conn.remote_address())
+        });
+
+        // Client behind a full-cone NAT.
+        let nat = Arc::new(NatSocket::new(NatPolicy::full_cone()));
+        let client = client_endpoint_on_abstract(nat, &fingerprint);
+        let conn = client.connect(recv_addr, "mftp").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong", "QUIC data round-trips through the cone NAT");
+        conn.close(0u32.into(), b"done");
+
+        let (got, remote) = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("server task finishes promptly")
+            .unwrap();
+        assert_eq!(&got, b"hello");
+        // The remote address the receiver observed is a NAT external port, not the
+        // client's 127.0.0.2:4xxxx synthetic internal address.
+        assert_ne!(
+            remote.ip().to_string(),
+            "127.0.0.2",
+            "receiver should see the NAT's mapped address, not the internal one"
         );
     }
 }

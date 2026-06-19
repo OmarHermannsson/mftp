@@ -27,9 +27,15 @@
 //! Hidden from docs; test-support only.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, IoSliceMut};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -118,11 +124,7 @@ impl Nat {
     /// Create a NAT with the given behaviour. Spawns a background engine task, so
     /// must be called from within a tokio runtime.
     pub fn new(policy: NatPolicy) -> Nat {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let allowed = Arc::new(Mutex::new(HashSet::new()));
-        let mapped = Arc::new(Mutex::new(HashMap::new()));
-        tokio::spawn(engine(policy, cmd_rx, inbound_tx, allowed, mapped.clone()));
+        let (cmd_tx, inbound_rx, mapped) = spawn_engine(policy);
         Nat {
             policy,
             cmd_tx,
@@ -157,6 +159,24 @@ impl Nat {
     pub fn external_addr_for(&self, dest: SocketAddr) -> Option<SocketAddr> {
         self.mapped.lock().unwrap().get(&dest).copied()
     }
+}
+
+/// Spawn the NAT engine and return the handles both [`Nat`] and [`NatSocket`]
+/// build on: the outbound command sender, the inbound datagram receiver, and the
+/// destination→external-address map.
+type EngineHandles = (
+    mpsc::UnboundedSender<Cmd>,
+    mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+);
+
+fn spawn_engine(policy: NatPolicy) -> EngineHandles {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+    let allowed = Arc::new(Mutex::new(HashSet::new()));
+    let mapped = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(engine(policy, cmd_rx, inbound_tx, allowed, mapped.clone()));
+    (cmd_tx, inbound_rx, mapped)
 }
 
 /// The NAT engine: processes outbound sends one at a time (so mapping creation
@@ -240,6 +260,116 @@ fn spawn_reader(
             }
         }
     });
+}
+
+/// Synthetic, never-bound "internal" address reported to quinn as the NAT'd
+/// endpoint's local address. The endpoint never actually receives on it (inbound
+/// arrives via the engine's external sockets), so it only needs to be a unique,
+/// well-formed loopback address.
+fn next_internal_addr() -> SocketAddr {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed) as u16;
+    SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), 40000u16.wrapping_add(n)))
+}
+
+/// A quinn [`AsyncUdpSocket`] that runs an endpoint *behind* a [`Nat`]: outbound
+/// datagrams go through the NAT's mapping, inbound ones are whatever passed its
+/// filter. Lets a real QUIC endpoint be subjected to cone/symmetric NAT in tests.
+#[derive(Debug)]
+pub struct NatSocket {
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
+    inbound_rx: Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    local_addr: SocketAddr,
+    mapped: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+}
+
+impl NatSocket {
+    /// Build a socket behind a fresh NAT with the given behaviour.
+    pub fn new(policy: NatPolicy) -> NatSocket {
+        let (cmd_tx, inbound_rx, mapped) = spawn_engine(policy);
+        NatSocket {
+            cmd_tx,
+            inbound_rx: Mutex::new(inbound_rx),
+            local_addr: next_internal_addr(),
+            mapped,
+        }
+    }
+
+    /// External (mapped) address presented toward `dest` (see [`Nat::external_addr_for`]).
+    pub fn external_addr_for(&self, dest: SocketAddr) -> Option<SocketAddr> {
+        self.mapped.lock().unwrap().get(&dest).copied()
+    }
+}
+
+impl AsyncUdpSocket for NatSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        // try_send never blocks (unbounded channel), so we're always writable.
+        Box::pin(AlwaysWritable)
+    }
+
+    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        // max_transmit_segments() == 1 → contents is a single datagram.
+        let _ = self.cmd_tx.send(Cmd::Send {
+            dest: transmit.destination,
+            payload: transmit.contents.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Pending;
+        }
+        let mut rx = self.inbound_rx.lock().expect("nat inbound lock poisoned");
+        match rx.poll_recv(cx) {
+            Poll::Ready(Some((payload, from))) => {
+                let len = payload.len().min(bufs[0].len());
+                bufs[0][..len].copy_from_slice(&payload[..len]);
+                meta[0] = RecvMeta {
+                    addr: from,
+                    len,
+                    stride: len,
+                    ..Default::default()
+                };
+                Poll::Ready(Ok(1))
+            }
+            // Engine gone (only on teardown): go idle rather than busy-loop.
+            Poll::Ready(None) => Poll::Pending,
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        true
+    }
+}
+
+/// A [`UdpPoller`] that is always writable — the NAT socket's `try_send` enqueues
+/// to an unbounded channel and never returns `WouldBlock`.
+#[derive(Debug)]
+struct AlwaysWritable;
+
+impl UdpPoller for AlwaysWritable {
+    fn poll_writable(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(test)]
