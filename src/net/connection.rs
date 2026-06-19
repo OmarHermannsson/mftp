@@ -328,10 +328,11 @@ pub fn make_server_endpoint_with_cert_auth(
 
     let socket = make_udp_socket(bind_addr)?;
     let runtime = quinn::default_runtime().context("no async runtime")?;
-    let endpoint = Endpoint::new(
+    let abstract_socket = test_support::maybe_wrap(runtime.wrap_udp_socket(socket)?);
+    let endpoint = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server_config),
-        socket,
+        abstract_socket,
         runtime,
     )?;
 
@@ -377,7 +378,13 @@ pub fn make_client_endpoint(
     let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let socket = make_udp_socket(bind)?;
     let runtime = quinn::default_runtime().context("no async runtime")?;
-    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+    let abstract_socket = test_support::maybe_wrap(runtime.wrap_udp_socket(socket)?);
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        abstract_socket,
+        runtime,
+    )?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
@@ -406,6 +413,121 @@ fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
+}
+
+// ── Test-only network-loss injection ──────────────────────────────────────────
+
+/// Process-global packet-loss injection for testing transfer correctness under
+/// a lossy link without a remote host + `tc netem`.
+///
+/// When armed via [`set_send_loss`], every QUIC endpoint built afterwards wraps
+/// its UDP socket in a [`LossySocket`] that deterministically drops 1 of every
+/// `denom` outbound datagrams (after a short warm-up so the handshake starts
+/// cleanly).  Dropping is on the send path — quinn believes the datagram was
+/// sent, so its normal loss recovery retransmits it, exactly as for a datagram
+/// lost in the network.  Production never arms the knob, so the only cost on the
+/// hot path is nil (the wrapper is bypassed) and at endpoint-construction time a
+/// single relaxed atomic load.  Hidden from docs; mirrors the receiver's
+/// `test_hooks` pattern.
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+    use quinn::udp::{RecvMeta, Transmit};
+    use quinn::{AsyncUdpSocket, UdpPoller};
+    use std::io::{self, IoSliceMut};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll};
+
+    /// Drop 1 of every `DENOM` datagrams; 0 disables injection.
+    static SEND_LOSS_DENOM: AtomicU64 = AtomicU64::new(0);
+    /// First few datagrams per socket are never dropped, so the QUIC handshake
+    /// reliably gets underway before loss begins.
+    const WARMUP: u64 = 16;
+
+    /// Arm loss injection: every subsequently-built endpoint drops 1 of every
+    /// `denom` outbound datagrams.  `denom == 0` disables it.
+    pub fn set_send_loss(denom: u64) {
+        SEND_LOSS_DENOM.store(denom, Ordering::Relaxed);
+    }
+
+    /// Disarm loss injection.
+    pub fn clear() {
+        SEND_LOSS_DENOM.store(0, Ordering::Relaxed);
+    }
+
+    /// Wrap `socket` in a [`LossySocket`] iff loss injection is currently armed;
+    /// otherwise return it unchanged.  Called by the endpoint constructors.
+    pub(crate) fn maybe_wrap(socket: Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket> {
+        let denom = SEND_LOSS_DENOM.load(Ordering::Relaxed);
+        if denom == 0 {
+            socket
+        } else {
+            Arc::new(LossySocket {
+                inner: socket,
+                denom,
+                sent: AtomicU64::new(0),
+            })
+        }
+    }
+
+    /// An [`AsyncUdpSocket`] that forwards to an inner socket but silently drops
+    /// a deterministic fraction of outbound datagrams.
+    #[derive(Debug)]
+    struct LossySocket {
+        inner: Arc<dyn AsyncUdpSocket>,
+        denom: u64,
+        sent: AtomicU64,
+    }
+
+    impl LossySocket {
+        fn should_drop(&self) -> bool {
+            let n = self.sent.fetch_add(1, Ordering::Relaxed);
+            n >= WARMUP && (n - WARMUP).is_multiple_of(self.denom)
+        }
+    }
+
+    impl AsyncUdpSocket for LossySocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+            if self.should_drop() {
+                // Report success without transmitting: the datagram is "lost"
+                // and quinn's loss recovery will retransmit it.
+                return Ok(());
+            }
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        // Force one datagram per send so the drop fraction is per-datagram
+        // (disables GSO batching — irrelevant for tests).
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
 }
 
 // ── TLS certificate helpers ───────────────────────────────────────────────────
