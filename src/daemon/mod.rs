@@ -181,12 +181,241 @@ pub fn bind_control_socket(path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Run the daemon: serve the QUIC network receiver (accept-many, multipath) and
-/// the local control socket concurrently, using the persistent device identity.
+/// Construction options for a [`Daemon`].
 ///
-/// When `~/.config/mftp/authorized_devices` is non-empty, mutual-TLS DeviceId
-/// auth is enforced and only QUIC is served (the TCP path does not yet present
-/// client certs, so serving it under auth would be a bypass).
+/// Unlike [`run`], the config directory is injected rather than resolved from
+/// `$HOME`, and LAN discovery is opt-in — so the daemon can be brought up
+/// in-process on an ephemeral port (`127.0.0.1:0`) with isolated state for
+/// tests.
+pub struct DaemonOptions {
+    pub bind: std::net::SocketAddr,
+    pub output_dir: PathBuf,
+    pub socket_path: PathBuf,
+    /// Directory holding identity + authorized_devices/acl.toml.
+    pub config_dir: PathBuf,
+    /// `Some(name)` announces on the LAN via multicast discovery (best-effort);
+    /// `None` disables it (the default for tests, which want no multicast).
+    pub announce_name: Option<String>,
+    pub http: Option<std::net::SocketAddr>,
+}
+
+/// A fully-bound daemon: the network receiver and control socket (plus optional
+/// HTTP dashboard and LAN discovery) are listening, but no accept loop is
+/// running yet.  Inspect [`local_addr`](Daemon::local_addr) etc., then call
+/// [`serve`](Daemon::serve) to run until a shutdown signal fires.
+pub struct Daemon {
+    server: crate::transfer::receiver::Server,
+    control: UnixListener,
+    state: Arc<DaemonState>,
+    acl: crate::service::acl::Acl,
+    output_dir: PathBuf,
+    socket_path: PathBuf,
+    device_id: String,
+    fingerprint: String,
+    local_addr: std::net::SocketAddr,
+    auth_enforced: bool,
+    authorized_count: usize,
+    /// Real address the HTTP dashboard bound to, if enabled.
+    http_addr: Option<std::net::SocketAddr>,
+    /// Whether the LAN discovery responder came up.
+    announced: bool,
+    /// Background tasks (discovery, HTTP) aborted on shutdown.
+    background: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Daemon {
+    /// Bind the network receiver, control socket, and optional HTTP/discovery,
+    /// using the persistent device identity in `opts.config_dir`.
+    ///
+    /// When the config dir's authorized set (acl.toml peers, else
+    /// authorized_devices) is non-empty, mutual-TLS DeviceId auth is enforced
+    /// and only QUIC is served (the TCP path does not present client certs, so
+    /// serving it under auth would be a bypass).
+    pub async fn bind(opts: DaemonOptions) -> Result<Daemon> {
+        let id = crate::identity::load_or_create_in(&opts.config_dir)?;
+
+        // M8: an ACL (acl.toml), if present, supplies the authorized peers and
+        // their per-tenant output dirs/quotas. Otherwise fall back to the M4
+        // plain allowlist (authorized_devices).
+        let acl = crate::service::acl::Acl::load(&opts.config_dir).unwrap_or_default();
+        let authorized = if acl.is_empty() {
+            crate::identity::load_authorized_in(&opts.config_dir)
+        } else {
+            acl.authorized_ids()
+        };
+        let auth_enforced = !authorized.is_empty();
+        let authorized_count = authorized.len();
+
+        let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
+        let server = crate::transfer::receiver::Server::bind_with_cert_auth(
+            opts.bind,
+            opts.output_dir.clone(),
+            id.cert.clone(),
+            key,
+            id.fingerprint.clone(),
+            if auth_enforced {
+                Some(authorized)
+            } else {
+                None
+            },
+        )?;
+        let local_addr = server.local_addr;
+        let listening_on = local_addr.to_string();
+
+        let mut background = Vec::new();
+
+        // LAN discovery responder (M5): best-effort — if the host can't join the
+        // multicast group the daemon still serves normally.
+        let mut announced = false;
+        if let Some(name) = opts.announce_name {
+            match crate::discovery::bind_responder() {
+                Ok(sock) => {
+                    announced = true;
+                    let device = id.device_id.clone();
+                    background.push(tokio::spawn(async move {
+                        let _ =
+                            crate::discovery::respond_loop(sock, name, local_addr.port(), device)
+                                .await;
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!("LAN discovery disabled (could not bind responder): {e:#}")
+                }
+            }
+        }
+
+        let control = bind_control_socket(&opts.socket_path)?;
+        let state = Arc::new(DaemonState::new(
+            opts.config_dir.clone(),
+            listening_on.clone(),
+        ));
+
+        // M8: optional HTTP status API + Web UI dashboard.
+        let mut http_addr = None;
+        if let Some(addr) = opts.http {
+            let http_listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind HTTP dashboard on {addr}"))?;
+            http_addr = Some(http_listener.local_addr()?);
+            let http_state = Arc::new(crate::service::http::HttpState {
+                config_dir: opts.config_dir.clone(),
+                listening_on: listening_on.clone(),
+            });
+            background.push(tokio::spawn(async move {
+                let _ = crate::service::http::serve(http_listener, http_state).await;
+            }));
+        }
+
+        Ok(Daemon {
+            server,
+            control,
+            state,
+            acl,
+            output_dir: opts.output_dir,
+            socket_path: opts.socket_path,
+            device_id: id.device_id,
+            fingerprint: id.fingerprint,
+            local_addr,
+            auth_enforced,
+            authorized_count,
+            http_addr,
+            announced,
+            background,
+        })
+    }
+
+    /// Address the QUIC network receiver is bound to.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+    /// This daemon's device certificate fingerprint.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+    /// This daemon's Ed25519 DeviceId.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    /// Path of the local control socket.
+    pub fn control_socket(&self) -> &Path {
+        &self.socket_path
+    }
+    /// Shared state behind the control socket (e.g. the completed-transfer count).
+    pub fn state(&self) -> &Arc<DaemonState> {
+        &self.state
+    }
+
+    /// Serve the network receiver and control socket until `shutdown` resolves
+    /// (graceful) or a fatal serve error occurs.
+    ///
+    /// On return the control socket file is removed and background tasks
+    /// (discovery, HTTP) are aborted.  Shutdown stops *accepting* immediately;
+    /// in-flight transfers running in their own tasks are dropped (and are
+    /// resumable on reconnect).
+    pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+        let Daemon {
+            server,
+            control,
+            state,
+            acl,
+            output_dir,
+            socket_path,
+            background,
+            ..
+        } = self;
+
+        // Per-peer output routing (M8): with an ACL, each authorized peer's files
+        // land in its own subdir (tenant isolation); without one, the shared root.
+        let acl_for_router = acl.clone();
+        let output_root = output_dir.clone();
+        let serve_fut = server.serve_with_router(move |peer| {
+            if acl_for_router.is_empty() {
+                return Ok(output_root.clone());
+            }
+            let device = peer.context("ACL enforced but peer presented no DeviceId")?;
+            let dir = acl_for_router.output_dir_for(&output_root, device)?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create tenant dir {}", dir.display()))?;
+            // Enforce the peer's byte quota against its current on-disk usage.
+            // This rejects a peer already at/over quota at connect time (bounding
+            // its total to ~quota + one in-flight transfer); `incoming` is unknown
+            // here since the manifest hasn't been read yet.
+            let used = dir_size_bytes(&dir);
+            acl_for_router.check_quota(device, used, 0)?;
+            Ok(dir)
+        });
+
+        // Serve both until one errors or the shutdown signal fires.
+        let result = tokio::select! {
+            r = serve_fut => r,
+            r = serve_control(control, state) => r,
+            _ = shutdown => Ok(()),
+        };
+
+        // Cleanup: abort background tasks and remove the control socket file so a
+        // restart does not trip over a stale socket.
+        for h in background {
+            h.abort();
+        }
+        let _ = std::fs::remove_file(&socket_path);
+        result
+    }
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM, so the daemon
+/// can shut down gracefully instead of being hard-killed.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+/// Run the daemon to completion: bind the receiver + control socket using the
+/// persistent identity under the resolved config dir, print the startup banner,
+/// and serve until SIGINT/SIGTERM.
 pub async fn run(
     bind: std::net::SocketAddr,
     output_dir: PathBuf,
@@ -196,107 +425,42 @@ pub async fn run(
 ) -> Result<()> {
     let config_dir =
         crate::identity::config_dir().context("cannot locate config dir ($HOME unset)")?;
-    let id = crate::identity::load_or_create_in(&config_dir)?;
 
-    // M8: an ACL (acl.toml), if present, supplies the authorized peers and their
-    // per-tenant output dirs/quotas. Otherwise fall back to the M4 plain
-    // allowlist (authorized_devices).
-    let acl = crate::service::acl::Acl::load(&config_dir).unwrap_or_default();
-    let authorized = if acl.is_empty() {
-        crate::identity::load_authorized_in(&config_dir)
-    } else {
-        acl.authorized_ids()
-    };
-    let auth_enforced = !authorized.is_empty();
+    let acl_present = !crate::service::acl::Acl::load(&config_dir)
+        .unwrap_or_default()
+        .is_empty();
 
-    let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
-    let server = crate::transfer::receiver::Server::bind_with_cert_auth(
+    let daemon = Daemon::bind(DaemonOptions {
         bind,
-        output_dir.clone(),
-        id.cert.clone(),
-        key,
-        id.fingerprint.clone(),
-        if auth_enforced {
-            Some(authorized.clone())
-        } else {
-            None
-        },
-    )?;
-    let listening_on = server.local_addr.to_string();
+        output_dir,
+        socket_path: socket_path.clone(),
+        config_dir,
+        announce_name: Some(announce_name),
+        http,
+    })
+    .await?;
 
-    println!("mftpd listening on {listening_on} (QUIC)");
-    println!("Device ID: {}", id.device_id);
-    println!("Fingerprint: {}", id.fingerprint);
-    if auth_enforced {
-        let mode = if acl.is_empty() { "allowlist" } else { "ACL" };
+    println!("mftpd listening on {} (QUIC)", daemon.local_addr());
+    println!("Device ID: {}", daemon.device_id());
+    println!("Fingerprint: {}", daemon.fingerprint());
+    if daemon.auth_enforced {
+        let mode = if acl_present { "ACL" } else { "allowlist" };
         println!(
             "Identity auth: ENFORCED via {mode} ({} authorized device(s))",
-            authorized.len()
+            daemon.authorized_count
         );
     } else {
         println!("Identity auth: open (add devices with `mftp daemon-trust add <id>`)");
     }
+    if daemon.announced {
+        println!("Discovery: announcing on the LAN");
+    }
     println!("Control socket: {}", socket_path.display());
-
-    // LAN discovery responder (M5): announce ourselves so senders can reach us
-    // by name. Best-effort — if the host can't join the multicast group (e.g.
-    // no multicast-capable interface) the daemon still serves normally.
-    let announce_port = server.local_addr.port();
-    let announce_device = id.device_id.clone();
-    match crate::discovery::bind_responder() {
-        Ok(sock) => {
-            println!("Discovery: announcing as {announce_name:?} on the LAN");
-            tokio::spawn(crate::discovery::respond_loop(
-                sock,
-                announce_name,
-                announce_port,
-                announce_device,
-            ));
-        }
-        Err(e) => tracing::warn!("LAN discovery disabled (could not bind responder): {e:#}"),
-    }
-
-    let listener = bind_control_socket(&socket_path)?;
-    let state = Arc::new(DaemonState::new(config_dir.clone(), listening_on.clone()));
-
-    // M8: optional HTTP status API + Web UI dashboard.
-    if let Some(http_addr) = http {
-        let http_listener = tokio::net::TcpListener::bind(http_addr)
-            .await
-            .with_context(|| format!("bind HTTP dashboard on {http_addr}"))?;
-        let real = http_listener.local_addr()?;
+    if let Some(real) = daemon.http_addr {
         println!("Web UI / HTTP API: http://{real}/");
-        let http_state = Arc::new(crate::service::http::HttpState {
-            config_dir: config_dir.clone(),
-            listening_on: listening_on.clone(),
-        });
-        tokio::spawn(crate::service::http::serve(http_listener, http_state));
     }
 
-    // Per-peer output routing (M8): with an ACL, each authorized peer's files
-    // land in its own subdir (tenant isolation); without one, the shared root.
-    let acl_for_router = acl.clone();
-    let output_root = output_dir.clone();
-    let serve_fut = server.serve_with_router(move |peer| {
-        if acl_for_router.is_empty() {
-            return Ok(output_root.clone());
-        }
-        let device = peer.context("ACL enforced but peer presented no DeviceId")?;
-        let dir = acl_for_router.output_dir_for(&output_root, device)?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create tenant dir {}", dir.display()))?;
-        // Enforce the peer's byte quota against its current on-disk usage. This
-        // rejects a peer that is already at/over quota at connect time (bounding
-        // its total to ~quota + one in-flight transfer); `incoming` is unknown
-        // here since the manifest hasn't been read yet.
-        let used = dir_size_bytes(&dir);
-        acl_for_router.check_quota(device, used, 0)?;
-        Ok(dir)
-    });
-
-    // Serve both forever; if either exits (error), propagate.
-    tokio::try_join!(serve_fut, serve_control(listener, state))?;
-    Ok(())
+    daemon.serve(shutdown_signal()).await
 }
 
 /// Total size in bytes of all regular files under `dir` (0 if absent). Used for
