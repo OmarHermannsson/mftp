@@ -729,7 +729,7 @@ async fn test_directory_symlink_preserved() -> anyhow::Result<()> {
 async fn test_directory_preserve_mode_and_mtime() -> anyhow::Result<()> {
     use std::fs::FileTimes;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, UNIX_EPOCH};
 
     let send_dir = TempDir::new()?;
     let recv_dir = TempDir::new()?;
