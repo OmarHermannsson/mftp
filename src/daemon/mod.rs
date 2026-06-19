@@ -222,6 +222,10 @@ pub struct Daemon {
     acl: crate::service::acl::Acl,
     output_dir: PathBuf,
     socket_path: PathBuf,
+    /// Config dir, re-read on SIGHUP to refresh the live allowlist.
+    config_dir: PathBuf,
+    /// Live authorized-device set the TLS verifier consults; reloaded on SIGHUP.
+    allowlist: crate::net::connection::ReloadableAllowlist,
     device_id: String,
     fingerprint: String,
     local_addr: std::net::SocketAddr,
@@ -250,29 +254,26 @@ impl Daemon {
         // their per-tenant output dirs/quotas. Otherwise fall back to the M4
         // plain allowlist (authorized_devices).
         let acl = crate::service::acl::Acl::load(&opts.config_dir).unwrap_or_default();
-        let authorized = if acl.is_empty() {
-            crate::identity::load_authorized_in(&opts.config_dir)
-        } else {
-            acl.authorized_ids()
-        };
+        let authorized = authorized_from_disk(&opts.config_dir);
         let auth_enforced = !authorized.is_empty();
         let authorized_count = authorized.len();
+
+        // The verifier reads this live set on every handshake, so a SIGHUP reload
+        // (see `serve`) takes effect for subsequent connections — including
+        // flipping the daemon between open and enforced — without rebinding.
+        let allowlist = crate::net::connection::ReloadableAllowlist::new(authorized);
 
         let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
         // One counter shared by the network receiver (which increments it per
         // completed transfer) and DaemonState (which reports it in Status).
         let completed = Arc::new(AtomicU64::new(0));
-        let server = crate::transfer::receiver::Server::bind_with_cert_auth(
+        let server = crate::transfer::receiver::Server::bind_with_reloadable_auth(
             opts.bind,
             opts.output_dir.clone(),
             id.cert.clone(),
             key,
             id.fingerprint.clone(),
-            if auth_enforced {
-                Some(authorized)
-            } else {
-                None
-            },
+            allowlist.clone(),
         )?
         .count_completions_into(Arc::clone(&completed));
         let local_addr = server.local_addr;
@@ -330,6 +331,8 @@ impl Daemon {
             acl,
             output_dir: opts.output_dir,
             socket_path: opts.socket_path,
+            config_dir: opts.config_dir,
+            allowlist,
             device_id: id.device_id,
             fingerprint: id.fingerprint,
             local_addr,
@@ -362,8 +365,20 @@ impl Daemon {
         &self.state
     }
 
+    /// A handle that reloads the authorized-device set from disk into the running
+    /// receiver — the same operation SIGHUP performs.  Capture it before
+    /// [`serve`](Daemon::serve) consumes the daemon to drive reloads
+    /// programmatically (the production daemon drives it from SIGHUP instead).
+    pub fn reloader(&self) -> Reloader {
+        Reloader {
+            config_dir: self.config_dir.clone(),
+            allowlist: self.allowlist.clone(),
+        }
+    }
+
     /// Serve the network receiver and control socket until `shutdown` resolves
-    /// (graceful) or a fatal serve error occurs.
+    /// (graceful) or a fatal serve error occurs.  On SIGHUP, reload the
+    /// authorized-device set from disk into the running verifier and keep going.
     ///
     /// On return the control socket file is removed and background tasks
     /// (discovery, HTTP) are aborted.  Shutdown stops *accepting* immediately;
@@ -377,6 +392,8 @@ impl Daemon {
             acl,
             output_dir,
             socket_path,
+            config_dir,
+            allowlist,
             background,
             ..
         } = self;
@@ -402,11 +419,29 @@ impl Daemon {
             Ok(dir)
         });
 
-        // Serve both until one errors or the shutdown signal fires.
-        let result = tokio::select! {
-            r = serve_fut => r,
-            r = serve_control(control, state) => r,
-            _ = shutdown => Ok(()),
+        let control_fut = serve_control(control, state);
+        tokio::pin!(serve_fut);
+        tokio::pin!(control_fut);
+        tokio::pin!(shutdown);
+
+        // SIGHUP triggers a reload of the authorized set; best-effort to register.
+        let mut sighup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
+
+        // Serve until one of the loops errors or shutdown fires; SIGHUP reloads
+        // the live allowlist in place and continues.
+        let result = loop {
+            tokio::select! {
+                r = &mut serve_fut => break r,
+                r = &mut control_fut => break r,
+                _ = &mut shutdown => break Ok(()),
+                _ = wait_for_sighup(&mut sighup) => {
+                    let ids = authorized_from_disk(&config_dir);
+                    let n = ids.len();
+                    allowlist.replace(ids);
+                    tracing::info!("SIGHUP: reloaded {n} authorized device(s)");
+                }
+            }
         };
 
         // Cleanup: abort background tasks and remove the control socket file so a
@@ -416,6 +451,45 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&socket_path);
         result
+    }
+}
+
+/// A handle for reloading the daemon's authorized-device set from disk into the
+/// running TLS verifier (what SIGHUP does).  Obtain via [`Daemon::reloader`].
+pub struct Reloader {
+    config_dir: PathBuf,
+    allowlist: crate::net::connection::ReloadableAllowlist,
+}
+
+impl Reloader {
+    /// Re-read the authorized set from disk and apply it to the running receiver;
+    /// returns the new authorized count.
+    pub fn reload(&self) -> usize {
+        let ids = authorized_from_disk(&self.config_dir);
+        let n = ids.len();
+        self.allowlist.replace(ids);
+        n
+    }
+}
+
+/// Load the authorized DeviceId set from disk: the ACL's peers if `acl.toml` has
+/// any, else the plain `authorized_devices` allowlist.
+fn authorized_from_disk(config_dir: &Path) -> Vec<String> {
+    let acl = crate::service::acl::Acl::load(config_dir).unwrap_or_default();
+    if acl.is_empty() {
+        crate::identity::load_authorized_in(config_dir)
+    } else {
+        acl.authorized_ids()
+    }
+}
+
+/// Await the next SIGHUP, or never (if the handler could not be registered).
+async fn wait_for_sighup(sig: &mut Option<tokio::signal::unix::Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 

@@ -216,22 +216,74 @@ pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)>
     Ok((endpoint, fingerprint))
 }
 
-/// Verifies an incoming client certificate by its Ed25519 DeviceId against an
-/// allowlist (M4 daemon identity auth). A client whose DeviceId is not listed —
-/// or that presents no Ed25519 key — is rejected at the TLS handshake.
+/// A live, reloadable set of authorized peer DeviceIds shared between the daemon
+/// and the running TLS verifier.
+///
+/// The verifier reads the *current* contents on every handshake, so the daemon
+/// can swap the set in place (on SIGHUP) and have it take effect for subsequent
+/// connections without rebuilding the endpoint. Cheap to clone (an `Arc`).
+#[derive(Clone, Debug, Default)]
+pub struct ReloadableAllowlist {
+    set: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl ReloadableAllowlist {
+    pub fn new(ids: Vec<String>) -> Self {
+        ReloadableAllowlist {
+            set: Arc::new(std::sync::RwLock::new(Self::normalize(ids))),
+        }
+    }
+
+    fn normalize(ids: Vec<String>) -> std::collections::HashSet<String> {
+        ids.into_iter().map(|s| s.trim().to_lowercase()).collect()
+    }
+
+    /// Replace the entire authorized set (the SIGHUP-reload operation).
+    pub fn replace(&self, ids: Vec<String>) {
+        *self.set.write().expect("allowlist lock poisoned") = Self::normalize(ids);
+    }
+
+    /// True when no peer is authorized — auth is *open* (any/no client cert).
+    pub fn is_empty(&self) -> bool {
+        self.set.read().expect("allowlist lock poisoned").is_empty()
+    }
+
+    /// Number of currently authorized peers.
+    pub fn len(&self) -> usize {
+        self.set.read().expect("allowlist lock poisoned").len()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set
+            .read()
+            .expect("allowlist lock poisoned")
+            .contains(id)
+    }
+}
+
+/// Verifies an incoming client certificate by its Ed25519 DeviceId against a
+/// [`ReloadableAllowlist`] (M4 daemon identity auth).
+///
+/// When the allowlist is non-empty, mutual TLS is mandatory and a client whose
+/// DeviceId is not listed — or that presents no Ed25519 key — is rejected at the
+/// handshake. When the allowlist is empty the daemon is *open*: client auth is
+/// not mandatory, so a sender without an identity still connects (and any cert
+/// that is presented is accepted). This lets SIGHUP flip a daemon between open
+/// and enforced without a restart.
 #[derive(Debug)]
 pub struct DeviceAllowlistVerifier {
-    authorized: Vec<String>,
+    authorized: ReloadableAllowlist,
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl DeviceAllowlistVerifier {
     pub fn new(authorized: Vec<String>) -> Self {
+        Self::from_allowlist(ReloadableAllowlist::new(authorized))
+    }
+
+    pub fn from_allowlist(authorized: ReloadableAllowlist) -> Self {
         DeviceAllowlistVerifier {
-            authorized: authorized
-                .into_iter()
-                .map(|s| s.trim().to_lowercase())
-                .collect(),
+            authorized,
             supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
         }
     }
@@ -242,16 +294,26 @@ impl rustls::server::danger::ClientCertVerifier for DeviceAllowlistVerifier {
         &[]
     }
 
+    /// When the allowlist is empty the daemon is open: don't require a client
+    /// certificate (senders without an identity must still connect).
+    fn client_auth_mandatory(&self) -> bool {
+        !self.authorized.is_empty()
+    }
+
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Open mode (empty allowlist): accept whatever cert was presented.
+        if self.authorized.is_empty() {
+            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
         let id = crate::identity::device_id_from_cert(end_entity).ok_or_else(|| {
             rustls::Error::General("client certificate has no Ed25519 device key".into())
         })?;
-        if self.authorized.iter().any(|a| a == &id) {
+        if self.authorized.contains(&id) {
             Ok(rustls::server::danger::ClientCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(
@@ -320,7 +382,33 @@ pub fn make_server_endpoint_with_cert_auth(
             .with_single_cert(vec![cert], key)
             .context("failed to build rustls server config")?,
     };
+    finalize_server_endpoint(bind_addr, server_crypto)
+}
 
+/// Like [`make_server_endpoint_with_cert_auth`], but the DeviceId allowlist is a
+/// live [`ReloadableAllowlist`] the daemon can update in place (SIGHUP reload).
+/// The verifier is always installed: an empty allowlist is *open* (client auth
+/// not mandatory), a non-empty one enforces — see [`DeviceAllowlistVerifier`].
+pub fn make_server_endpoint_with_reloadable_auth(
+    bind_addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    allowlist: ReloadableAllowlist,
+) -> Result<Endpoint> {
+    install_crypto_provider();
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::from_allowlist(allowlist)))
+        .with_single_cert(vec![cert], key)
+        .context("failed to build rustls server config (reloadable client auth)")?;
+    finalize_server_endpoint(bind_addr, server_crypto)
+}
+
+/// Wrap a finished rustls server config into a bound QUIC endpoint with the
+/// shared receiver transport settings.
+fn finalize_server_endpoint(
+    bind_addr: SocketAddr,
+    server_crypto: rustls::ServerConfig,
+) -> Result<Endpoint> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));

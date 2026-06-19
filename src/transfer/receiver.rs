@@ -220,6 +220,30 @@ impl Server {
         })
     }
 
+    /// Like [`Server::bind_with_cert_auth`], but the DeviceId allowlist is a live
+    /// [`ReloadableAllowlist`] the caller (the daemon) can update in place to
+    /// reload trust on SIGHUP. The verifier is always installed; an empty
+    /// allowlist means open (client auth not mandatory).
+    pub fn bind_with_reloadable_auth(
+        addr: SocketAddr,
+        output_dir: PathBuf,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+        allowlist: crate::net::connection::ReloadableAllowlist,
+    ) -> Result<Self> {
+        use crate::net::connection::make_server_endpoint_with_reloadable_auth;
+        let endpoint = make_server_endpoint_with_reloadable_auth(addr, cert, key, allowlist)?;
+        let local_addr = endpoint.local_addr()?;
+        Ok(Self {
+            endpoint,
+            local_addr,
+            fingerprint,
+            output_dir,
+            completed: None,
+        })
+    }
+
     /// Accept and handle exactly one incoming connection (single-path), then
     /// return. Intended for integration tests.
     pub async fn accept_one(&self) -> Result<()> {

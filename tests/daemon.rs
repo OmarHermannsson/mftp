@@ -213,6 +213,118 @@ async fn daemon_rejects_unauthorized_sender_and_keeps_serving() -> anyhow::Resul
     Ok(())
 }
 
+/// SIGHUP-style reload: a device authorized *after* the daemon is already
+/// serving can connect once the live allowlist is reloaded — no restart, no
+/// rebinding of the endpoint.
+#[tokio::test]
+async fn daemon_reload_admits_newly_authorized_device() -> anyhow::Result<()> {
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+
+    // Start enforced against some unrelated device so auth is mandatory but our
+    // sender is not yet allowed.
+    mftp::identity::add_authorized_in(dcfg.path(), &"a".repeat(64))?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    // Capture the reload handle *before* serve consumes the daemon.
+    let reloader = daemon.reloader();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    // Our sender's DeviceId is not authorized yet → rejected at the handshake.
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let device = sender_id.device_id.clone();
+    let src = make_file(send_dir.path(), "before.bin", 256 * 1024);
+    let before = sender::send(src, addr, auth_send_config(fingerprint.clone(), sender_id)).await;
+    assert!(before.is_err(), "sender is not authorized before reload");
+
+    // Authorize the device on disk and reload (what SIGHUP does).
+    mftp::identity::add_authorized_in(dcfg.path(), &device)?;
+    assert_eq!(reloader.reload(), 2, "reload sees both authorized devices");
+
+    // The same device now completes a transfer through the running daemon.
+    let sender_id2 = mftp::identity::load_or_create_in(scfg.path())?;
+    let src2 = make_file(send_dir.path(), "after.bin", 256 * 1024);
+    sender::send(
+        src2.clone(),
+        addr,
+        auth_send_config(fingerprint, sender_id2),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::read(&src2)?,
+        std::fs::read(out.path().join("after.bin"))?,
+        "received file matches after reload"
+    );
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+    Ok(())
+}
+
+/// Open mode (no authorized devices): a sender presenting no client identity
+/// must still connect — the always-installed verifier must not make client auth
+/// mandatory when the allowlist is empty.
+#[tokio::test]
+async fn daemon_open_mode_accepts_sender_without_identity() -> anyhow::Result<()> {
+    let dcfg = TempDir::new()?; // empty: no authorized_devices → open
+    let out = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let socket = daemon.control_socket().to_owned();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    match client_request(&socket, DaemonRequest::Status).await? {
+        DaemonResponse::Status { auth_enforced, .. } => {
+            assert!(!auth_enforced, "open daemon should not enforce auth")
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+
+    // Sender with no client identity (the common case) over QUIC.
+    let src = make_file(send_dir.path(), "open.bin", 256 * 1024);
+    let cfg = SendConfig {
+        streams: Some(2),
+        chunk_size: Some(256 * 1024),
+        compress: false,
+        compress_level: 3,
+        trusted_fingerprint: Some(fingerprint),
+        trusted_device: None,
+        client_identity: None,
+        forced_transport: Some(ForcedTransport::Quic),
+        tcp_rtt_threshold: Duration::ZERO,
+        fec: None,
+        parallel_reads: false,
+        paths: 1,
+        recursive: false,
+        preserve: false,
+    };
+    sender::send(src.clone(), addr, cfg).await?;
+    assert_eq!(
+        std::fs::read(&src)?,
+        std::fs::read(out.path().join("open.bin"))?,
+        "open-mode transfer without client identity succeeds"
+    );
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+    Ok(())
+}
+
 /// `bind` should fail (rather than silently rebinding) when the network address
 /// is already taken — a basic startup-error path.
 #[tokio::test]
