@@ -141,6 +141,26 @@ async fn daemon_starts_serves_transfer_and_shuts_down_gracefully() -> anyhow::Re
         "received file matches"
     );
 
+    // ── Status reflects the completed transfer. ───────────────────────────────
+    // The receiver increments the counter in its per-connection task just after
+    // sending Complete, which may land a hair after the sender's send() returns,
+    // so poll briefly rather than asserting immediately.
+    let mut completed = 0;
+    for _ in 0..40 {
+        if let DaemonResponse::Status {
+            transfers_completed,
+            ..
+        } = client_request(&socket, DaemonRequest::Status).await?
+        {
+            completed = transfers_completed;
+            if completed >= 1 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(completed, 1, "Status should report one completed transfer");
+
     // ── Graceful shutdown: serve returns Ok and removes the control socket. ───
     shutdown_tx.send(()).expect("send shutdown");
     tokio::time::timeout(Duration::from_secs(5), serve)

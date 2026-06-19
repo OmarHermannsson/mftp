@@ -71,16 +71,28 @@ pub struct DaemonState {
     pub config_dir: PathBuf,
     /// Human-readable address the network receiver is bound to.
     pub listening_on: String,
-    /// Count of completed transfers (for Status).
-    pub transfers_completed: AtomicU64,
+    /// Count of completed transfers (for Status). Shared with the network
+    /// receiver (see [`crate::transfer::receiver::Server::count_completions_into`]),
+    /// which increments it as transfers complete.
+    pub transfers_completed: Arc<AtomicU64>,
 }
 
 impl DaemonState {
     pub fn new(config_dir: PathBuf, listening_on: String) -> Self {
+        Self::with_counter(config_dir, listening_on, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Like [`new`](Self::new), but shares an existing completed-transfer counter
+    /// (so the network receiver and the Status reply observe the same value).
+    pub fn with_counter(
+        config_dir: PathBuf,
+        listening_on: String,
+        transfers_completed: Arc<AtomicU64>,
+    ) -> Self {
         DaemonState {
             config_dir,
             listening_on,
-            transfers_completed: AtomicU64::new(0),
+            transfers_completed,
         }
     }
 }
@@ -247,6 +259,9 @@ impl Daemon {
         let authorized_count = authorized.len();
 
         let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
+        // One counter shared by the network receiver (which increments it per
+        // completed transfer) and DaemonState (which reports it in Status).
+        let completed = Arc::new(AtomicU64::new(0));
         let server = crate::transfer::receiver::Server::bind_with_cert_auth(
             opts.bind,
             opts.output_dir.clone(),
@@ -258,7 +273,8 @@ impl Daemon {
             } else {
                 None
             },
-        )?;
+        )?
+        .count_completions_into(Arc::clone(&completed));
         let local_addr = server.local_addr;
         let listening_on = local_addr.to_string();
 
@@ -285,9 +301,10 @@ impl Daemon {
         }
 
         let control = bind_control_socket(&opts.socket_path)?;
-        let state = Arc::new(DaemonState::new(
+        let state = Arc::new(DaemonState::with_counter(
             opts.config_dir.clone(),
             listening_on.clone(),
+            completed,
         ));
 
         // M8: optional HTTP status API + Web UI dashboard.

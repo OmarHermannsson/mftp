@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -159,6 +159,11 @@ pub struct Server {
     pub local_addr: SocketAddr,
     pub fingerprint: String,
     output_dir: PathBuf,
+    /// Optional counter incremented once per successfully completed transfer in
+    /// [`Server::serve`]/[`Server::serve_with_router`]. Attached via
+    /// [`Server::count_completions_into`] (the daemon shares its Status counter
+    /// here); `None` for the test/one-shot accept helpers.
+    completed: Option<Arc<AtomicU64>>,
 }
 
 impl Server {
@@ -170,7 +175,15 @@ impl Server {
             local_addr,
             fingerprint,
             output_dir,
+            completed: None,
         })
+    }
+
+    /// Attach a counter incremented once per successfully completed transfer
+    /// (used by the daemon to back its `Status.transfers_completed`).
+    pub fn count_completions_into(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.completed = Some(counter);
+        self
     }
 
     /// Build from a pre-generated certificate so QUIC and TCP can share one cert.
@@ -203,6 +216,7 @@ impl Server {
             local_addr,
             fingerprint,
             output_dir,
+            completed: None,
         })
     }
 
@@ -258,8 +272,10 @@ impl Server {
         F: Fn(Option<&str>) -> Result<PathBuf> + Send + Sync + 'static,
     {
         let router = std::sync::Arc::new(router);
+        let completed = self.completed.clone();
         while let Some(incoming) = self.endpoint.accept().await {
             let router = std::sync::Arc::clone(&router);
+            let completed = completed.clone();
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
@@ -276,12 +292,21 @@ impl Server {
                         // Single connection per transfer (endpoint = None): no
                         // cross-connection feeder, so a second sender can never
                         // be absorbed into this transfer.
-                        let r = handle_quic_connection(conn, None, out).await;
-                        if let Err(e) = r {
-                            if e.downcast_ref::<SwitchToTcp>().is_some() {
-                                debug!("sender switched to TCP+TLS");
-                            } else {
-                                tracing::error!("transfer error: {e:#}");
+                        match handle_quic_connection(conn, None, out).await {
+                            Ok(()) => {
+                                // Count only genuine completions (handle_quic_connection
+                                // returns Ok after the whole-file hash verifies and the
+                                // Complete ack is sent).
+                                if let Some(c) = &completed {
+                                    c.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                if e.downcast_ref::<SwitchToTcp>().is_some() {
+                                    debug!("sender switched to TCP+TLS");
+                                } else {
+                                    tracing::error!("transfer error: {e:#}");
+                                }
                             }
                         }
                     }
