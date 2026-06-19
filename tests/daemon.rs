@@ -269,6 +269,86 @@ async fn daemon_reload_admits_newly_authorized_device() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SIGHUP-style reload also re-applies ACL routing: a per-peer output-subdir
+/// change on disk takes effect for the next transfer without a restart.
+#[tokio::test]
+async fn daemon_reload_applies_acl_routing_change() -> anyhow::Result<()> {
+    use mftp::service::acl::{Acl, PeerPolicy};
+
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+
+    // Initial ACL: the sender's files route into "first".
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let device = sender_id.device_id.clone();
+    let mut acl = Acl::default();
+    acl.set_peer(
+        &device,
+        PeerPolicy {
+            output_subdir: "first".into(),
+            quota_bytes: None,
+        },
+    );
+    acl.save(dcfg.path())?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let reloader = daemon.reloader();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    // First transfer lands under the "first" tenant subdir.
+    let src1 = make_file(send_dir.path(), "one.bin", 256 * 1024);
+    sender::send(
+        src1.clone(),
+        addr,
+        auth_send_config(fingerprint.clone(), sender_id),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::read(&src1)?,
+        std::fs::read(out.path().join("first").join("one.bin"))?,
+        "first transfer routes to the original subdir"
+    );
+
+    // Re-point the same peer at "second" on disk and reload.
+    let mut acl2 = Acl::default();
+    acl2.set_peer(
+        &device,
+        PeerPolicy {
+            output_subdir: "second".into(),
+            quota_bytes: None,
+        },
+    );
+    acl2.save(dcfg.path())?;
+    reloader.reload();
+
+    // The next transfer routes to the new subdir — no restart.
+    let sender_id2 = mftp::identity::load_or_create_in(scfg.path())?;
+    let src2 = make_file(send_dir.path(), "two.bin", 256 * 1024);
+    sender::send(
+        src2.clone(),
+        addr,
+        auth_send_config(fingerprint, sender_id2),
+    )
+    .await?;
+    assert_eq!(
+        std::fs::read(&src2)?,
+        std::fs::read(out.path().join("second").join("two.bin"))?,
+        "after reload the transfer routes to the updated subdir"
+    );
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+    Ok(())
+}
+
 /// Open mode (no authorized devices): a sender presenting no client identity
 /// must still connect — the always-installed verifier must not make client auth
 /// mandatory when the allowlist is empty.

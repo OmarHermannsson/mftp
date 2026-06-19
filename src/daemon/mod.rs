@@ -219,7 +219,9 @@ pub struct Daemon {
     server: crate::transfer::receiver::Server,
     control: UnixListener,
     state: Arc<DaemonState>,
-    acl: crate::service::acl::Acl,
+    /// Live per-peer routing/quota policy; reloaded on SIGHUP alongside the
+    /// allowlist.
+    acl: crate::service::acl::ReloadableAcl,
     output_dir: PathBuf,
     socket_path: PathBuf,
     /// Config dir, re-read on SIGHUP to refresh the live allowlist.
@@ -253,15 +255,16 @@ impl Daemon {
         // M8: an ACL (acl.toml), if present, supplies the authorized peers and
         // their per-tenant output dirs/quotas. Otherwise fall back to the M4
         // plain allowlist (authorized_devices).
-        let acl = crate::service::acl::Acl::load(&opts.config_dir).unwrap_or_default();
-        let authorized = authorized_from_disk(&opts.config_dir);
+        let (acl, authorized) = load_acl_and_authorized(&opts.config_dir);
         let auth_enforced = !authorized.is_empty();
         let authorized_count = authorized.len();
 
-        // The verifier reads this live set on every handshake, so a SIGHUP reload
-        // (see `serve`) takes effect for subsequent connections — including
-        // flipping the daemon between open and enforced — without rebinding.
+        // The verifier reads the allowlist and the router reads the ACL on every
+        // connection, so a SIGHUP reload (see `serve`) swaps both in place and
+        // takes effect for subsequent connections — new trust *and* new per-peer
+        // routing/quotas — without rebinding.
         let allowlist = crate::net::connection::ReloadableAllowlist::new(authorized);
+        let acl = crate::service::acl::ReloadableAcl::new(acl);
 
         let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
         // One counter shared by the network receiver (which increments it per
@@ -365,20 +368,22 @@ impl Daemon {
         &self.state
     }
 
-    /// A handle that reloads the authorized-device set from disk into the running
-    /// receiver — the same operation SIGHUP performs.  Capture it before
-    /// [`serve`](Daemon::serve) consumes the daemon to drive reloads
+    /// A handle that reloads the authorized-device set *and* ACL from disk into
+    /// the running receiver — the same operation SIGHUP performs.  Capture it
+    /// before [`serve`](Daemon::serve) consumes the daemon to drive reloads
     /// programmatically (the production daemon drives it from SIGHUP instead).
     pub fn reloader(&self) -> Reloader {
         Reloader {
             config_dir: self.config_dir.clone(),
+            acl: self.acl.clone(),
             allowlist: self.allowlist.clone(),
         }
     }
 
     /// Serve the network receiver and control socket until `shutdown` resolves
     /// (graceful) or a fatal serve error occurs.  On SIGHUP, reload the
-    /// authorized-device set from disk into the running verifier and keep going.
+    /// authorized-device set and ACL from disk into the running receiver and
+    /// keep going.
     ///
     /// On return the control socket file is removed and background tasks
     /// (discovery, HTTP) are aborted.  Shutdown stops *accepting* immediately;
@@ -400,23 +405,27 @@ impl Daemon {
 
         // Per-peer output routing (M8): with an ACL, each authorized peer's files
         // land in its own subdir (tenant isolation); without one, the shared root.
+        // The router reads the *live* ACL on every connection, so a SIGHUP reload
+        // changes routing/quotas for subsequent transfers.
         let acl_for_router = acl.clone();
         let output_root = output_dir.clone();
         let serve_fut = server.serve_with_router(move |peer| {
-            if acl_for_router.is_empty() {
-                return Ok(output_root.clone());
-            }
-            let device = peer.context("ACL enforced but peer presented no DeviceId")?;
-            let dir = acl_for_router.output_dir_for(&output_root, device)?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create tenant dir {}", dir.display()))?;
-            // Enforce the peer's byte quota against its current on-disk usage.
-            // This rejects a peer already at/over quota at connect time (bounding
-            // its total to ~quota + one in-flight transfer); `incoming` is unknown
-            // here since the manifest hasn't been read yet.
-            let used = dir_size_bytes(&dir);
-            acl_for_router.check_quota(device, used, 0)?;
-            Ok(dir)
+            acl_for_router.with(|acl| {
+                if acl.is_empty() {
+                    return Ok(output_root.clone());
+                }
+                let device = peer.context("ACL enforced but peer presented no DeviceId")?;
+                let dir = acl.output_dir_for(&output_root, device)?;
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("create tenant dir {}", dir.display()))?;
+                // Enforce the peer's byte quota against its current on-disk usage.
+                // This rejects a peer already at/over quota at connect time
+                // (bounding its total to ~quota + one in-flight transfer);
+                // `incoming` is unknown here (the manifest hasn't been read yet).
+                let used = dir_size_bytes(&dir);
+                acl.check_quota(device, used, 0)?;
+                Ok(dir)
+            })
         });
 
         let control_fut = serve_control(control, state);
@@ -424,22 +433,21 @@ impl Daemon {
         tokio::pin!(control_fut);
         tokio::pin!(shutdown);
 
-        // SIGHUP triggers a reload of the authorized set; best-effort to register.
+        // SIGHUP triggers a reload of both the allowlist and the ACL; best-effort
+        // to register the handler.
         let mut sighup =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
 
         // Serve until one of the loops errors or shutdown fires; SIGHUP reloads
-        // the live allowlist in place and continues.
+        // the live allowlist + ACL in place and continues.
         let result = loop {
             tokio::select! {
                 r = &mut serve_fut => break r,
                 r = &mut control_fut => break r,
                 _ = &mut shutdown => break Ok(()),
                 _ = wait_for_sighup(&mut sighup) => {
-                    let ids = authorized_from_disk(&config_dir);
-                    let n = ids.len();
-                    allowlist.replace(ids);
-                    tracing::info!("SIGHUP: reloaded {n} authorized device(s)");
+                    let n = apply_reload(&config_dir, &acl, &allowlist);
+                    tracing::info!("SIGHUP: reloaded {n} authorized device(s) + ACL");
                 }
             }
         };
@@ -454,33 +462,46 @@ impl Daemon {
     }
 }
 
-/// A handle for reloading the daemon's authorized-device set from disk into the
-/// running TLS verifier (what SIGHUP does).  Obtain via [`Daemon::reloader`].
+/// A handle for reloading the daemon's authorized-device set and ACL from disk
+/// into the running receiver (what SIGHUP does).  Obtain via [`Daemon::reloader`].
 pub struct Reloader {
     config_dir: PathBuf,
+    acl: crate::service::acl::ReloadableAcl,
     allowlist: crate::net::connection::ReloadableAllowlist,
 }
 
 impl Reloader {
-    /// Re-read the authorized set from disk and apply it to the running receiver;
-    /// returns the new authorized count.
+    /// Re-read the authorized set + ACL from disk and apply both to the running
+    /// receiver; returns the new authorized count.
     pub fn reload(&self) -> usize {
-        let ids = authorized_from_disk(&self.config_dir);
-        let n = ids.len();
-        self.allowlist.replace(ids);
-        n
+        apply_reload(&self.config_dir, &self.acl, &self.allowlist)
     }
 }
 
-/// Load the authorized DeviceId set from disk: the ACL's peers if `acl.toml` has
-/// any, else the plain `authorized_devices` allowlist.
-fn authorized_from_disk(config_dir: &Path) -> Vec<String> {
+/// Load the ACL and the derived authorized set from disk in one pass: the ACL's
+/// peers if `acl.toml` has any, else the plain `authorized_devices` allowlist.
+fn load_acl_and_authorized(config_dir: &Path) -> (crate::service::acl::Acl, Vec<String>) {
     let acl = crate::service::acl::Acl::load(config_dir).unwrap_or_default();
-    if acl.is_empty() {
+    let authorized = if acl.is_empty() {
         crate::identity::load_authorized_in(config_dir)
     } else {
         acl.authorized_ids()
-    }
+    };
+    (acl, authorized)
+}
+
+/// Reload the authorized set + ACL from disk and swap both live handles in place;
+/// returns the new authorized count. Shared by SIGHUP and [`Reloader::reload`].
+fn apply_reload(
+    config_dir: &Path,
+    acl: &crate::service::acl::ReloadableAcl,
+    allowlist: &crate::net::connection::ReloadableAllowlist,
+) -> usize {
+    let (new_acl, authorized) = load_acl_and_authorized(config_dir);
+    let n = authorized.len();
+    allowlist.replace(authorized);
+    acl.replace(new_acl);
+    n
 }
 
 /// Await the next SIGHUP, or never (if the handler could not be registered).

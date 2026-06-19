@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,43 @@ impl Acl {
 
 fn acl_path(dir: &Path) -> PathBuf {
     dir.join("acl.toml")
+}
+
+/// A live, reloadable [`Acl`] shared between the daemon's connection router and
+/// the SIGHUP reload path.
+///
+/// The router reads the *current* ACL on every connection (under a read lock),
+/// so the daemon can swap a fresh ACL in place (on SIGHUP) and have new per-peer
+/// output dirs / quotas take effect for subsequent connections without
+/// rebinding. Cheap to clone (an `Arc`).
+#[derive(Clone, Default)]
+pub struct ReloadableAcl {
+    inner: Arc<RwLock<Acl>>,
+}
+
+impl ReloadableAcl {
+    pub fn new(acl: Acl) -> Self {
+        ReloadableAcl {
+            inner: Arc::new(RwLock::new(acl)),
+        }
+    }
+
+    /// Replace the entire ACL (the SIGHUP-reload operation).
+    pub fn replace(&self, acl: Acl) {
+        *self.inner.write().expect("acl lock poisoned") = acl;
+    }
+
+    /// True when no peer policy is configured (the daemon is in open / allowlist
+    /// mode rather than ACL tenant-isolation mode).
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().expect("acl lock poisoned").is_empty()
+    }
+
+    /// Run `f` against the current ACL under a read lock. Used by the router to
+    /// resolve a peer's output dir + quota from a consistent snapshot.
+    pub fn with<R>(&self, f: impl FnOnce(&Acl) -> R) -> R {
+        f(&self.inner.read().expect("acl lock poisoned"))
+    }
 }
 
 #[cfg(test)]
