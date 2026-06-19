@@ -723,6 +723,59 @@ async fn test_directory_symlink_preserved() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--preserve` carries file permission bits and mtime across the transfer.
+#[tokio::test]
+#[cfg(unix)]
+async fn test_directory_preserve_mode_and_mtime() -> anyhow::Result<()> {
+    use std::fs::FileTimes;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+
+    let src = send_dir.path().join("modes");
+    std::fs::create_dir_all(&src)?;
+
+    // Distinctive, non-default modes so a missing preserve would be obvious.
+    // (Both keep the owner-write bit so we can still set times below.)
+    let exe = src.join("run.sh");
+    let secret = src.join("secret.key");
+    std::fs::write(&exe, b"#!/bin/sh\necho hi\n")?;
+    std::fs::write(&secret, b"top secret bytes")?;
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))?;
+
+    // A fixed mtime well in the past so it can't coincide with the transfer time
+    // (which is what an unpreserved file would inherit).
+    let past = UNIX_EPOCH + Duration::from_secs(1_600_000_000); // 2020-09-13
+    let times = FileTimes::new().set_modified(past);
+    for p in [&exe, &secret] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)?
+            .set_times(times)?;
+    }
+
+    roundtrip_dir(src.clone(), &recv_dir, 1, 256 * 1024, false, true).await?;
+
+    let received = recv_dir.path().join("modes");
+    for (name, want_mode) in [("run.sh", 0o755u32), ("secret.key", 0o600u32)] {
+        let meta = std::fs::metadata(received.join(name))?;
+        assert_eq!(
+            meta.mode() & 0o777,
+            want_mode,
+            "mode not preserved for {name}"
+        );
+        assert_eq!(
+            meta.mtime(),
+            1_600_000_000,
+            "mtime not preserved for {name}"
+        );
+    }
+    Ok(())
+}
+
 /// Sending a directory without -r must fail with a clear error.
 #[tokio::test]
 async fn test_require_recursive_flag() {
