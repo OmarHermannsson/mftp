@@ -42,11 +42,19 @@ use crate::transfer::resume::{ResumeState, RESUME_SAVE_BATCH};
 #[doc(hidden)]
 pub mod test_hooks {
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static DROP_ONCE: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+    /// Number of chunks to mark before aborting; 0 disables the abort hook.
+    static ABORT_AFTER: AtomicU64 = AtomicU64::new(0);
+    /// Count of chunks marked-received since the abort hook was armed.
+    static MARKED: AtomicU64 = AtomicU64::new(0);
+    /// Latches true once the abort threshold is crossed; read by every stream
+    /// worker at the top of its loop so they all tear down promptly.
+    static ABORT_FIRED: AtomicBool = AtomicBool::new(false);
 
     fn set() -> &'static Mutex<HashSet<u64>> {
         DROP_ONCE.get_or_init(|| Mutex::new(HashSet::new()))
@@ -61,13 +69,25 @@ pub mod test_hooks {
         ENABLED.store(true, Ordering::Relaxed);
     }
 
-    /// Clear all pending drops and disable the hook.
+    /// Arm a simulated crash: once `n` chunks have been marked-received across all
+    /// stream workers, the receiver flushes its resume state and aborts the
+    /// transfer (leaving a partial resume file for a follow-up run). Test only.
+    pub fn abort_after_chunks(n: u64) {
+        MARKED.store(0, Ordering::Relaxed);
+        ABORT_FIRED.store(false, Ordering::Relaxed);
+        ABORT_AFTER.store(n, Ordering::Relaxed);
+    }
+
+    /// Clear all pending drops/aborts and disable the hooks.
     pub fn clear() {
         set()
             .lock()
             .expect("test-hook drop set mutex poisoned")
             .clear();
         ENABLED.store(false, Ordering::Relaxed);
+        ABORT_AFTER.store(0, Ordering::Relaxed);
+        MARKED.store(0, Ordering::Relaxed);
+        ABORT_FIRED.store(false, Ordering::Relaxed);
     }
 
     /// Returns true (and consumes the mark) if `idx` should be dropped.
@@ -79,6 +99,28 @@ pub mod test_hooks {
             .lock()
             .expect("test-hook drop set mutex poisoned")
             .remove(&idx)
+    }
+
+    /// Record one marked chunk; returns true the moment the armed abort threshold
+    /// is crossed (so the caller can force a resume flush before tearing down).
+    /// A single relaxed load in the common (disarmed) path.
+    pub(crate) fn note_marked_and_check_abort() -> bool {
+        if ABORT_AFTER.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let n = MARKED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= ABORT_AFTER.load(Ordering::Relaxed) {
+            ABORT_FIRED.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True once the simulated crash has fired; stream workers poll this at the
+    /// top of their receive loop and bail.
+    pub(crate) fn abort_requested() -> bool {
+        ABORT_FIRED.load(Ordering::Relaxed)
     }
 }
 
@@ -2116,6 +2158,13 @@ where
     let mut chunk_count = 0u64;
 
     loop {
+        // Test-only: simulate a crash mid-transfer once the armed chunk count is
+        // reached.  Every worker polls this so the whole connection tears down
+        // promptly, leaving a partial (flushed) resume file behind.
+        if test_hooks::abort_requested() {
+            bail!("test hook: simulated crash mid-transfer");
+        }
+
         if processing.len() >= MAX_IN_FLIGHT {
             match processing.join_next().await {
                 Some(Ok(Ok(()))) => {}
@@ -2249,7 +2298,11 @@ where
             let snap = {
                 let mut r = resume.lock().expect("resume-state mutex poisoned");
                 r.mark_received(chunk_index);
-                if r.incr_dirty() >= RESUME_SAVE_BATCH {
+                // Test-only: force a flush the moment the simulated-crash threshold
+                // is crossed so the partial resume file is guaranteed on disk
+                // regardless of where it falls relative to RESUME_SAVE_BATCH.
+                let force = test_hooks::note_marked_and_check_abort();
+                if r.incr_dirty() >= RESUME_SAVE_BATCH || force {
                     r.reset_dirty();
                     Some(r.snapshot()?)
                 } else {
