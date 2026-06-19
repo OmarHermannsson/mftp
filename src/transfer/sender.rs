@@ -409,7 +409,7 @@ async fn send_quic_with_conn(
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
-            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::messages::advertised_version(),
         },
     )
     .await?;
@@ -456,9 +456,12 @@ async fn send_quic_with_conn(
     }
     let paths_for_workers = Arc::new(paths_vec);
     let peer_version = neg_resp.protocol_version;
-    // v7+: prefix each data stream with a StreamHello frame. Skipped against an
-    // older receiver so the wire stays identical to v6.
-    let send_hello = peer_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
+    // v7+: prefix each data stream with a StreamHello frame. Skipped unless both
+    // peers are ≥ v7 so the wire stays identical to v6 against an older receiver.
+    let send_hello = crate::protocol::messages::stream_hello_active(
+        crate::protocol::messages::advertised_version(),
+        peer_version,
+    );
 
     if config.fec.is_some() {
         run_transfer_fec(
@@ -643,7 +646,7 @@ async fn send_tcp(
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
-            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::messages::advertised_version(),
         },
     )
     .await?;
@@ -653,7 +656,10 @@ async fn send_tcp(
     let trusted_fp = config.trusted_fingerprint.clone();
     let trusted_dev = config.trusted_device.clone();
     let peer_version = neg_resp.protocol_version;
-    let send_hello = peer_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
+    let send_hello = crate::protocol::messages::stream_hello_active(
+        crate::protocol::messages::advertised_version(),
+        peer_version,
+    );
 
     run_transfer(
         &file,
@@ -966,7 +972,7 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     // For directory transfers, check that receiver supports v3.
-    if entries.is_some() && peer_protocol_version < 3 {
+    if entries.is_some() && !crate::protocol::messages::directory_supported(peer_protocol_version) {
         bail!(
             "the receiver is running an older version of mftp (protocol version {peer_protocol_version}) \
              that does not support directory transfers — please upgrade the receiver to v3+"
@@ -1012,7 +1018,7 @@ where
             );
             framing::send_message(ctrl_send, &m).await?;
             // v3+: DirEntries immediately after the manifest (strict ordering).
-            if peer_protocol_version >= 3 {
+            if crate::protocol::messages::directory_supported(peer_protocol_version) {
                 let dir_entries_msg = DirEntries {
                     entries: entries.map(|e| e.to_vec()),
                 };

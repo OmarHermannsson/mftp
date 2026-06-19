@@ -50,6 +50,69 @@ pub const MAX_REPAIR_ROUNDS: u32 = 5;
 /// gap is cheaper to recover with a fresh resumed transfer).
 pub const MAX_REPAIR_CHUNKS_PER_ROUND: usize = 100_000;
 
+/// First version that sends the `DirEntries` message (recursive directory
+/// transfer). A sender to an older peer must refuse a directory transfer.
+pub const MIN_DIRECTORY_VERSION: u32 = 3;
+
+/// First version that supports in-band incremental repair
+/// (`ReceiverMessage::Retransmit`). Against an older peer the receiver falls
+/// back to abort + resume instead.
+pub const MIN_REPAIR_VERSION: u32 = 5;
+
+// ── Version-gated feature decisions ───────────────────────────────────────────
+//
+// Every protocol feature that is only safe when *both* peers understand it is
+// gated through one of these helpers, so the cross-version rules live in one
+// place (and are unit-testable without a live handshake).
+
+/// Whether the `StreamHello` data-stream preamble (v7) is active on this
+/// transfer. It is sent/expected only when **both** peers are ≥ v7 — otherwise
+/// the wire stays byte-identical to v6 (see [`PROTOCOL_VERSION`] history).
+pub fn stream_hello_active(local_version: u32, peer_version: u32) -> bool {
+    local_version >= STREAM_HELLO_MIN_VERSION && peer_version >= STREAM_HELLO_MIN_VERSION
+}
+
+/// Whether `peer_version` understands the `DirEntries` message (directory transfers).
+pub fn directory_supported(peer_version: u32) -> bool {
+    peer_version >= MIN_DIRECTORY_VERSION
+}
+
+/// Whether `peer_version` supports in-band incremental repair.
+pub fn repair_supported(peer_version: u32) -> bool {
+    peer_version >= MIN_REPAIR_VERSION
+}
+
+/// Test-only override of the locally-advertised protocol version, letting an
+/// in-process test negotiate down to an older version to exercise cross-version
+/// interop. Hidden from docs; production never sets it (the only cost is one
+/// relaxed atomic load per negotiation).
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 0 = no override (use [`super::PROTOCOL_VERSION`]).
+    static FORCED_VERSION: AtomicU32 = AtomicU32::new(0);
+
+    /// Force the version advertised in NegotiateRequest/Response, or clear it.
+    pub fn force_local_version(version: Option<u32>) {
+        FORCED_VERSION.store(version.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(crate) fn forced() -> u32 {
+        FORCED_VERSION.load(Ordering::Relaxed)
+    }
+}
+
+/// The protocol version this peer advertises during negotiation. Normally
+/// [`PROTOCOL_VERSION`]; a test may cap it via
+/// [`test_hooks::force_local_version`] to drive older-peer interop.
+pub fn advertised_version() -> u32 {
+    match test_hooks::forced() {
+        0 => PROTOCOL_VERSION,
+        v => v,
+    }
+}
+
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NegotiateRequest {
@@ -291,4 +354,43 @@ pub enum ReceiverMessage {
     /// finalizes.  Bounded by `MAX_REPAIR_ROUNDS` / `MAX_REPAIR_CHUNKS_PER_ROUND`
     /// on both ends.  Single-file transfers only.
     Retransmit { chunks: Vec<u64> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_hello_active_only_when_both_v7() {
+        // Active only if both peers are ≥ v7.
+        assert!(stream_hello_active(7, 7));
+        assert!(stream_hello_active(7, 8));
+        assert!(stream_hello_active(8, 7));
+        // Any older peer (either side) disables it → wire stays v6-identical.
+        assert!(!stream_hello_active(7, 6));
+        assert!(!stream_hello_active(6, 7));
+        assert!(!stream_hello_active(6, 6));
+    }
+
+    #[test]
+    fn directory_and_repair_version_floors() {
+        assert!(!directory_supported(2));
+        assert!(directory_supported(MIN_DIRECTORY_VERSION));
+        assert!(directory_supported(7));
+
+        assert!(!repair_supported(4));
+        assert!(repair_supported(MIN_REPAIR_VERSION));
+        assert!(repair_supported(7));
+    }
+
+    #[test]
+    fn advertised_version_respects_override() {
+        // Default: the compiled-in version.
+        assert_eq!(advertised_version(), PROTOCOL_VERSION);
+        // Override caps it; clearing restores the default.
+        test_hooks::force_local_version(Some(6));
+        assert_eq!(advertised_version(), 6);
+        test_hooks::force_local_version(None);
+        assert_eq!(advertised_version(), PROTOCOL_VERSION);
+    }
 }

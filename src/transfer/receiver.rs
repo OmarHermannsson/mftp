@@ -27,7 +27,7 @@ use crate::protocol::{
     framing,
     messages::{
         ChunkData, DirEntries, FecChunkData, FileEntry, FileKind, NegotiateRequest,
-        NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest, PROTOCOL_VERSION,
+        NegotiateResponse, ReceiverMessage, SenderMessage, TransferManifest,
     },
 };
 use crate::transfer::hash::ChunkHasher;
@@ -1079,9 +1079,11 @@ where
 {
     let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
     // v7+ senders prefix each data stream with a StreamHello frame; only read it
-    // when the sender actually negotiated ≥ v7 (older senders never send it).
-    let expect_hello =
-        neg_req.protocol_version >= crate::protocol::messages::STREAM_HELLO_MIN_VERSION;
+    // when both peers negotiated ≥ v7 (older senders never send it).
+    let expect_hello = crate::protocol::messages::stream_hello_active(
+        crate::protocol::messages::advertised_version(),
+        neg_req.protocol_version,
+    );
     let receiver_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4) as u32;
@@ -1089,7 +1091,7 @@ where
         &mut ctrl_send,
         &NegotiateResponse {
             cpu_cores: receiver_cores,
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: crate::protocol::messages::advertised_version(),
         },
     )
     .await?;
@@ -1107,15 +1109,16 @@ where
 
     // Protocol version 3+: read DirEntries immediately after the manifest.
     // v2 senders don't send this message; skip the read for them.
-    let dir_entries: Option<Vec<FileEntry>> = if neg_req.protocol_version >= 3 {
-        let de: DirEntries = framing::recv_data_message(&mut ctrl_recv)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("stream closed before DirEntries"))?;
-        validate_dir_entries(&manifest, &de)?;
-        de.entries
-    } else {
-        None
-    };
+    let dir_entries: Option<Vec<FileEntry>> =
+        if crate::protocol::messages::directory_supported(neg_req.protocol_version) {
+            let de: DirEntries = framing::recv_data_message(&mut ctrl_recv)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("stream closed before DirEntries"))?;
+            validate_dir_entries(&manifest, &de)?;
+            de.entries
+        } else {
+            None
+        };
 
     let entry_count = dir_entries.as_deref().map(|e| {
         e.iter()
@@ -1415,8 +1418,8 @@ where
     // congestion window alive.  Works for single-file (pwrite to the output fd)
     // and directory transfers (scatter-write across the concat layout); bounded
     // by MAX_REPAIR_ROUNDS.
-    let repairable =
-        neg_req.protocol_version >= 5 && (pt.out_file.is_some() || pt.layout.is_some());
+    let repairable = crate::protocol::messages::repair_supported(neg_req.protocol_version)
+        && (pt.out_file.is_some() || pt.layout.is_some());
     let mut repaired = false;
     let mut round = 0u32;
     // `repairable` is fixed, but each iteration either breaks or writes repaired
