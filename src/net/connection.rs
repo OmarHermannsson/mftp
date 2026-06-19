@@ -1090,4 +1090,109 @@ mod tests {
             "window {w} should be close to {expected}"
         );
     }
+
+    // ── Hole-punching feasibility spike (M6) ───────────────────────────────────
+    //
+    // De-risks the make-or-break question before building NAT traversal: can we
+    // (1) send raw "punch" datagrams on a UDP socket and then run a quinn
+    // connection over that *same* socket, and (2) does quinn's server tolerate a
+    // non-QUIC datagram (the peer's punch probe) arriving on its socket before
+    // the handshake? Both are required because hole-punching must open the NAT
+    // mapping on the exact socket/port quinn will use, and probes from the peer
+    // will land on quinn's socket during the punch.
+
+    /// Build a quinn **server** endpoint on an already-created (possibly
+    /// pre-probed) socket — the seam the real feature needs to run QUIC over a
+    /// punched mapping.
+    fn server_endpoint_on(
+        socket: std::net::UdpSocket,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> Endpoint {
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let mut sc = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        sc.transport_config(receiver_transport());
+        let runtime = quinn::default_runtime().unwrap();
+        Endpoint::new(quinn::EndpointConfig::default(), Some(sc), socket, runtime).unwrap()
+    }
+
+    /// Build a quinn **client** endpoint on an already-created (pre-probed) socket,
+    /// pinning the server's cert fingerprint.
+    fn client_endpoint_on(socket: std::net::UdpSocket, fingerprint: &str) -> Endpoint {
+        let verifier = Arc::new(PinnedFingerprintVerifier::new(fingerprint).unwrap());
+        let client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let mut cc = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        cc.transport_config(sender_transport());
+        let runtime = quinn::default_runtime().unwrap();
+        let mut ep =
+            Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime).unwrap();
+        ep.set_default_client_config(cc);
+        ep
+    }
+
+    #[tokio::test]
+    async fn holepunch_spike_quinn_runs_over_pre_probed_socket() {
+        install_crypto_provider();
+        let (cert, key_bytes) = generate_self_signed_cert().unwrap();
+        let fingerprint = cert_fingerprint(&cert);
+
+        // ── Receiver: quinn server on its own socket, accepting one connection. ──
+        let recv_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let server = server_endpoint_on(recv_sock, cert, make_private_key(key_bytes).unwrap());
+        let accept = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 5];
+            recv.read_exact(&mut buf).await.unwrap();
+            send.write_all(b"pong").await.unwrap();
+            send.finish().unwrap();
+            // Wait for the client to close (after it has read the reply) so the
+            // finished stream is flushed before this task — and the endpoint —
+            // drop.
+            conn.closed().await;
+            buf
+        });
+
+        // ── Sender: pre-probe on its socket, then run quinn over that same one. ──
+        let send_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        // (1) Raw "punch" probe from the exact socket quinn will use. In a real
+        // NAT this opens the mapping; here it also (2) exercises the receiver's
+        // quinn server tolerating a non-QUIC datagram before the handshake.
+        send_sock
+            .send_to(b"\x00\x01mftp-punch-probe", recv_addr)
+            .expect("raw probe send");
+
+        let client = client_endpoint_on(send_sock, &fingerprint);
+        let conn = client.connect(recv_addr, "mftp").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong", "handshake + data survived punch-then-QUIC");
+
+        // Reply received → close the client connection, which releases the
+        // server's `closed().await` above (avoids a teardown deadlock).
+        conn.close(0u32.into(), b"done");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("server task finishes promptly after client close")
+            .unwrap();
+        assert_eq!(
+            &got, b"hello",
+            "server received the payload despite a pre-handshake junk datagram"
+        );
+    }
 }
