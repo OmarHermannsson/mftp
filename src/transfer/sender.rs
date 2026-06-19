@@ -181,6 +181,18 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// at low latency, consistently underperforming TCP+CUBIC at sub-15 ms RTT.
 pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(15);
 
+/// Decide whether a successfully-established QUIC connection should be torn down
+/// in favour of TCP+TLS, based on the measured RTT.
+///
+/// On a low-latency link (LAN / same datacenter) TCP's faster congestion ramp
+/// beats QUIC's, so in *auto* mode we switch when the RTT is at or below the
+/// configured threshold.  The switch never fires when:
+///   * the user pinned `--transport quic` (`forced_quic`), or
+///   * the threshold is `ZERO` (RTT-based switching disabled).
+fn should_switch_to_tcp(forced_quic: bool, threshold: Duration, rtt: Duration) -> bool {
+    !forced_quic && threshold > Duration::ZERO && rtt <= threshold
+}
+
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     // Scan directory before connecting so errors are surfaced early.
     let dir_entries = resolve_source(&file, &config)?;
@@ -221,7 +233,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
             let rtt = conn.stats().path.rtt;
             let threshold = config.tcp_rtt_threshold;
             // RTT-based TCP switch only applies in auto mode.
-            if !forced_quic && threshold > Duration::ZERO && rtt <= threshold {
+            if should_switch_to_tcp(forced_quic, threshold, rtt) {
                 eprintln!(
                     "[mftp] RTT {:.2} ms (≤ {:.2} ms threshold) — switching to TCP+TLS for LAN throughput…",
                     rtt.as_secs_f64() * 1000.0,
@@ -2914,6 +2926,29 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::sync::{mpsc, Semaphore};
+
+    #[test]
+    fn tcp_switch_fires_only_in_auto_mode_at_or_below_threshold() {
+        let thr = Duration::from_millis(15);
+
+        // Auto mode: switch when RTT is below or exactly at the threshold
+        // (≤ is inclusive)…
+        assert!(should_switch_to_tcp(false, thr, Duration::from_millis(2)));
+        assert!(should_switch_to_tcp(false, thr, thr));
+        // …but stay on QUIC above it.
+        assert!(!should_switch_to_tcp(false, thr, Duration::from_millis(16)));
+
+        // Pinned `--transport quic` never switches, even on a fast link.
+        assert!(!should_switch_to_tcp(true, thr, Duration::from_millis(1)));
+
+        // A ZERO threshold disables RTT-based switching entirely.
+        assert!(!should_switch_to_tcp(
+            false,
+            Duration::ZERO,
+            Duration::from_millis(1)
+        ));
+        assert!(!should_switch_to_tcp(false, Duration::ZERO, Duration::ZERO));
+    }
 
     /// Regression test for the late-scaling end-of-transfer deadlock.
     ///
