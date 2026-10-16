@@ -465,6 +465,17 @@ pub fn make_client_endpoint(
 
     let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let socket = make_udp_socket(bind)?;
+    // Connecting through a token-gated relay: claim the sender slot from this
+    // exact socket before quinn's first Initial. Sent a few times since UDP may
+    // drop it; the relay consumes duplicates. A lost/reordered claim only costs
+    // a QUIC Initial retransmit.
+    if let Some(claim) = crate::reach::relay::client_claim_for(server_addr) {
+        for _ in 0..3 {
+            if let Err(e) = socket.send_to(&claim, server_addr) {
+                debug!("relay claim to {server_addr} not sent: {e}");
+            }
+        }
+    }
     let runtime = quinn::default_runtime().context("no async runtime")?;
     let abstract_socket = test_support::maybe_wrap(runtime.wrap_udp_socket(socket)?);
     let mut endpoint = Endpoint::new_with_abstract_socket(

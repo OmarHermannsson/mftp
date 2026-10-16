@@ -111,6 +111,9 @@ async fn transfer_through_relay() -> anyhow::Result<()> {
     // Relay forwarding to the receiver; the sender will aim at the relay.
     let relay = RelayServer::bind("127.0.0.1:0".parse()?, recv_addr).await?;
     let relay_addr = relay.local_addr();
+    // The relay allocation's session token: the sender's QUIC endpoint claims
+    // the relay's sender slot with it before the handshake.
+    mftp::reach::relay::arm_client_claim(relay_addr, relay.token());
     let relay_task = tokio::spawn(async move { relay.run().await });
 
     let src = make_file(send_dir.path(), "relayed.bin", 768 * 1024);
@@ -137,6 +140,7 @@ async fn transfer_through_relay() -> anyhow::Result<()> {
     .await?;
     recv_task.await??;
     relay_task.abort();
+    mftp::reach::relay::disarm_client_claim(relay_addr);
 
     let received = recv_dir.path().join(src.file_name().unwrap());
     assert_eq!(std::fs::read(&src)?, std::fs::read(&received)?);
