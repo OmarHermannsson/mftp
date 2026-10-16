@@ -334,17 +334,50 @@ async fn handle_control_conn(stream: UnixStream, state: Arc<DaemonState>) -> Res
     Ok(())
 }
 
-/// Bind the control socket, removing any stale socket file first.
+/// Bind the control socket.
+///
+/// * Missing parent directories are created with mode 0700.
+/// * An existing path is only replaced if it is a *stale* socket: if a live
+///   daemon answers on it, this fails with "already running" instead of
+///   stealing its socket; a non-socket file there is never deleted.
+/// * The socket is chmod'ed to 0600 after bind — the control plane can add
+///   trusted devices, so only the owning user may connect.
 pub fn bind_control_socket(path: &Path) -> Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
     }
-    // A leftover socket file from a previous run would make bind() fail with
-    // EADDRINUSE even though nothing is listening; clear it.
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_socket() => {
+            // A leftover socket from a crashed run makes bind() fail with
+            // EADDRINUSE even though nothing listens; but a *live* daemon must
+            // not have its socket pulled out from under it.
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                anyhow::bail!(
+                    "a daemon is already running on control socket {} \
+                     (stop it first, or pass a different --socket)",
+                    path.display()
+                );
+            }
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove stale socket {}", path.display()))?;
+        }
+        Ok(_) => anyhow::bail!(
+            "{} exists and is not a socket; refusing to replace it",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
     }
     let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
     Ok(listener)
 }
 
@@ -769,6 +802,31 @@ mod tests {
             let _ = serve_control(listener, st).await;
         });
         (sock, state)
+    }
+
+    #[tokio::test]
+    async fn control_socket_is_private_and_not_stolen() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("run/sub/mftpd.sock");
+        let listener = bind_control_socket(&sock).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&sock), 0o600);
+        assert_eq!(mode(sock.parent().unwrap()), 0o700);
+
+        // A live listener → a second bind refuses instead of stealing.
+        let err = bind_control_socket(&sock).unwrap_err();
+        assert!(format!("{err:#}").contains("already running"), "{err:#}");
+
+        // Once the listener is gone the stale socket is replaced.
+        drop(listener);
+        let _again = bind_control_socket(&sock).unwrap();
+
+        // A regular file at the path is never deleted.
+        let file = dir.path().join("not-a-socket");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(bind_control_socket(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
     }
 
     #[tokio::test]
