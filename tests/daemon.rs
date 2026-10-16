@@ -405,6 +405,59 @@ async fn daemon_open_mode_accepts_sender_without_identity() -> anyhow::Result<()
     Ok(())
 }
 
+/// A peer already at/over its ACL byte quota is rejected at connect time, while
+/// a peer under quota is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_enforces_acl_quota_at_connect() -> anyhow::Result<()> {
+    use mftp::service::acl::{Acl, PeerPolicy};
+
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let mut acl = Acl::default();
+    acl.set_peer(
+        &sender_id.device_id,
+        PeerPolicy {
+            output_subdir: "tenant".into(),
+            quota_bytes: Some(1024 * 1024),
+        },
+    );
+    acl.save(dcfg.path())?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    // Under quota: served.
+    let src = make_file(send_dir.path(), "ok.bin", 256 * 1024);
+    sender::send(
+        src,
+        addr,
+        auth_send_config(fingerprint.clone(), sender_id.clone()),
+    )
+    .await?;
+    assert!(out.path().join("tenant/ok.bin").exists());
+
+    // Fill the tenant dir past the quota → the next connection is refused.
+    std::fs::write(out.path().join("tenant/filler.bin"), vec![0u8; 1024 * 1024])?;
+    let src2 = make_file(send_dir.path(), "over.bin", 64 * 1024);
+    let over = sender::send(src2, addr, auth_send_config(fingerprint, sender_id)).await;
+    assert!(over.is_err(), "over-quota peer must be rejected");
+    assert!(!out.path().join("tenant/over.bin").exists());
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+    Ok(())
+}
+
 /// A malformed `acl.toml` must make startup fail (fail closed) instead of being
 /// read as an empty ACL — which would leave the daemon open to any sender.
 #[tokio::test]

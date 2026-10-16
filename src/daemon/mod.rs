@@ -552,22 +552,36 @@ impl Daemon {
         let acl_for_router = state.acl.clone();
         let output_root = output_dir.clone();
         let serve_fut = server.serve_with_router(move |peer| {
-            acl_for_router.with(|acl| {
+            // Snapshot what we need from the live ACL and drop the read lock
+            // before touching the filesystem, so a slow directory walk never
+            // blocks a SIGHUP reload (or other connections) on the lock.
+            let routed = acl_for_router.with(|acl| -> Result<Option<_>> {
                 if acl.is_empty() {
-                    return Ok(output_root.clone());
+                    return Ok(None);
                 }
                 let device = peer.context("ACL enforced but peer presented no DeviceId")?;
                 let dir = acl.output_dir_for(&output_root, device)?;
-                std::fs::create_dir_all(&dir)
-                    .with_context(|| format!("create tenant dir {}", dir.display()))?;
-                // Enforce the peer's byte quota against its current on-disk usage.
-                // This rejects a peer already at/over quota at connect time
-                // (bounding its total to ~quota + one in-flight transfer);
-                // `incoming` is unknown here (the manifest hasn't been read yet).
-                let used = dir_size_bytes(&dir);
-                acl.check_quota(device, used, 0)?;
-                Ok(dir)
-            })
+                let quota = acl.policy(device).and_then(|p| p.quota_bytes);
+                Ok(Some((device.to_owned(), dir, quota)))
+            })?;
+            let Some((device, dir, quota)) = routed else {
+                return Ok(output_root.clone());
+            };
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("create tenant dir {}", dir.display()))?;
+            // Enforce the peer's byte quota against its current on-disk usage.
+            // This rejects a peer already at/over quota at connect time
+            // (bounding its total to ~quota + one in-flight transfer). The
+            // incoming transfer's size is unknown here: the router runs before
+            // the manifest is read, and the receiver exposes no post-manifest
+            // admission hook yet.
+            if let Some(limit) = quota {
+                let used = run_blocking(|| dir_size_bytes(&dir));
+                if used >= limit {
+                    anyhow::bail!("{device} is at/over its quota ({used} of {limit} bytes used)");
+                }
+            }
+            Ok(dir)
         });
 
         let control_fut = serve_control(control, Arc::clone(&state));
@@ -696,6 +710,19 @@ pub async fn run(
     }
 
     daemon.serve(shutdown_signal()).await
+}
+
+/// Run blocking filesystem work from inside the (synchronous) connection router
+/// without stalling an async worker: on a multi-threaded runtime the current
+/// worker is handed off via `block_in_place`; elsewhere (current-thread
+/// runtimes, no runtime) the closure simply runs inline.
+fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Total size in bytes of all regular files under `dir` (0 if absent). Used for
