@@ -119,9 +119,10 @@ where
     let chunk_index = u64::from_le_bytes(hdr[20..28].try_into().unwrap());
     let chunk_hash: [u8; 32] = hdr[28..60].try_into().unwrap();
     let compressed = hdr[60] != 0;
-    let payload_len_hdr = u64::from_le_bytes(hdr[61..69].try_into().unwrap()) as usize;
-    let payload_len = frame_body_len - CHUNK_HDR;
-    if payload_len != payload_len_hdr {
+    // Compare as u64: a wire value cast to usize first could truncate on 32-bit.
+    let payload_len_hdr = u64::from_le_bytes(hdr[61..69].try_into().unwrap());
+    let payload_len = frame_body_len - CHUNK_HDR; // ≥ 0: checked above
+    if payload_len as u64 != payload_len_hdr {
         bail!(
             "chunk data frame: payload length mismatch \
              (frame says {payload_len}, bincode says {payload_len_hdr})"
@@ -244,6 +245,16 @@ where
     if shard_count > MAX_FEC_SHARDS {
         bail!("FEC chunk frame: implausible shard_count {shard_count} (limit {MAX_FEC_SHARDS})");
     }
+    // The frame body must at least hold the fixed header, the shard metadata
+    // and the payload_len field; whatever remains is the payload.  (No overflow:
+    // shard_count ≤ 256.)
+    let min_body = FEC_FIXED_HDR + shard_count * 5 + 8;
+    if frame_body_len < min_body {
+        bail!(
+            "FEC chunk frame too small: {frame_body_len} bytes \
+             (need {min_body} for {shard_count} shards)"
+        );
+    }
 
     // Read shard_lengths (4 bytes each).
     let mut lengths_buf = vec![0u8; shard_count * 4];
@@ -273,13 +284,14 @@ where
         .read_exact(&mut payload_len_buf)
         .await
         .context("read FEC payload_len")?;
-    let payload_len = u64::from_le_bytes(payload_len_buf) as usize;
-
-    let expected_frame_body = FEC_FIXED_HDR + shard_count * 5 + 8 + payload_len;
-    if frame_body_len != expected_frame_body {
+    // Wire-supplied: never add it to anything unchecked (overflow panics with
+    // overflow-checks on).  It must equal exactly what the frame has left.
+    let payload_len_wire = u64::from_le_bytes(payload_len_buf);
+    let payload_len = frame_body_len - min_body;
+    if payload_len_wire != payload_len as u64 {
         bail!(
-            "FEC chunk frame body length mismatch: \
-             got {frame_body_len}, expected {expected_frame_body}"
+            "FEC chunk frame body length mismatch: frame has {payload_len} payload bytes, \
+             header says {payload_len_wire}"
         );
     }
 
@@ -374,6 +386,66 @@ where
 mod tests {
     use super::*;
     use crate::protocol::messages::{Compression, DirEntries, NegotiateRequest, TransferManifest};
+
+    /// Fixed FEC header (with length prefix) for hand-built malformed frames.
+    fn fec_hdr(frame_body_len: u32, shard_count: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&frame_body_len.to_le_bytes());
+        v.extend_from_slice(&[0u8; 16 + 8 + 32 + 1 + 4 + 2 + 1]);
+        v.extend_from_slice(&shard_count.to_le_bytes());
+        v
+    }
+
+    #[tokio::test]
+    async fn fec_frame_huge_payload_len_errors_not_overflows() {
+        // payload_len = u64::MAX used to be added unchecked to the header size.
+        let mut frame = fec_hdr((FEC_FIXED_HDR + 8) as u32, 0);
+        frame.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut r = &frame[..];
+        assert!(recv_fec_chunk_data(&mut r).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fec_frame_body_shorter_than_header_rejected() {
+        let frame = fec_hdr(10, 4);
+        let mut r = &frame[..];
+        let err = recv_fec_chunk_data(&mut r).await.unwrap_err();
+        assert!(format!("{err:#}").contains("too small"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn fec_frame_roundtrip() {
+        let msg = FecChunkData {
+            transfer_id: [1; 16],
+            chunk_index: 3,
+            chunk_hash: [2; 32],
+            compressed: false,
+            stripe_index: 1,
+            shard_index_in_stripe: 4,
+            is_parity: true,
+            shard_lengths: vec![10, 20, 30, 40],
+            shard_compressed: vec![0, 1, 0, 1],
+            payload: vec![9; 100],
+        };
+        let mut buf = Vec::new();
+        send_fec_chunk_data(&mut buf, &msg).await.unwrap();
+        let mut r = &buf[..];
+        let got = recv_fec_chunk_data(&mut r).await.unwrap().unwrap();
+        assert_eq!(got.shard_lengths, msg.shard_lengths);
+        assert_eq!(got.payload, msg.payload);
+    }
+
+    #[tokio::test]
+    async fn chunk_frame_payload_len_mismatch_rejected() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(CHUNK_HDR as u32 + 4).to_le_bytes());
+        frame.extend_from_slice(&[0u8; 16 + 8 + 32 + 1]);
+        // Claims a payload length whose low 32 bits match but high bits don't.
+        frame.extend_from_slice(&((1u64 << 32) | 4).to_le_bytes());
+        frame.extend_from_slice(&[0u8; 4]);
+        let mut r = &frame[..];
+        assert!(recv_chunk_data(&mut r).await.is_err());
+    }
 
     /// The Phase-1 (v6) startup optimization rests on this invariant: the sender
     /// may write NegotiateRequest + TransferManifest + DirEntries back-to-back
