@@ -4,6 +4,9 @@
 //! retry, and report on transfers across restarts. Stored as JSON at
 //! `~/.config/mftp/queue.json`. This is the scheduling/bookkeeping layer; the
 //! actual transfer is still performed by the existing engine.
+//!
+//! **Status: library-level only.** The daemon does not enqueue or update jobs
+//! yet; only the HTTP `/queue` endpoint reads this file.
 
 use std::path::{Path, PathBuf};
 

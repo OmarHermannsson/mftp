@@ -33,7 +33,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP, and auto-pins its discovered Device ID |
 | **Rendezvous (NAT traversal)** | `mftp rendezvous` runs a signaling-only broker; receivers register by Device ID and senders reach them with `mftp send <file> <device-id> --rendezvous <broker>`. Candidates are exchanged for UDP hole punching; the broker never sees file data |
 | **Zero-knowledge relay** | When hole punching fails (symmetric NAT), `mftp relay --to <receiver>` blindly forwards the QUIC datagrams. End-to-end TLS means the relay only ever sees ciphertext — it cannot read or alter the transfer |
-| **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota), tracks a persistent transfer queue, optionally serves a Web UI / JSON status API (`mftp daemon --http`), and can envelope-encrypt received files at rest (AES-256-GCM) |
+| **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota) and optionally serves a read-only Web UI / JSON status API (`mftp daemon --http`). A persistent transfer queue and streaming at-rest encryption (AES-256-GCM, per-file keys) exist as **library building blocks only** — the daemon does not yet record transfers in the queue or encrypt received files, which are written in plaintext |
 
 ---
 
@@ -260,6 +260,8 @@ Options:
                            Senders can then use `mftp send <file> <name>`.
       --http <HOST:PORT>   Also serve a read-only Web UI / JSON status API here.
 ```
+
+The dashboard's transfer table reads the queue file (`~/.config/mftp/queue.json`), which the daemon does not populate yet, so it is empty in practice. Received files are stored as plaintext; at-rest encryption is not wired into the daemon.
 
 When the authorized-device allowlist is non-empty (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
 
