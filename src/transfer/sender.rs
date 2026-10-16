@@ -1482,11 +1482,18 @@ where
     pb.set_message("verifying…");
 
     let file_hash: [u8; 32] = match file_hasher {
-        Some(h) => Arc::try_unwrap(h)
-            .expect(
+        Some(h) => {
+            let h = Arc::try_unwrap(h).expect(
                 "all stream workers have completed; no other Arc<ChunkHasher> references remain",
-            )
-            .finish()?,
+            );
+            if h.is_abandoned() {
+                // Inline collection overflowed (one worker far behind); hash
+                // the source from disk like the resume path does.
+                hash_source_from_disk(file, entries, chunk_size).await?
+            } else {
+                h.finish()?
+            }
+        }
         None => hash_task
             .expect("resume path always spawns hash_task")
             .await
@@ -1524,6 +1531,24 @@ where
     )?;
 
     Ok(())
+}
+
+/// Hash the transfer source from disk (single file or directory concat
+/// stream) off the async runtime.  Used when inline hash collection was
+/// skipped (resume) or abandoned.
+async fn hash_source_from_disk(
+    file: &Path,
+    entries: Option<&[FileEntry]>,
+    chunk_size: usize,
+) -> Result<[u8; 32]> {
+    let path = file.to_owned();
+    let ents = entries.map(|e| e.to_vec());
+    tokio::task::spawn_blocking(move || match ents {
+        Some(ents) => crate::transfer::hash::hash_concat_sync(&ents, &path, chunk_size),
+        None => hash_file_sync(&path, chunk_size),
+    })
+    .await
+    .context("hash task panicked")?
 }
 
 // ── Incremental repair (protocol v5) ───────────────────────────────────────────
@@ -2885,9 +2910,15 @@ where
     pb.set_message("verifying…");
 
     let file_hash: [u8; 32] = match file_hasher {
-        Some(h) => Arc::try_unwrap(h)
-            .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain")
-            .finish()?,
+        Some(h) => {
+            let h = Arc::try_unwrap(h)
+                .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain");
+            if h.is_abandoned() {
+                hash_source_from_disk(file, None, chunk_size).await?
+            } else {
+                h.finish()?
+            }
+        }
         None => hash_task
             .expect("resume path always spawns hash_task")
             .await

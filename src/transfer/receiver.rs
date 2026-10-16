@@ -910,6 +910,9 @@ fn write_fec_chunk(
                 chunk = chunk_index,
                 "FEC data shard hash mismatch; dropping (will be repaired or re-fetched)"
             );
+            if let Some(h) = hasher {
+                h.abandon();
+            }
             return Ok(0);
         }
     }
@@ -2078,13 +2081,18 @@ async fn finish_transfer<S>(
 where
     S: tokio::io::AsyncWrite + Unpin,
 {
+    // An abandoned hasher (dropped chunk, pending overflow) is incomplete; treat
+    // it like the resume path and hash from disk.
+    let hasher = hasher
+        .map(|h| {
+            Arc::try_unwrap(h).expect("all stream tasks finished so no other Arc references exist")
+        })
+        .filter(|h| !h.is_abandoned());
     let file_hash: [u8; 32] = match hasher {
-        Some(h) => Arc::try_unwrap(h)
-            .expect("all stream tasks finished so no other Arc references exist")
-            .finish()?,
+        Some(h) => h.finish()?,
         None => {
-            // Resume path: some chunks were already on disk and never fed to a
-            // ChunkHasher, so hash the complete stream from disk instead.
+            // Resume path (or abandoned inline hasher): some chunks were never
+            // fed to a ChunkHasher, so hash the complete stream from disk instead.
             let chunk_size = manifest.chunk_size;
             if let Some(ref cl) = layout {
                 // Directory: hash the concat stream across all files in order.
@@ -2256,6 +2264,9 @@ where
         // (leaving it unmarked) exactly once, exercising the repair path.
         if test_hooks::should_drop(chunk_index) {
             warn!(chunk = chunk_index, "test hook: dropping chunk");
+            if let Some(ref h) = hasher {
+                h.abandon();
+            }
             continue;
         }
 
@@ -2300,6 +2311,12 @@ where
                 // hash and lets a resumed rerun re-fetch it.
                 stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
                 drop(write_permit);
+                // The chunk can now only arrive via repair (which bypasses the
+                // inline hasher), so stop collecting inline — otherwise every
+                // later chunk piles up behind it until the pending cap trips.
+                if let Some(ref h) = hasher {
+                    h.abandon();
+                }
                 warn!(
                     chunk = chunk_index,
                     got = %hex::encode(computed),
@@ -2477,6 +2494,11 @@ where
                 chunk = fcd.chunk_index,
                 "test hook: dropping FEC data shard"
             );
+            // The stripe may now be unreconstructable and the chunk recovered
+            // only via repair, which bypasses the inline hasher.
+            if let Some(ref h) = hasher {
+                h.abandon();
+            }
             shard_count += 1;
             continue;
         }
