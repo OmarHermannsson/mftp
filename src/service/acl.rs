@@ -34,13 +34,58 @@ pub struct Acl {
 
 impl Acl {
     /// Load the ACL from `dir/acl.toml` (empty if absent).
+    ///
+    /// The loaded ACL is [validated](Acl::validated): DeviceId keys are
+    /// normalized (trim + lowercase, as the TLS allowlist does) and each
+    /// peer's `output_subdir` must be a distinct, non-overlapping relative
+    /// path. Any violation is an error — the daemon never runs with an ACL it
+    /// only partly understood.
     pub fn load(dir: &Path) -> Result<Acl> {
         let path = acl_path(dir);
         match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parse {}", path.display())),
+            Ok(s) => toml::from_str::<Acl>(&s)
+                .with_context(|| format!("parse {}", path.display()))?
+                .validated()
+                .with_context(|| format!("invalid {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Acl::default()),
             Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
         }
+    }
+
+    /// Normalize and validate an ACL:
+    ///   * keys are trimmed + lower-cased and must be 64-hex DeviceIds; two keys
+    ///     that normalize to the same id are rejected;
+    ///   * every `output_subdir` must be a non-empty relative path with no `.` /
+    ///     `..` components;
+    ///   * no peer's subdir may equal, contain, or be contained in another's —
+    ///     otherwise one tenant could read/overwrite (and be quota-charged for)
+    ///     another's files.
+    pub fn validated(self) -> Result<Acl> {
+        let mut peers = BTreeMap::new();
+        let mut dirs: Vec<(String, Vec<String>)> = Vec::new();
+        for (raw_id, policy) in self.peers {
+            let id = raw_id.trim().to_lowercase();
+            if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                anyhow::bail!("ACL peer {raw_id:?} is not a DeviceId (expected 64 hex chars)");
+            }
+            let comps = subdir_components(&policy.output_subdir)
+                .with_context(|| format!("ACL peer {id}"))?;
+            for (other, other_comps) in &dirs {
+                let n = comps.len().min(other_comps.len());
+                if comps[..n] == other_comps[..n] {
+                    anyhow::bail!(
+                        "ACL output_subdir {:?} of {id} overlaps that of {other} — each \
+                         peer needs its own, non-nested directory",
+                        policy.output_subdir
+                    );
+                }
+            }
+            dirs.push((id.clone(), comps));
+            if peers.insert(id.clone(), policy).is_some() {
+                anyhow::bail!("ACL lists device {id} more than once");
+            }
+        }
+        Ok(Acl { peers })
     }
 
     /// Persist the ACL to `dir/acl.toml`.
@@ -106,6 +151,29 @@ impl Acl {
     pub fn remove_peer(&mut self, device_id: &str) -> bool {
         self.peers.remove(&device_id.to_lowercase()).is_some()
     }
+}
+
+/// Split an `output_subdir` into its normal components, rejecting empty, `.`,
+/// absolute, and `..`-containing paths.
+fn subdir_components(sub: &str) -> Result<Vec<String>> {
+    use std::path::Component;
+    let mut out = Vec::new();
+    for c in Path::new(sub.trim()).components() {
+        match c {
+            Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => {
+                anyhow::bail!("output_subdir {sub:?} must be a relative path with no `..` or root")
+            }
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!(
+            "output_subdir {sub:?} must name a subdirectory (empty or `.` would share the \
+             output root with every peer)"
+        );
+    }
+    Ok(out)
 }
 
 fn acl_path(dir: &Path) -> PathBuf {
@@ -186,6 +254,57 @@ mod tests {
         assert!(acl.output_dir_for(root, &"x".repeat(64)).is_err());
         // Unknown device → denied.
         assert!(acl.output_dir_for(root, &"z".repeat(64)).is_err());
+    }
+
+    fn load_str(body: &str) -> Result<Acl> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("acl.toml"), body).unwrap();
+        Acl::load(dir.path())
+    }
+
+    #[test]
+    fn load_normalizes_keys() {
+        let upper = "AB".repeat(32);
+        let acl = load_str(&format!(
+            "[peers.\" {upper} \"]\noutput_subdir = \"alice\"\n"
+        ))
+        .unwrap();
+        assert_eq!(acl.authorized_ids(), vec!["ab".repeat(32)]);
+        assert!(acl.policy(&upper).is_some());
+    }
+
+    #[test]
+    fn load_rejects_bad_subdirs_and_ids() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let one = |sub: &str| format!("[peers.{a}]\noutput_subdir = {sub:?}\n");
+        for bad in ["", ".", "./", "../x", "/abs"] {
+            assert!(
+                load_str(&one(bad)).is_err(),
+                "subdir {bad:?} must be rejected"
+            );
+        }
+        let two = |sa: &str, sb: &str| {
+            format!("[peers.{a}]\noutput_subdir = {sa:?}\n[peers.{b}]\noutput_subdir = {sb:?}\n")
+        };
+        assert!(load_str(&two("alice", "bob")).is_ok());
+        assert!(load_str(&two("alice", "alice")).is_err(), "same dir");
+        assert!(load_str(&two("alice", "alice/sub")).is_err(), "nested");
+        assert!(
+            load_str(&two("./alice/", "alice")).is_err(),
+            "normalized equal"
+        );
+        assert!(
+            load_str(&two("alice", "alicex")).is_ok(),
+            "prefix by chars only"
+        );
+        // Duplicate after normalization.
+        let dup = format!(
+            "[peers.{a}]\noutput_subdir = \"x\"\n[peers.\"{}\"]\noutput_subdir = \"y\"\n",
+            a.to_uppercase()
+        );
+        assert!(load_str(&dup).is_err(), "case-duplicate ids");
+        assert!(load_str("[peers.notanid]\noutput_subdir = \"x\"\n").is_err());
     }
 
     #[test]
