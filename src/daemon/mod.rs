@@ -464,7 +464,9 @@ impl Daemon {
             let http_listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind HTTP dashboard on {addr}"))?;
-            http_addr = Some(http_listener.local_addr()?);
+            let bound = http_listener.local_addr()?;
+            crate::service::http::warn_if_exposed(bound);
+            http_addr = Some(bound);
             let auth_state = Arc::clone(&state);
             let http_state = Arc::new(crate::service::http::HttpState {
                 config_dir: opts.config_dir.clone(),

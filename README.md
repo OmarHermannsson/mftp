@@ -259,6 +259,9 @@ Options:
       --name <NAME>        LAN discovery name to announce as (default: hostname).
                            Senders can then use `mftp send <file> <name>`.
       --http <HOST:PORT>   Also serve a read-only Web UI / JSON status API here.
+                           Unauthenticated: bind it to 127.0.0.1 (a non-loopback
+                           address prints a warning). Requests must carry an
+                           IP-literal or localhost Host header (DNS-rebinding guard).
 ```
 
 The dashboard's transfer table reads the queue file (`~/.config/mftp/queue.json`), which the daemon does not populate yet, so it is empty in practice. Received files are stored as plaintext; at-rest encryption is not wired into the daemon.
