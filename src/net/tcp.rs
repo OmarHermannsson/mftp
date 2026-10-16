@@ -58,6 +58,17 @@ fn try_set_bbr(raw_fd: std::os::unix::io::RawFd) {
 /// (~2 minutes on Linux).
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the client waits for the TLS handshake once TCP is up, when trust
+/// is pinned (`--trust` / `--trust-device`).  A peer that accepts the TCP
+/// connection but never answers the ClientHello (a tarpit, a wrong service,
+/// a middlebox) would otherwise hang the sender forever.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Handshake bound when trust is TOFU: the certificate verifier may block on
+/// an interactive "trust this fingerprint?" prompt mid-handshake, so allow a
+/// human time to answer while still never waiting indefinitely.
+const TLS_HANDSHAKE_TIMEOUT_TOFU: Duration = Duration::from_secs(300);
+
 pub use tokio_rustls::client::TlsStream as ClientTlsStream;
 pub use tokio_rustls::server::TlsStream as ServerTlsStream;
 
@@ -118,6 +129,17 @@ pub async fn connect_tls(
     trusted_fingerprint: Option<&str>,
     trusted_device: Option<&str>,
 ) -> Result<ClientTlsStream<TcpStream>> {
+    let limit = handshake_timeout(trusted_fingerprint, trusted_device);
+    connect_tls_within(addr, trusted_fingerprint, trusted_device, limit).await
+}
+
+/// [`connect_tls`] with an explicit TLS-handshake bound.
+async fn connect_tls_within(
+    addr: SocketAddr,
+    trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    limit: Duration,
+) -> Result<ClientTlsStream<TcpStream>> {
     use crate::net::connection::make_client_tls_config;
 
     let tcp = connect_raw(addr).await?;
@@ -126,10 +148,19 @@ pub async fn connect_tls(
     // Use the server's IP address as the TLS SNI — our custom verifiers don't
     // validate the name, but TLS requires one.
     let server_name = ServerName::IpAddress(addr.ip().into());
-    connector
-        .connect(server_name, tcp)
+    tokio::time::timeout(limit, connector.connect(server_name, tcp))
         .await
+        .with_context(|| format!("TLS handshake with {addr} timed out after {limit:.0?}"))?
         .context("TLS handshake failed")
+}
+
+/// Client TLS handshake bound for the given trust mode.
+fn handshake_timeout(trusted_fingerprint: Option<&str>, trusted_device: Option<&str>) -> Duration {
+    if trusted_fingerprint.is_some() || trusted_device.is_some() {
+        TLS_HANDSHAKE_TIMEOUT
+    } else {
+        TLS_HANDSHAKE_TIMEOUT_TOFU
+    }
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
@@ -164,4 +195,38 @@ async fn connect_raw(addr: SocketAddr) -> Result<TcpStream> {
         .with_context(|| format!("TCP connect to {addr}"))?;
     stream.set_nodelay(true).context("TCP_NODELAY")?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that accepts TCP but never speaks TLS must not hang the client.
+    #[tokio::test]
+    async fn tls_handshake_times_out_against_silent_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tarpit = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            // Hold the connection open without ever answering.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(sock);
+        });
+
+        let fp = "a".repeat(64);
+        let start = std::time::Instant::now();
+        let err = connect_tls_within(addr, Some(&fp), None, Duration::from_millis(300))
+            .await
+            .expect_err("handshake must time out");
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        tarpit.abort();
+    }
+
+    #[test]
+    fn handshake_timeout_depends_on_trust_mode() {
+        assert_eq!(handshake_timeout(Some("x"), None), TLS_HANDSHAKE_TIMEOUT);
+        assert_eq!(handshake_timeout(None, Some("x")), TLS_HANDSHAKE_TIMEOUT);
+        assert_eq!(handshake_timeout(None, None), TLS_HANDSHAKE_TIMEOUT_TOFU);
+    }
 }
