@@ -873,7 +873,11 @@ async fn handle_tcp_connection(
     acceptor: Arc<TlsAcceptor>,
     output_dir: PathBuf,
 ) -> Result<()> {
-    let peer = tls_peer_device_id(&ctrl_stream);
+    let control_peer = TcpPeer {
+        ip: ctrl_stream.get_ref().0.peer_addr()?.ip(),
+        device: tls_peer_device_id(&ctrl_stream),
+    };
+    let peer = control_peer.device.clone();
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
     run_receive(
@@ -884,14 +888,30 @@ async fn handle_tcp_connection(
         move |_transfer_id| {
             let listener = Arc::clone(&listener);
             let acceptor = Arc::clone(&acceptor);
+            let control_peer = control_peer.clone();
             async move {
-                let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
-                raw.set_nodelay(true)?;
-                let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
-                    .await
-                    .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
-                    .context("TLS handshake on data stream")?;
-                Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+                // Data connections are taken in arrival order, but only from
+                // the control connection's peer (same IP and client identity);
+                // anything else is dropped and the next one awaited.
+                loop {
+                    let (raw, addr) = listener.accept().await.context("accept TCP data stream")?;
+                    raw.set_nodelay(true)?;
+                    let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
+                        .await
+                        .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
+                        .context("TLS handshake on data stream")?;
+                    let data_peer = TcpPeer {
+                        ip: addr.ip(),
+                        device: tls_peer_device_id(&tls),
+                    };
+                    if data_peer == control_peer {
+                        return Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>);
+                    }
+                    warn!(
+                        "dropping data connection from {data_peer}: transfer is controlled \
+                         from {control_peer}"
+                    );
+                }
             }
         },
     )
@@ -921,11 +941,31 @@ enum TcpRouteKey {
     Legacy,
 }
 
+/// Who is on the other end of a TCP+TLS connection: its source IP and the
+/// DeviceId of the client certificate it presented (if any). A data connection
+/// is only accepted for a transfer whose control connection had the same peer,
+/// so knowing a (predictable) transfer_id and sharing an IP isn't enough to
+/// inject streams into someone else's transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpPeer {
+    ip: std::net::IpAddr,
+    device: Option<String>,
+}
+
+impl std::fmt::Display for TcpPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.device {
+            Some(d) => write!(f, "{} (device {d})", self.ip),
+            None => write!(f, "{} (no client certificate)", self.ip),
+        }
+    }
+}
+
 /// Registry of in-progress TCP transfers on a shared listener, mapping each
 /// to the channel its data connections are delivered on.
 #[derive(Default)]
 struct TcpStreamRouter {
-    routes: Mutex<HashMap<TcpRouteKey, (std::net::IpAddr, async_channel::Sender<DataStream>)>>,
+    routes: Mutex<HashMap<TcpRouteKey, (TcpPeer, async_channel::Sender<DataStream>)>>,
     changed: tokio::sync::Notify,
 }
 
@@ -947,11 +987,11 @@ impl Drop for TcpRouteGuard {
 }
 
 impl TcpStreamRouter {
-    /// Start accepting data connections for `key` from `peer_ip`.
+    /// Start accepting data connections for `key` from `peer`.
     fn register(
         self: &Arc<Self>,
         key: TcpRouteKey,
-        peer_ip: std::net::IpAddr,
+        peer: TcpPeer,
     ) -> Result<(async_channel::Receiver<DataStream>, TcpRouteGuard)> {
         let mut routes = self.routes.lock().expect("tcp router mutex poisoned");
         if routes.contains_key(&key) {
@@ -966,7 +1006,7 @@ impl TcpStreamRouter {
             });
         }
         let (tx, rx) = async_channel::unbounded();
-        routes.insert(key, (peer_ip, tx));
+        routes.insert(key, (peer, tx));
         drop(routes);
         self.changed.notify_waiters();
         Ok((
@@ -978,23 +1018,18 @@ impl TcpStreamRouter {
         ))
     }
 
-    /// Whether `key` is registered for connections from `peer_ip`.
-    fn has_route(&self, key: TcpRouteKey, peer_ip: std::net::IpAddr) -> bool {
+    /// Whether `key` is registered for connections from `peer`.
+    fn has_route(&self, key: TcpRouteKey, peer: &TcpPeer) -> bool {
         self.routes
             .lock()
             .expect("tcp router mutex poisoned")
             .get(&key)
-            .is_some_and(|(ip, _)| *ip == peer_ip)
+            .is_some_and(|(owner, _)| owner == peer)
     }
 
     /// Hand a data connection to its transfer, waiting up to [`TCP_ROUTE_WAIT`]
     /// for the transfer to register.
-    async fn deliver(
-        &self,
-        key: TcpRouteKey,
-        peer_ip: std::net::IpAddr,
-        stream: DataStream,
-    ) -> Result<()> {
+    async fn deliver(&self, key: TcpRouteKey, peer: &TcpPeer, stream: DataStream) -> Result<()> {
         let deadline = tokio::time::Instant::now() + TCP_ROUTE_WAIT;
         loop {
             let notified = self.changed.notified();
@@ -1006,9 +1041,9 @@ impl TcpStreamRouter {
                 .expect("tcp router mutex poisoned")
                 .get(&key)
                 .cloned();
-            if let Some((ip, tx)) = route {
-                if ip != peer_ip {
-                    bail!("data connection from {peer_ip} for a transfer controlled from {ip}");
+            if let Some((owner, tx)) = route {
+                if owner != *peer {
+                    bail!("data connection from {peer} for a transfer controlled from {owner}");
                 }
                 return tx
                     .send(stream)
@@ -1056,7 +1091,10 @@ async fn serve_routed_tcp_connection(
         transfer_id: [0; 16],
         stream_seq: 0,
     })? as u32;
-    let peer_ip = peer_addr.ip();
+    let tcp_peer = TcpPeer {
+        ip: peer_addr.ip(),
+        device: tls_peer_device_id(&tls),
+    };
     let mut prefix = vec![0u8; 4];
     let mut filled = 0;
     let deadline = tokio::time::Instant::now() + HANDSHAKE_READ_TIMEOUT;
@@ -1081,11 +1119,11 @@ async fn serve_routed_tcp_connection(
             Ok(Err(e)) if !eof => return Err(e).context("read first frame"),
             _ => {}
         }
-        if router.has_route(TcpRouteKey::Legacy, peer_ip) {
+        if router.has_route(TcpRouteKey::Legacy, &tcp_peer) {
             prefix.truncate(filled);
             let stream = std::io::Cursor::new(prefix).chain(tls);
             return router
-                .deliver(TcpRouteKey::Legacy, peer_ip, Box::new(stream))
+                .deliver(TcpRouteKey::Legacy, &tcp_peer, Box::new(stream))
                 .await;
         }
         if eof {
@@ -1129,11 +1167,11 @@ async fn serve_routed_tcp_connection(
             // Re-prepend what we consumed: run_receive re-reads (and validates)
             // the StreamHello itself.
             let stream = std::io::Cursor::new(prefix).chain(tls);
-            router.deliver(key, peer_ip, Box::new(stream)).await
+            router.deliver(key, &tcp_peer, Box::new(stream)).await
         }
         TcpConnKind::Control { legacy } => {
             info!("TCP transfer from {peer_addr}");
-            let peer = tls_peer_device_id(&tls);
+            let peer = tcp_peer.device.clone();
             let (ctrl_recv, ctrl_send) = tokio::io::split(tls);
             let ctrl_recv = std::io::Cursor::new(prefix).chain(ctrl_recv);
             let mut route: Option<(async_channel::Receiver<DataStream>, TcpRouteGuard)> = None;
@@ -1151,7 +1189,7 @@ async fn serve_routed_tcp_connection(
                             } else {
                                 TcpRouteKey::Transfer(transfer_id)
                             };
-                            router.register(key, peer_ip).map(|(rx, guard)| {
+                            router.register(key, tcp_peer.clone()).map(|(rx, guard)| {
                                 route = Some((rx.clone(), guard));
                                 rx
                             })
@@ -4225,7 +4263,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let router = Arc::new(TcpStreamRouter::default());
         let (rx, _route) = router
-            .register(TcpRouteKey::Legacy, "127.0.0.1".parse().unwrap())
+            .register(
+                TcpRouteKey::Legacy,
+                TcpPeer {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    device: None,
+                },
+            )
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().to_owned();
@@ -4259,6 +4303,82 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("closed legacy connection delivered")
+            .unwrap();
+    }
+
+    /// A data connection is only routed to a transfer whose control
+    /// connection had the same peer: same IP is not enough, the client
+    /// certificate's DeviceId must match too (and vice versa).
+    #[tokio::test]
+    async fn tcp_data_connection_must_match_control_peer_identity() {
+        use crate::net::connection::{cert_fingerprint, generate_self_signed_cert};
+        use crate::protocol::messages::StreamHello;
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        let fp = cert_fingerprint(&cert);
+        let acceptor =
+            Arc::new(make_tls_acceptor(cert, make_private_key(key).unwrap(), None).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Arc::new(TcpStreamRouter::default());
+        let srv_router = Arc::clone(&router);
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_owned();
+        tokio::spawn(async move {
+            loop {
+                let (raw, peer) = listener.accept().await.unwrap();
+                let (a, r, o) = (Arc::clone(&acceptor), Arc::clone(&srv_router), out.clone());
+                let res_tx = res_tx.clone();
+                tokio::spawn(async move {
+                    let _ = res_tx.send(serve_routed_tcp_connection(raw, peer, a, r, o).await);
+                });
+            }
+        });
+
+        let cfg_a = tempfile::tempdir().unwrap();
+        let cfg_b = tempfile::tempdir().unwrap();
+        let alice = crate::identity::load_or_create_in(cfg_a.path()).unwrap();
+        let mallory = crate::identity::load_or_create_in(cfg_b.path()).unwrap();
+        let id = [7u8; 16];
+        let (rx, _route) = router
+            .register(
+                TcpRouteKey::Transfer(id),
+                TcpPeer {
+                    ip: "127.0.0.1".parse().unwrap(),
+                    device: Some(alice.device_id.clone()),
+                },
+            )
+            .unwrap();
+        let hello = StreamHello {
+            transfer_id: id,
+            stream_seq: 0,
+        };
+
+        // Same IP, other identity (and no identity): refused, never delivered.
+        for who in [Some(&mallory), None] {
+            let mut c = crate::net::tcp::connect_tls(addr, Some(&fp), None, who)
+                .await
+                .unwrap();
+            framing::send_message(&mut c, &hello).await.unwrap();
+            let res = tokio::time::timeout(Duration::from_secs(10), res_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(format!("{:#}", res.unwrap_err()).contains("controlled from"));
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "foreign data connection was delivered"
+        );
+
+        // The control connection's own identity: delivered.
+        let mut c = crate::net::tcp::connect_tls(addr, Some(&fp), None, Some(&alice))
+            .await
+            .unwrap();
+        framing::send_message(&mut c, &hello).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("matching data connection delivered")
             .unwrap();
     }
 
