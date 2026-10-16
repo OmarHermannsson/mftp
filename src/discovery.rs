@@ -8,8 +8,14 @@
 //! This is an mftp-specific protocol carried over an admin-scoped IPv4 multicast
 //! group (rather than full DNS-SD wire format) — enough for the mftp-to-mftp
 //! "resolve a name on the LAN" use case without a DNS-encoder dependency. The
-//! announcement also carries the responder's Ed25519 DeviceId so the sender can
-//! pin it (`--trust-device`) end-to-end.
+//! announcement also carries the responder's Ed25519 DeviceId.
+//!
+//! **Announcements are unauthenticated**: anyone on the LAN can answer for any
+//! name. Discovery therefore only supplies an *address*; it never establishes
+//! trust. The sender either matches the announced DeviceId against an explicit
+//! `--trust-device` pin, or goes through normal TOFU certificate verification
+//! for the discovered address. Conflicting answers (several distinct DeviceIds
+//! for one name) are an error rather than "first responder wins".
 //!
 //! Production uses the multicast group [`DISCOVERY_GROUP`]:[`DISCOVERY_PORT`];
 //! the request/response protocol itself is transport-agnostic and unit-tested
@@ -116,11 +122,32 @@ pub fn bind_responder() -> Result<UdpSocket> {
 /// In production `query_target` is `DISCOVERY_GROUP:DISCOVERY_PORT`; tests pass
 /// a unicast responder address. The resolved IP is the responder's source
 /// address; the port is taken from the announcement.
+///
+/// Prefer [`resolve_all`] + [`choose`] when the result will be connected to:
+/// this returns whichever responder answered first.
 pub async fn resolve(
     name: &str,
     query_target: SocketAddr,
     timeout: Duration,
 ) -> Result<Option<Resolved>> {
+    Ok(resolve_all(name, query_target, timeout, Duration::ZERO)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Like [`resolve`], but after the first matching announcement keep listening
+/// for `grace` (bounded by `timeout`) and return **every** distinct responder,
+/// in arrival order. An empty vec means nothing answered within `timeout`.
+///
+/// Collecting a short window lets the caller notice that more than one device
+/// claims the same name (a misconfiguration — or a spoofing attempt).
+pub async fn resolve_all(
+    name: &str,
+    query_target: SocketAddr,
+    timeout: Duration,
+    grace: Duration,
+) -> Result<Vec<Resolved>> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .await
         .context("bind discovery query socket")?;
@@ -133,11 +160,12 @@ pub async fn resolve(
         .context("send discovery query")?;
 
     let mut buf = vec![0u8; 2048];
-    let deadline = tokio::time::Instant::now() + timeout;
+    let mut found: Vec<Resolved> = Vec::new();
+    let mut deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(None);
+            return Ok(found);
         }
         match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) => {
@@ -148,16 +176,76 @@ pub async fn resolve(
                 }) = decode(&buf[..n])
                 {
                     if name_matches(name, &ann_name) {
-                        let addr = SocketAddr::new(from.ip(), port);
-                        return Ok(Some(Resolved { addr, device_id }));
+                        let r = Resolved {
+                            addr: SocketAddr::new(from.ip(), port),
+                            device_id: device_id.trim().to_lowercase(),
+                        };
+                        if found.is_empty() {
+                            // First answer: shorten the wait to the grace window.
+                            deadline = deadline.min(tokio::time::Instant::now() + grace);
+                        }
+                        if !found.contains(&r) {
+                            found.push(r);
+                        }
+                        if grace.is_zero() {
+                            return Ok(found);
+                        }
                     }
                 }
                 // Non-matching / malformed datagram — keep waiting.
             }
             Ok(Err(e)) => return Err(e).context("discovery recv"),
-            Err(_) => return Ok(None), // timed out
+            Err(_) => return Ok(found), // timed out
         }
     }
+}
+
+/// Pick the responder to connect to from [`resolve_all`]'s answers for `name`.
+///
+/// * With `trusted_device` (the user's `--trust-device` pin), the responder
+///   announcing that DeviceId is chosen; if none does, it is an error. The pin
+///   is then enforced cryptographically at the TLS layer.
+/// * Without a pin, all answers must come from **one** DeviceId; distinct
+///   DeviceIds for the same name are an error (ambiguous or spoofed). The
+///   result is only an address hint — the caller must still verify the
+///   receiver via TOFU, since the announced id is unauthenticated.
+pub fn choose(name: &str, found: &[Resolved], trusted_device: Option<&str>) -> Result<Resolved> {
+    if let Some(pin) = trusted_device {
+        let pin = pin.trim().to_lowercase();
+        return found
+            .iter()
+            .find(|r| r.device_id == pin)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "no LAN responder for {name:?} announced the pinned device {pin} \
+                     (answers: {})",
+                    describe(found)
+                )
+            });
+    }
+    let first = found
+        .first()
+        .with_context(|| format!("no LAN responder for {name:?}"))?;
+    if found.iter().any(|r| r.device_id != first.device_id) {
+        anyhow::bail!(
+            "multiple devices answered for {name:?} on the LAN: {} — pass --trust-device \
+             <id> to pick one, or use host:port",
+            describe(found)
+        );
+    }
+    Ok(first.clone())
+}
+
+fn describe(found: &[Resolved]) -> String {
+    if found.is_empty() {
+        return "none".to_string();
+    }
+    found
+        .iter()
+        .map(|r| format!("{} at {}", r.device_id, r.addr))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Production multicast target for [`resolve`].
@@ -231,6 +319,73 @@ mod tests {
         assert_eq!(got.addr.port(), 9999, "port comes from the announcement");
         assert_eq!(got.device_id, device_id);
         h.abort();
+    }
+
+    fn resolved(id: char, port: u16) -> Resolved {
+        Resolved {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            device_id: id.to_string().repeat(64),
+        }
+    }
+
+    #[test]
+    fn choose_rejects_conflicting_devices() {
+        let a = resolved('a', 1);
+        let a2 = resolved('a', 2); // same device, second interface
+        let b = resolved('b', 3);
+        assert_eq!(choose("n", &[a.clone(), a2.clone()], None).unwrap(), a);
+        assert!(choose("n", &[a.clone(), b.clone()], None).is_err());
+        assert!(choose("n", &[], None).is_err());
+        // A pin selects the matching responder even amid conflicting answers…
+        let pin = "B".repeat(64);
+        assert_eq!(choose("n", &[a.clone(), b.clone()], Some(&pin)).unwrap(), b);
+        // …and is an error when nobody announces it.
+        assert!(choose("n", &[a], Some(&"c".repeat(64))).is_err());
+    }
+
+    /// `resolve_all` collects every responder answering within the grace window.
+    #[tokio::test]
+    async fn resolve_all_collects_multiple_responders() {
+        // Two responders for the same name, and a forwarder that fans one query
+        // out to both (standing in for the multicast group).
+        let r1 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let r2 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let (a1, a2) = (r1.local_addr().unwrap(), r2.local_addr().unwrap());
+        let h1 = tokio::spawn(respond_loop(r1, "laptop".into(), 1111, "a".repeat(64)));
+        let h2 = tokio::spawn(respond_loop(r2, "laptop".into(), 2222, "b".repeat(64)));
+        let fan = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fan_addr = fan.local_addr().unwrap();
+        let hf = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, from) = fan.recv_from(&mut buf).await.unwrap();
+            // Forward the query to each responder and relay its answer back to
+            // the querier (responders reply to whoever sent them the query).
+            let q = buf[..n].to_vec();
+            for target in [a1, a2] {
+                let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                s.send_to(&q, target).await.unwrap();
+                let mut rb = vec![0u8; 2048];
+                let (m, _) = s.recv_from(&mut rb).await.unwrap();
+                fan.send_to(&rb[..m], from).await.unwrap();
+            }
+        });
+
+        let found = resolve_all(
+            "laptop",
+            fan_addr,
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<_> = found.iter().map(|r| r.device_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".repeat(64), "b".repeat(64)]);
+        assert!(choose("laptop", &found, None).is_err(), "ambiguous name");
+        for h in [h1, h2] {
+            h.abort();
+        }
+        hf.abort();
     }
 
     /// A query for a different name times out (no match).

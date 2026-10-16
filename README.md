@@ -30,7 +30,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
 | **Persistent device identity** | The receiver keeps a stable Ed25519 key + certificate in `~/.config/mftp/`, so its fingerprint no longer changes across restarts. `mftp receive` prints a stable **Device ID**; `--trust-device <id>` pins the device key (survives certificate re-issuance, unlike `--trust`) |
 | **`mftpd` daemon (Unix)** | `mftp daemon` runs a persistent accept-many receiver with a local control socket (`mftp daemon-status`, `mftp daemon-trust add/remove/list`). Adding authorized sender Device IDs enforces **mutual-TLS identity auth** — only allowlisted devices can send |
-| **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP, and auto-pins its discovered Device ID |
+| **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP (the receiver is still verified via TOFU or `--trust-device`; announcements are unauthenticated) |
 | **Rendezvous (NAT traversal)** | `mftp rendezvous` runs a signaling-only broker; receivers register by Device ID and senders reach them with `mftp send <file> <device-id> --rendezvous <broker>`. Candidates are exchanged for UDP hole punching; the broker never sees file data |
 | **Zero-knowledge relay** | When hole punching fails (symmetric NAT), `mftp relay --to <receiver>` blindly forwards the QUIC datagrams. End-to-end TLS means the relay only ever sees ciphertext — it cannot read or alter the transfer |
 | **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota) and optionally serves a read-only Web UI / JSON status API (`mftp daemon --http`). A persistent transfer queue and streaming at-rest encryption (AES-256-GCM, per-file keys) exist as **library building blocks only** — the daemon does not yet record transfers in the queue or encrypt received files, which are written in plaintext |
@@ -151,7 +151,7 @@ mftp send [OPTIONS] <FILE> <DESTINATION>
 `DESTINATION` is either:
 - `host:port` — connect to an already-running `mftp receive`. The port must be reachable (UDP for QUIC, TCP for TCP+TLS).
 - `[user@]host:/remote/path` — launch the receiver via SSH (recommended). Falls back through QUIC → TCP+TLS → SFTP automatically.
-- `<name>` — a receiver advertised by name on the LAN (see `mftp daemon --name`); resolved via discovery, its Device ID auto-pinned.
+- `<name>` — a receiver advertised by name on the LAN (see `mftp daemon --name`); resolved via discovery to an address only. Announcements are unauthenticated, so the receiver is still verified via TOFU / `--trust`, or by `--trust-device <id>` (which also picks that device if several answer). Distinct devices answering for one name is an error.
 - `<device-id>` with `--rendezvous <broker>` — reach a NATed receiver by Device ID through a rendezvous broker.
 
 ```

@@ -535,27 +535,43 @@ async fn main() -> Result<()> {
             } else {
                 // Not host:port and not an SSH dest — treat it as a LAN name and
                 // resolve it via mftp discovery (M5).
-                let resolved = mftp::discovery::resolve(
+                //
+                // Announcements are unauthenticated multicast, so discovery only
+                // yields an address: the announced DeviceId is never pinned on
+                // its own say-so. With --trust-device we pick the responder
+                // announcing that id (and TLS enforces it); otherwise the
+                // receiver is verified like any host:port — via --trust or the
+                // TOFU fingerprint prompt/known_hosts.
+                let found = mftp::discovery::resolve_all(
                     &destination,
                     mftp::discovery::multicast_target(),
                     std::time::Duration::from_secs(3),
+                    std::time::Duration::from_millis(500),
                 )
                 .await
-                .with_context(|| format!("discovery for {destination:?}"))?
-                .with_context(|| {
-                    format!(
+                .with_context(|| format!("discovery for {destination:?}"))?;
+                if found.is_empty() {
+                    anyhow::bail!(
                         "no mftp receiver named {destination:?} found on the LAN \
                          (is `mftp daemon --name {destination}` running there?), and it is \
                          not a valid host:port or SSH destination"
-                    )
-                })?;
+                    );
+                }
+                let resolved = mftp::discovery::choose(
+                    &destination,
+                    &found,
+                    config.trusted_device.as_deref(),
+                )?;
                 eprintln!(
-                    "[mftp] resolved {destination:?} → {} (device {})",
+                    "[mftp] resolved {destination:?} → {} (announced device {})",
                     resolved.addr, resolved.device_id
                 );
-                // Auto-pin the discovered DeviceId unless the user pinned trust.
                 if config.trusted_fingerprint.is_none() && config.trusted_device.is_none() {
-                    config.trusted_device = Some(resolved.device_id);
+                    eprintln!(
+                        "[mftp] the announced device id is unauthenticated — verify the \
+                         receiver's fingerprint below (or pin it with --trust-device {})",
+                        resolved.device_id
+                    );
                 }
                 sender::send(file, resolved.addr, config).await
             }
