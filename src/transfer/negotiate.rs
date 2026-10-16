@@ -174,8 +174,7 @@ pub fn compute_target_streams(
         .filter(|s| s.in_flight_chunks >= max_in_flight * 3 / 4)
         .count();
     if saturated_tail >= 5 && current_streams > 2 {
-        let target = ((current_streams as u8).saturating_sub(2)).max(2);
-        return Some(target);
+        return Some(stream_count_u8(current_streams.saturating_sub(2).max(2)));
     }
 
     // Disk stall for ≥3 consecutive trailing samples.
@@ -186,12 +185,13 @@ pub fn compute_target_streams(
         .filter(|s| s.disk_stall_ms > 100)
         .count();
     if stall_tail >= 3 && current_streams > 2 {
-        let target = ((current_streams as u8).saturating_sub(2)).max(2);
-        return Some(target);
+        return Some(stream_count_u8(current_streams.saturating_sub(2).max(2)));
     }
 
     // ── Scale-up check ────────────────────────────────────────────────────
-    if current_streams >= cpu_cap {
+    // The wire carries stream counts as u8, so never recommend scaling up past
+    // 255 (a target that clamps below `current_streams` would be a scale-down).
+    if current_streams >= cpu_cap || current_streams >= u8::MAX as usize {
         return None;
     }
 
@@ -237,8 +237,14 @@ pub fn compute_target_streams(
     }
 
     // Recommend scaling up by 2 streams (capped at cpu_cap).
-    let target = ((current_streams + 2) as u8).min(cpu_cap as u8);
-    Some(target)
+    Some(stream_count_u8((current_streams + 2).min(cpu_cap)))
+}
+
+/// Convert a stream count to the u8 wire representation, clamped to
+/// `1..=u8::MAX`.  A bare `as u8` truncates (cpu_cap 256 → 0), and a target of
+/// 0 streams would stop every sender worker with chunks still queued.
+pub fn stream_count_u8(n: usize) -> u8 {
+    n.clamp(1, u8::MAX as usize) as u8
 }
 
 #[cfg(test)]
@@ -385,6 +391,20 @@ mod tests {
             .collect();
         let result = compute_target_streams(&samples, 6, 16, 100_000_000, None, None);
         assert_eq!(result, Some(4), "should scale down by 2");
+    }
+
+    #[test]
+    fn huge_cpu_cap_never_truncates_to_zero() {
+        // cpu_cap 256 used to become `256 as u8 == 0`, recommending 0 streams.
+        let samples: Vec<_> = (0..5).map(|i| make_sample(i * 10_000_000, 0, 0)).collect();
+        let result = compute_target_streams(&samples, 254, 256, 100_000_000, None, None);
+        assert_eq!(result, Some(255));
+        // At the u8 ceiling, no further scale-up (would wrap or shrink).
+        let result = compute_target_streams(&samples, 255, 512, 100_000_000, None, None);
+        assert_eq!(result, None);
+        assert_eq!(stream_count_u8(0), 1);
+        assert_eq!(stream_count_u8(256), 255);
+        assert_eq!(stream_count_u8(300), 255);
     }
 
     #[test]

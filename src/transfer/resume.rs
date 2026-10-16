@@ -11,8 +11,11 @@
 //! [N bytes]  bincode-serialised ResumeData { transfer_id, total_chunks, received }
 //! ```
 //!
-//! The file is written atomically: data is written to `<path>.tmp` then
-//! renamed to `<path>`, so a crash during save never produces a corrupt file.
+//! The file is written atomically: data is written to a uniquely named
+//! `<path>.<pid>.<seq>.tmp` then renamed to `<path>`, so a crash during save
+//! never produces a corrupt file and concurrent snapshot writers (several
+//! stream workers can cross the batch threshold at once) never share — and
+//! race on — one temp file.
 //! On completion the resume file is deleted.
 //!
 //! The atomic rename guards against torn writes, but not against on-disk bit-rot
@@ -22,6 +25,10 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process sequence for unique snapshot temp-file names.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Number of chunks to accumulate before flushing the resume file to disk.
 ///
@@ -66,19 +73,42 @@ pub struct ResumeSnapshot {
 }
 
 impl ResumeSnapshot {
-    /// Atomically persist the snapshot: write to `<path>.tmp`, fsync, rename.
+    /// Atomically persist the snapshot: write to a unique temp file, fsync,
+    /// rename over `<path>`.
+    ///
+    /// Concurrent writers may finish in any order, so an older snapshot can
+    /// land last and briefly under-report received chunks.  That is safe: a
+    /// chunk missing from the resume file is merely re-fetched.
     pub fn write_to_disk(&self) -> Result<()> {
-        let tmp = self.path.with_extension("tmp");
-        {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .path
+            .with_extension(format!("{}.{seq}.tmp", std::process::id()));
+        let res = (|| -> Result<()> {
             let mut f =
                 std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
             f.write_all(&self.payload)
                 .context("write resume snapshot")?;
             f.sync_data().context("fsync resume snapshot")?;
+            std::fs::rename(&tmp, &self.path)
+                .with_context(|| format!("rename resume file to {}", self.path.display()))
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("rename resume file to {}", self.path.display()))?;
-        Ok(())
+        res
+    }
+
+    /// Like [`write_to_disk`](Self::write_to_disk) but only logs a failure.
+    ///
+    /// For the periodic in-transfer saves: correctness never depends on the
+    /// resume file being current (the end-of-transfer hash catches any gap),
+    /// so a transient save error (e.g. ENOSPC on the state file) must not
+    /// abort an otherwise healthy transfer.
+    pub fn write_to_disk_best_effort(&self) {
+        if let Err(e) = self.write_to_disk() {
+            tracing::warn!("failed to save resume state (continuing): {e:#}");
+        }
     }
 }
 
@@ -194,6 +224,12 @@ impl ResumeState {
     }
 
     pub fn mark_received(&mut self, chunk_index: u64) {
+        // Callers validate indices against the manifest; never panic on a
+        // stray out-of-range one.
+        if chunk_index >= self.total_chunks {
+            debug_assert!(false, "mark_received({chunk_index}) out of range");
+            return;
+        }
         let word = (chunk_index / 64) as usize;
         let bit = chunk_index % 64;
         self.received[word] |= 1 << bit;
@@ -312,6 +348,33 @@ mod tests {
         assert!(loaded.is_received(63));
         assert!(loaded.is_received(199));
         assert!(!loaded.is_received(1));
+    }
+
+    #[test]
+    fn concurrent_snapshot_writers_do_not_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = [3u8; 16];
+        let mut s = ResumeState::new(dir.path(), &id, 128);
+        s.mark_received(1);
+        let snaps: Vec<_> = (0..8).map(|_| s.snapshot().unwrap()).collect();
+        std::thread::scope(|sc| {
+            for snap in &snaps {
+                sc.spawn(move || {
+                    for _ in 0..20 {
+                        snap.write_to_disk().expect("concurrent snapshot write");
+                    }
+                });
+            }
+        });
+        let loaded = ResumeState::try_load(dir.path(), &id, 128).unwrap();
+        assert!(loaded.is_received(1));
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     }
 
     #[test]

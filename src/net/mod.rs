@@ -13,6 +13,8 @@
 //! to raise it further on very-high-BDP links (after raising the sysctl caps).
 
 pub mod connection;
+#[doc(hidden)]
+pub mod natsim;
 pub mod tcp;
 
 /// Default UDP/TCP socket buffer target: 64 MiB (~500 ms RTT at 1 Gbps BDP).

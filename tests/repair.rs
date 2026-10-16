@@ -49,10 +49,13 @@ async fn transfer_ok(
         compress: false,
         compress_level: 3,
         trusted_fingerprint: Some(fingerprint),
+        trusted_device: None,
+        client_identity: None,
         forced_transport: None,
         tcp_rtt_threshold: std::time::Duration::ZERO,
         fec,
         parallel_reads: false,
+        paths: 1,
         recursive: false,
         preserve: false,
     };
@@ -137,10 +140,13 @@ async fn incremental_repair_end_to_end() {
             compress: false,
             compress_level: 3,
             trusted_fingerprint: Some(fingerprint),
+            trusted_device: None,
+            client_identity: None,
             forced_transport: None,
             tcp_rtt_threshold: std::time::Duration::ZERO,
             fec: None,
             parallel_reads: false,
+            paths: 1,
             recursive: true,
             preserve: false,
         };
@@ -163,6 +169,23 @@ async fn incremental_repair_end_to_end() {
                 "content mismatch for {rel:?} after directory repair"
             );
         }
+        test_hooks::clear();
+    }
+
+    // ── Scenario 4: an early drop on a transfer with more chunks than the
+    // inline hasher's pending cap (256) ────────────────────────────────────
+    // Chunk 0 never reaches the strict in-order ChunkHasher (it only returns via
+    // repair), so every later chunk used to pile up as "pending" until the cap
+    // tripped and the receiver failed fatally — never reaching repair.  The
+    // hasher must now be abandoned (falling back to a from-disk hash).
+    {
+        test_hooks::clear();
+        const SMALL: usize = 4 * 1024; // receiver's MIN_CHUNK_SIZE
+        let dir = TempDir::new().unwrap();
+        let recv = TempDir::new().unwrap();
+        let src = make_file(dir.path(), "many.bin", SMALL * 600);
+        test_hooks::drop_chunks_once(&[0]);
+        transfer_ok(&src, &recv, 2, SMALL, None).await;
         test_hooks::clear();
     }
 }

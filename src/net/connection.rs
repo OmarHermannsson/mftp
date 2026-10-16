@@ -216,6 +216,135 @@ pub fn make_server_endpoint(bind_addr: SocketAddr) -> Result<(Endpoint, String)>
     Ok((endpoint, fingerprint))
 }
 
+/// A live, reloadable set of authorized peer DeviceIds shared between the daemon
+/// and the running TLS verifier.
+///
+/// The verifier reads the *current* contents on every handshake, so the daemon
+/// can swap the set in place (on SIGHUP) and have it take effect for subsequent
+/// connections without rebuilding the endpoint. Cheap to clone (an `Arc`).
+#[derive(Clone, Debug, Default)]
+pub struct ReloadableAllowlist {
+    set: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl ReloadableAllowlist {
+    pub fn new(ids: Vec<String>) -> Self {
+        ReloadableAllowlist {
+            set: Arc::new(std::sync::RwLock::new(Self::normalize(ids))),
+        }
+    }
+
+    fn normalize(ids: Vec<String>) -> std::collections::HashSet<String> {
+        ids.into_iter().map(|s| s.trim().to_lowercase()).collect()
+    }
+
+    /// Replace the entire authorized set (the SIGHUP-reload operation).
+    pub fn replace(&self, ids: Vec<String>) {
+        *self.set.write().expect("allowlist lock poisoned") = Self::normalize(ids);
+    }
+
+    /// True when no peer is authorized — auth is *open* (any/no client cert).
+    pub fn is_empty(&self) -> bool {
+        self.set.read().expect("allowlist lock poisoned").is_empty()
+    }
+
+    /// Number of currently authorized peers.
+    pub fn len(&self) -> usize {
+        self.set.read().expect("allowlist lock poisoned").len()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set
+            .read()
+            .expect("allowlist lock poisoned")
+            .contains(id)
+    }
+}
+
+/// Verifies an incoming client certificate by its Ed25519 DeviceId against a
+/// [`ReloadableAllowlist`] (M4 daemon identity auth).
+///
+/// When the allowlist is non-empty, mutual TLS is mandatory and a client whose
+/// DeviceId is not listed — or that presents no Ed25519 key — is rejected at the
+/// handshake. When the allowlist is empty the daemon is *open*: client auth is
+/// not mandatory, so a sender without an identity still connects (and any cert
+/// that is presented is accepted). This lets SIGHUP flip a daemon between open
+/// and enforced without a restart.
+#[derive(Debug)]
+pub struct DeviceAllowlistVerifier {
+    authorized: ReloadableAllowlist,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl DeviceAllowlistVerifier {
+    pub fn new(authorized: Vec<String>) -> Self {
+        Self::from_allowlist(ReloadableAllowlist::new(authorized))
+    }
+
+    pub fn from_allowlist(authorized: ReloadableAllowlist) -> Self {
+        DeviceAllowlistVerifier {
+            authorized,
+            supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for DeviceAllowlistVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    /// When the allowlist is empty the daemon is open: don't require a client
+    /// certificate (senders without an identity must still connect).
+    fn client_auth_mandatory(&self) -> bool {
+        !self.authorized.is_empty()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Open mode (empty allowlist): accept whatever cert was presented.
+        if self.authorized.is_empty() {
+            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
+        let id = crate::identity::device_id_from_cert(end_entity).ok_or_else(|| {
+            rustls::Error::General("client certificate has no Ed25519 device key".into())
+        })?;
+        if self.authorized.contains(&id) {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(format!(
+                "client device {id} is not authorized"
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
 // ── Server (shared cert) ──────────────────────────────────────────────────────
 
 /// Bind a QUIC server endpoint using a pre-generated certificate.
@@ -227,13 +356,62 @@ pub fn make_server_endpoint_with_cert(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint> {
+    make_server_endpoint_with_cert_auth(bind_addr, cert, key, None)
+}
+
+/// Like [`make_server_endpoint_with_cert`], but when `authorized` is
+/// `Some(list)` the server requires mutual TLS and only accepts senders whose
+/// Ed25519 DeviceId is in `list` (M4 daemon identity auth). `None` is open:
+/// client certs are optional (but verified when presented).
+pub fn make_server_endpoint_with_cert_auth(
+    bind_addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    authorized: Option<Vec<String>>,
+) -> Result<Endpoint> {
     install_crypto_provider();
 
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .context("failed to build rustls server config")?;
+    let builder = rustls::ServerConfig::builder();
+    let server_crypto = match authorized {
+        Some(list) => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config (client auth)")?,
+        // Open: client auth optional, but a presented identity is still
+        // verified (proof of key possession) so the receiver can tell a
+        // reconnecting sender from a stranger.
+        None => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(Vec::new())))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config")?,
+    };
+    finalize_server_endpoint(bind_addr, server_crypto)
+}
 
+/// Like [`make_server_endpoint_with_cert_auth`], but the DeviceId allowlist is a
+/// live [`ReloadableAllowlist`] the daemon can update in place (SIGHUP reload).
+/// The verifier is always installed: an empty allowlist is *open* (client auth
+/// not mandatory), a non-empty one enforces — see [`DeviceAllowlistVerifier`].
+pub fn make_server_endpoint_with_reloadable_auth(
+    bind_addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    allowlist: ReloadableAllowlist,
+) -> Result<Endpoint> {
+    install_crypto_provider();
+    let server_crypto = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::from_allowlist(allowlist)))
+        .with_single_cert(vec![cert], key)
+        .context("failed to build rustls server config (reloadable client auth)")?;
+    finalize_server_endpoint(bind_addr, server_crypto)
+}
+
+/// Wrap a finished rustls server config into a bound QUIC endpoint with the
+/// shared receiver transport settings.
+fn finalize_server_endpoint(
+    bind_addr: SocketAddr,
+    server_crypto: rustls::ServerConfig,
+) -> Result<Endpoint> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
@@ -241,10 +419,11 @@ pub fn make_server_endpoint_with_cert(
 
     let socket = make_udp_socket(bind_addr)?;
     let runtime = quinn::default_runtime().context("no async runtime")?;
-    let endpoint = Endpoint::new(
+    let abstract_socket = test_support::maybe_wrap(runtime.wrap_udp_socket(socket)?);
+    let endpoint = Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server_config),
-        socket,
+        abstract_socket,
         runtime,
     )?;
 
@@ -259,18 +438,28 @@ pub fn make_server_endpoint_with_cert(
 /// the user is prompted on the first connection to a new server.
 pub fn make_client_endpoint(
     trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    client_identity: Option<&crate::identity::Identity>,
     server_addr: SocketAddr,
 ) -> Result<Endpoint> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
-        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-        None => Arc::new(TofuVerifier::new(server_addr)),
-    };
+    let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
 
-    let client_crypto = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(verifier);
+    // Present our device identity as a client certificate so daemons enforcing
+    // DeviceId auth can verify us. A server that doesn't request client auth
+    // never asks for it, so this is invisible to non-auth receivers.
+    let client_crypto = match client_identity {
+        Some(id) => builder
+            .with_client_auth_cert(
+                vec![id.cert.clone()],
+                make_private_key(id.key_bytes.clone())?,
+            )
+            .context("attach client identity certificate")?,
+        None => builder.with_no_client_auth(),
+    };
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
@@ -279,8 +468,25 @@ pub fn make_client_endpoint(
 
     let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let socket = make_udp_socket(bind)?;
+    // Connecting through a token-gated relay: claim the sender slot from this
+    // exact socket before quinn's first Initial. Sent a few times since UDP may
+    // drop it; the relay consumes duplicates. A lost/reordered claim only costs
+    // a QUIC Initial retransmit.
+    if let Some(claim) = crate::reach::relay::client_claim_for(server_addr) {
+        for _ in 0..3 {
+            if let Err(e) = socket.send_to(&claim, server_addr) {
+                debug!("relay claim to {server_addr} not sent: {e}");
+            }
+        }
+    }
     let runtime = quinn::default_runtime().context("no async runtime")?;
-    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
+    let abstract_socket = test_support::maybe_wrap(runtime.wrap_udp_socket(socket)?);
+    let mut endpoint = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        abstract_socket,
+        runtime,
+    )?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
@@ -309,6 +515,121 @@ fn make_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
+}
+
+// ── Test-only network-loss injection ──────────────────────────────────────────
+
+/// Process-global packet-loss injection for testing transfer correctness under
+/// a lossy link without a remote host + `tc netem`.
+///
+/// When armed via [`set_send_loss`], every QUIC endpoint built afterwards wraps
+/// its UDP socket in a [`LossySocket`] that deterministically drops 1 of every
+/// `denom` outbound datagrams (after a short warm-up so the handshake starts
+/// cleanly).  Dropping is on the send path — quinn believes the datagram was
+/// sent, so its normal loss recovery retransmits it, exactly as for a datagram
+/// lost in the network.  Production never arms the knob, so the only cost on the
+/// hot path is nil (the wrapper is bypassed) and at endpoint-construction time a
+/// single relaxed atomic load.  Hidden from docs; mirrors the receiver's
+/// `test_hooks` pattern.
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+    use quinn::udp::{RecvMeta, Transmit};
+    use quinn::{AsyncUdpSocket, UdpPoller};
+    use std::io::{self, IoSliceMut};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::{Context, Poll};
+
+    /// Drop 1 of every `DENOM` datagrams; 0 disables injection.
+    static SEND_LOSS_DENOM: AtomicU64 = AtomicU64::new(0);
+    /// First few datagrams per socket are never dropped, so the QUIC handshake
+    /// reliably gets underway before loss begins.
+    const WARMUP: u64 = 16;
+
+    /// Arm loss injection: every subsequently-built endpoint drops 1 of every
+    /// `denom` outbound datagrams.  `denom == 0` disables it.
+    pub fn set_send_loss(denom: u64) {
+        SEND_LOSS_DENOM.store(denom, Ordering::Relaxed);
+    }
+
+    /// Disarm loss injection.
+    pub fn clear() {
+        SEND_LOSS_DENOM.store(0, Ordering::Relaxed);
+    }
+
+    /// Wrap `socket` in a [`LossySocket`] iff loss injection is currently armed;
+    /// otherwise return it unchanged.  Called by the endpoint constructors.
+    pub(crate) fn maybe_wrap(socket: Arc<dyn AsyncUdpSocket>) -> Arc<dyn AsyncUdpSocket> {
+        let denom = SEND_LOSS_DENOM.load(Ordering::Relaxed);
+        if denom == 0 {
+            socket
+        } else {
+            Arc::new(LossySocket {
+                inner: socket,
+                denom,
+                sent: AtomicU64::new(0),
+            })
+        }
+    }
+
+    /// An [`AsyncUdpSocket`] that forwards to an inner socket but silently drops
+    /// a deterministic fraction of outbound datagrams.
+    #[derive(Debug)]
+    struct LossySocket {
+        inner: Arc<dyn AsyncUdpSocket>,
+        denom: u64,
+        sent: AtomicU64,
+    }
+
+    impl LossySocket {
+        fn should_drop(&self) -> bool {
+            let n = self.sent.fetch_add(1, Ordering::Relaxed);
+            n >= WARMUP && (n - WARMUP).is_multiple_of(self.denom)
+        }
+    }
+
+    impl AsyncUdpSocket for LossySocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+            if self.should_drop() {
+                // Report success without transmitting: the datagram is "lost"
+                // and quinn's loss recovery will retransmit it.
+                return Ok(());
+            }
+            self.inner.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        // Force one datagram per send so the drop fraction is per-datagram
+        // (disables GSO batching — irrelevant for tests).
+        fn max_transmit_segments(&self) -> usize {
+            1
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            self.inner.max_receive_segments()
+        }
+
+        fn may_fragment(&self) -> bool {
+            self.inner.may_fragment()
+        }
+    }
 }
 
 // ── TLS certificate helpers ───────────────────────────────────────────────────
@@ -341,27 +662,63 @@ pub fn make_server_tls_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig> {
+    make_server_tls_config_auth(cert, key, None)
+}
+
+/// Like [`make_server_tls_config`], but when `authorized` is `Some(list)` the
+/// client must present a certificate whose DeviceId is in `list` (the TCP
+/// counterpart of [`make_server_endpoint_with_cert_auth`]).
+pub fn make_server_tls_config_auth(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    authorized: Option<Vec<String>>,
+) -> Result<rustls::ServerConfig> {
     install_crypto_provider();
-    rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .context("failed to build rustls server config")
+    let builder = rustls::ServerConfig::builder();
+    match authorized {
+        Some(list) => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config (client auth)"),
+        // Open: client auth optional (see make_server_endpoint_with_cert_auth).
+        None => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(Vec::new())))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config"),
+    }
 }
 
 /// Build a rustls `ClientConfig` for the TCP+TLS path (no QUIC-specific settings).
 pub fn make_client_tls_config(
     trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
     server_addr: SocketAddr,
 ) -> Result<rustls::ClientConfig> {
+    make_client_tls_config_with_identity(trusted_fingerprint, trusted_device, server_addr, None)
+}
+
+/// Like [`make_client_tls_config`], presenting `client_identity` (if any) as a
+/// client certificate for receivers that enforce DeviceId auth.
+pub fn make_client_tls_config_with_identity(
+    trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    server_addr: SocketAddr,
+    client_identity: Option<&crate::identity::Identity>,
+) -> Result<rustls::ClientConfig> {
     install_crypto_provider();
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trusted_fingerprint {
-        Some(fp) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
-        None => Arc::new(TofuVerifier::new(server_addr)),
-    };
-    Ok(rustls::ClientConfig::builder()
+    let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
+        .with_custom_certificate_verifier(verifier);
+    Ok(match client_identity {
+        Some(id) => builder
+            .with_client_auth_cert(
+                vec![id.cert.clone()],
+                make_private_key(id.key_bytes.clone())?,
+            )
+            .context("attach client identity certificate")?,
+        None => builder.with_no_client_auth(),
+    })
 }
 
 // ── Certificate verifiers ─────────────────────────────────────────────────────
@@ -393,7 +750,9 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = cert_fingerprint(end_entity);
-        match load_known_host(self.server_addr) {
+        let known = load_known_host(self.server_addr)
+            .map_err(|e| rustls::Error::General(format!("{e:#}")))?;
+        match known {
             Some(known_fp) => {
                 if fp != known_fp {
                     return Err(rustls::Error::General(format!(
@@ -547,6 +906,106 @@ impl rustls::client::danger::ServerCertVerifier for PinnedFingerprintVerifier {
     }
 }
 
+/// Accepts only a certificate whose Ed25519 DeviceId matches a pre-shared value.
+///
+/// Unlike [`PinnedFingerprintVerifier`] (which pins the whole certificate),
+/// this pins the device's public key, so it keeps matching even if the device
+/// re-issues its certificate. The DeviceId is the hex SHA-256 of the cert's
+/// Ed25519 SubjectPublicKeyInfo (see [`crate::identity::device_id_from_cert`]).
+#[derive(Debug)]
+struct PinnedDeviceVerifier {
+    expected: String,
+}
+
+impl PinnedDeviceVerifier {
+    fn new(device_id: &str) -> Result<Self> {
+        let normalized = normalize_fingerprint(device_id);
+        if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!(
+                "invalid --trust-device id (expected 64 hex chars, got {} usable): {device_id:?}",
+                normalized.len()
+            );
+        }
+        Ok(Self {
+            expected: normalized,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedDeviceVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let got = crate::identity::device_id_from_cert(end_entity).ok_or_else(|| {
+            rustls::Error::General(
+                "peer certificate has no Ed25519 device key — cannot match --trust-device".into(),
+            )
+        })?;
+        if got != self.expected {
+            return Err(rustls::Error::General(format!(
+                "device id mismatch\n  got:      {got}\n  expected: {}",
+                self.expected
+            )));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build the client-side certificate verifier from the trust options.
+///
+/// Precedence: a pinned DeviceId (`--trust-device`) wins over a pinned cert
+/// fingerprint (`--trust`), which wins over interactive TOFU.
+fn build_client_verifier(
+    trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    server_addr: SocketAddr,
+) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>> {
+    Ok(match (trusted_device, trusted_fingerprint) {
+        (Some(dev), _) => Arc::new(PinnedDeviceVerifier::new(dev)?),
+        (None, Some(fp)) => Arc::new(PinnedFingerprintVerifier::new(fp)?),
+        (None, None) => Arc::new(TofuVerifier::new(server_addr)),
+    })
+}
+
 // ── TOFU known-hosts helpers ──────────────────────────────────────────────────
 
 fn known_hosts_path() -> Option<PathBuf> {
@@ -555,26 +1014,67 @@ fn known_hosts_path() -> Option<PathBuf> {
 }
 
 /// Look up the stored fingerprint for `addr` in `~/.config/mftp/known_hosts`.
-fn load_known_host(addr: SocketAddr) -> Option<String> {
-    let path = known_hosts_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
+///
+/// `Ok(None)` means "never seen" (no file, no `$HOME`, or no entry) and leads
+/// to a TOFU prompt.  Anything that makes the stored trust *unknowable* — an
+/// unreadable file, or a malformed entry for this very address — is an error,
+/// so a damaged file can never silently downgrade a pinned host back to
+/// first-use prompting.  See [`parse_known_host`].
+fn load_known_host(addr: SocketAddr) -> Result<Option<String>> {
+    let Some(path) = known_hosts_path() else {
+        return Ok(None);
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    parse_known_host(&content, addr)
+}
+
+/// Find `addr`'s fingerprint in known_hosts `content` (`<addr> <fp>` lines,
+/// any whitespace, `#` comments).
+///
+/// Malformed lines are handled consistently: a malformed line for **this**
+/// address (missing or non-hex fingerprint, extra fields) is an error; a
+/// malformed line for another address is skipped with a warning.  The first
+/// well-formed entry for the address wins.
+fn parse_known_host(content: &str, addr: SocketAddr) -> Result<Option<String>> {
     let key = addr.to_string();
-    for line in content.lines() {
+    for (i, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(2, ' ');
-        if parts.next()? == key {
-            return Some(parts.next()?.trim().to_owned());
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let well_formed = fields.len() == 2
+            && fields[1].len() == 64
+            && fields[1].bytes().all(|b| b.is_ascii_hexdigit());
+        if fields[0] != key {
+            if !well_formed {
+                tracing::warn!(
+                    "~/.config/mftp/known_hosts line {}: malformed entry — skipped",
+                    i + 1
+                );
+            }
+            continue;
         }
+        if !well_formed {
+            bail!(
+                "~/.config/mftp/known_hosts line {}: malformed entry for {key} \
+                 (expected `<addr> <64-hex fingerprint>`); fix or remove it",
+                i + 1
+            );
+        }
+        return Ok(Some(fields[1].to_ascii_lowercase()));
     }
-    None
+    Ok(None)
 }
 
 /// Append an `addr fingerprint` entry to `~/.config/mftp/known_hosts`.
 fn store_known_host(addr: SocketAddr, fp: &str) {
     let Some(path) = known_hosts_path() else {
+        tracing::warn!("$HOME is not set — not remembering the fingerprint for {addr}");
         return;
     };
     if let Some(parent) = path.parent() {
@@ -595,8 +1095,12 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
         .create(true)
         .append(true)
         .open(&path);
-    if let Ok(mut f) = file {
-        let _ = writeln!(f, "{addr} {fp}");
+    match file.and_then(|mut f| writeln!(f, "{addr} {fp}")) {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(
+            "could not record fingerprint for {addr} in {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -647,6 +1151,28 @@ mod tests {
     }
 
     #[test]
+    fn known_host_parsing_is_strict_for_own_address() {
+        let addr: SocketAddr = "10.0.0.5:4433".parse().unwrap();
+        let fp = "AB".repeat(32);
+        // Tabs, comments, unrelated junk lines are fine; result is lowercased.
+        let ok = format!("# c\n10.0.0.9:1 garbage here\n10.0.0.5:4433\t{fp}\n");
+        assert_eq!(
+            parse_known_host(&ok, addr).unwrap(),
+            Some(fp.to_ascii_lowercase())
+        );
+        // No entry → None (TOFU prompt).
+        assert_eq!(parse_known_host("10.0.0.6:1 ab\n", addr).unwrap(), None);
+        // Address present but no / bad fingerprint → error, never a re-prompt.
+        for bad in [
+            "10.0.0.5:4433\n",
+            "10.0.0.5:4433 deadbeef\n",
+            &format!("10.0.0.5:4433 {fp} extra\n"),
+        ] {
+            assert!(parse_known_host(bad, addr).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn congestion_controller_selection_does_not_panic() {
         // Exercises all MFTP_CC branches: each must construct a valid
         // TransportConfig without panicking.  (Env var is process-global, so we
@@ -683,6 +1209,182 @@ mod tests {
         assert!(
             (w as i64 - expected as i64).unsigned_abs() < expected / 10,
             "window {w} should be close to {expected}"
+        );
+    }
+
+    // ── Hole-punching feasibility spike (M6) ───────────────────────────────────
+    //
+    // De-risks the make-or-break question before building NAT traversal: can we
+    // (1) send raw "punch" datagrams on a UDP socket and then run a quinn
+    // connection over that *same* socket, and (2) does quinn's server tolerate a
+    // non-QUIC datagram (the peer's punch probe) arriving on its socket before
+    // the handshake? Both are required because hole-punching must open the NAT
+    // mapping on the exact socket/port quinn will use, and probes from the peer
+    // will land on quinn's socket during the punch.
+
+    /// Build a quinn **server** endpoint on an already-created (possibly
+    /// pre-probed) socket — the seam the real feature needs to run QUIC over a
+    /// punched mapping.
+    fn server_endpoint_on(
+        socket: std::net::UdpSocket,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+    ) -> Endpoint {
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        let mut sc = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        sc.transport_config(receiver_transport());
+        let runtime = quinn::default_runtime().unwrap();
+        Endpoint::new(quinn::EndpointConfig::default(), Some(sc), socket, runtime).unwrap()
+    }
+
+    /// Build a quinn **client** endpoint on an already-created (pre-probed) socket,
+    /// pinning the server's cert fingerprint.
+    fn client_endpoint_on(socket: std::net::UdpSocket, fingerprint: &str) -> Endpoint {
+        let runtime = quinn::default_runtime().unwrap();
+        let abstract_socket = runtime.wrap_udp_socket(socket).unwrap();
+        client_endpoint_on_abstract(abstract_socket, fingerprint)
+    }
+
+    /// Like [`client_endpoint_on`], but over an arbitrary abstract socket — e.g. a
+    /// `natsim::NatSocket` so the client runs behind a simulated NAT.
+    fn client_endpoint_on_abstract(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        fingerprint: &str,
+    ) -> Endpoint {
+        let verifier = Arc::new(PinnedFingerprintVerifier::new(fingerprint).unwrap());
+        let client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let mut cc = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        cc.transport_config(sender_transport());
+        let runtime = quinn::default_runtime().unwrap();
+        let mut ep = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .unwrap();
+        ep.set_default_client_config(cc);
+        ep
+    }
+
+    #[tokio::test]
+    async fn holepunch_spike_quinn_runs_over_pre_probed_socket() {
+        install_crypto_provider();
+        let (cert, key_bytes) = generate_self_signed_cert().unwrap();
+        let fingerprint = cert_fingerprint(&cert);
+
+        // ── Receiver: quinn server on its own socket, accepting one connection. ──
+        let recv_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let server = server_endpoint_on(recv_sock, cert, make_private_key(key_bytes).unwrap());
+        let accept = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 5];
+            recv.read_exact(&mut buf).await.unwrap();
+            send.write_all(b"pong").await.unwrap();
+            send.finish().unwrap();
+            // Wait for the client to close (after it has read the reply) so the
+            // finished stream is flushed before this task — and the endpoint —
+            // drop.
+            conn.closed().await;
+            buf
+        });
+
+        // ── Sender: pre-probe on its socket, then run quinn over that same one. ──
+        let send_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        // (1) Raw "punch" probe from the exact socket quinn will use. In a real
+        // NAT this opens the mapping; here it also (2) exercises the receiver's
+        // quinn server tolerating a non-QUIC datagram before the handshake.
+        send_sock
+            .send_to(b"\x00\x01mftp-punch-probe", recv_addr)
+            .expect("raw probe send");
+
+        let client = client_endpoint_on(send_sock, &fingerprint);
+        let conn = client.connect(recv_addr, "mftp").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong", "handshake + data survived punch-then-QUIC");
+
+        // Reply received → close the client connection, which releases the
+        // server's `closed().await` above (avoids a teardown deadlock).
+        conn.close(0u32.into(), b"done");
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("server task finishes promptly after client close")
+            .unwrap();
+        assert_eq!(
+            &got, b"hello",
+            "server received the payload despite a pre-handshake junk datagram"
+        );
+    }
+
+    /// Phase 0b: a real QUIC connection survives running over the NAT simulator —
+    /// the client endpoint sits behind a full-cone `NatSocket`, so its traffic is
+    /// re-sourced through the NAT's mapped external address and the receiver's
+    /// replies come back through it.
+    #[tokio::test]
+    async fn natsim_carries_quic_through_a_cone_nat() {
+        use crate::net::natsim::{NatPolicy, NatSocket};
+
+        install_crypto_provider();
+        let (cert, key_bytes) = generate_self_signed_cert().unwrap();
+        let fingerprint = cert_fingerprint(&cert);
+
+        // Receiver on a plain socket.
+        let recv_sock = make_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let recv_addr = recv_sock.local_addr().unwrap();
+        let server = server_endpoint_on(recv_sock, cert, make_private_key(key_bytes).unwrap());
+        let accept = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+            let mut buf = [0u8; 5];
+            recv.read_exact(&mut buf).await.unwrap();
+            send.write_all(b"pong").await.unwrap();
+            send.finish().unwrap();
+            conn.closed().await;
+            // The receiver sees the connection coming from the NAT's external
+            // (mapped) address, not the client's synthetic internal one.
+            (buf, conn.remote_address())
+        });
+
+        // Client behind a full-cone NAT.
+        let nat = Arc::new(NatSocket::new(NatPolicy::full_cone()));
+        let client = client_endpoint_on_abstract(nat, &fingerprint);
+        let conn = client.connect(recv_addr, "mftp").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong", "QUIC data round-trips through the cone NAT");
+        conn.close(0u32.into(), b"done");
+
+        let (got, remote) = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("server task finishes promptly")
+            .unwrap();
+        assert_eq!(&got, b"hello");
+        // The remote address the receiver observed is a NAT external port, not the
+        // client's 127.0.0.2:4xxxx synthetic internal address.
+        assert_ne!(
+            remote.ip().to_string(),
+            "127.0.0.2",
+            "receiver should see the NAT's mapped address, not the internal one"
         );
     }
 }

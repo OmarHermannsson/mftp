@@ -42,27 +42,59 @@ pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>
     }
 }
 
-/// Allocate a `len`-byte buffer and fill it from `file` at `offset` via
-/// [`read_exact_at`], **without** first zeroing it.
+/// Allocate a `len`-byte buffer and fill it from `file` at `offset`,
+/// **without** first zeroing it.
 ///
-/// [`read_exact_at`] writes exactly `len` bytes or returns an error, so on the
-/// `Ok` path the buffer is fully initialised. This skips the redundant
-/// `vec![0u8; len]` zero-fill that the read immediately overwrites — a
-/// measurable slice of sender CPU on fast links (~10% in profiling, plus the
-/// allocator's zeroing).
+/// This skips the redundant `vec![0u8; len]` zero-fill that the read
+/// immediately overwrites — a measurable slice of sender CPU on fast links
+/// (~10% in profiling, plus the allocator's zeroing).
+///
+/// On Unix the bytes are read with `pread(2)` straight into the vector's
+/// spare capacity through a raw pointer, and the length is only extended over
+/// bytes the kernel reported as written — so no `&mut [u8]` ever covers
+/// uninitialised memory (which would be UB even if never read).  Other
+/// platforms fall back to a zeroed buffer + [`read_exact_at`].
 pub fn read_exact_at_vec(file: &File, len: usize, offset: u64) -> io::Result<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(len);
-    // SAFETY: we extend the length to the capacity just reserved, then fill
-    // every one of those `len` bytes via `read_exact_at` before the buffer is
-    // read or returned. `u8` is `Copy` with no `Drop`, so even the early-return
-    // error path drops the (partially written) buffer without reading it — no
-    // uninitialised memory is ever observed.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        buf.set_len(len);
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        let fd = file.as_raw_fd();
+        while buf.len() < len {
+            let filled = buf.len();
+            let spare = buf.spare_capacity_mut();
+            let want = (len - filled).min(isize::MAX as usize);
+            let off = offset
+                .checked_add(filled as u64)
+                .and_then(|o| libc::off_t::try_from(o).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+            // SAFETY: `spare` points at ≥ `want` writable (possibly uninit)
+            // bytes owned by `buf`; pread only writes into them.
+            let n = unsafe { libc::pread(fd, spare.as_mut_ptr().cast(), want, off) };
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            // SAFETY: the kernel initialised exactly `n` more bytes (n ≤ want).
+            unsafe { buf.set_len(filled + n as usize) };
+        }
+        Ok(buf)
     }
-    read_exact_at(file, &mut buf, offset)?;
-    Ok(buf)
+    #[cfg(not(unix))]
+    {
+        let mut buf = vec![0u8; len];
+        read_exact_at(file, &mut buf, offset)?;
+        Ok(buf)
+    }
 }
 
 /// Bytes available to an unprivileged process on the filesystem holding `path`
@@ -166,9 +198,9 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 /// `FADV_DONTNEED` only after a lookahead number of later writes, by which time
 /// the earlier writeback is reliably in flight.
 ///
-/// This function is kept for call sites that open a fresh fd per write (e.g.
-/// scatter-writes in directory mode), where a shared deferred tracker is not
-/// practical.
+/// This function is kept for call sites that open a fresh fd per write, where
+/// a deferred tracker bound to the fd is not practical.  (Directory-mode
+/// scatter-writes now keep handles open and use the deferred variant.)
 ///
 /// On macOS: identical to `write_all_at`; callers should set `F_NOCACHE` on
 /// the fd at open time to achieve an equivalent effect for the whole file.

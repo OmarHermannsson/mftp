@@ -136,6 +136,13 @@ pub struct SendConfig {
     pub compress_level: i32,
     /// Hex SHA-256 fingerprint to pin; None = TOFU (prints fingerprint, asks user).
     pub trusted_fingerprint: Option<String>,
+    /// Hex Ed25519 DeviceId to pin (`--trust-device`); takes precedence over
+    /// `trusted_fingerprint`. Survives the peer re-issuing its certificate.
+    pub trusted_device: Option<String>,
+    /// This sender's device identity, presented as a client certificate so a
+    /// daemon enforcing DeviceId auth can verify us (M4). `None` = present no
+    /// client cert (classic). Only used on the QUIC path.
+    pub client_identity: Option<crate::identity::Identity>,
     /// Force a specific transport path; `None` = auto (QUIC → TCP+TLS → SFTP).
     pub forced_transport: Option<ForcedTransport>,
     /// In auto mode, switch to TCP+TLS when measured RTT is at or below this
@@ -149,6 +156,12 @@ pub struct SendConfig {
     /// Only measurable on local NVMe with queue-depth ≥ 32; no benefit on
     /// network-bound transfers or spinning disks.
     pub parallel_reads: bool,
+    /// Number of independent QUIC connections (paths) to bond for the transfer.
+    /// `1` (default) is the classic single-connection behaviour. `> 1` opens
+    /// that many connections to the destination and stripes the data-stream
+    /// workers across them — link bonding (M3). Only the QUIC path honours this;
+    /// TCP already opens one connection per stream.
+    pub paths: usize,
     /// Transfer directories recursively.  When true and `file` is a directory,
     /// the sender scans the tree, builds a `DirEntries` manifest, and feeds the
     /// virtual concatenated byte stream.  Silently accepted (no-op) for regular
@@ -167,6 +180,18 @@ const QUIC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// successful QUIC handshake.  QUIC+BBR reaches full congestion window slowly
 /// at low latency, consistently underperforming TCP+CUBIC at sub-15 ms RTT.
 pub const DEFAULT_TCP_RTT_THRESHOLD: Duration = Duration::from_millis(15);
+
+/// Decide whether a successfully-established QUIC connection should be torn down
+/// in favour of TCP+TLS, based on the measured RTT.
+///
+/// On a low-latency link (LAN / same datacenter) TCP's faster congestion ramp
+/// beats QUIC's, so in *auto* mode we switch when the RTT is at or below the
+/// configured threshold.  The switch never fires when:
+///   * the user pinned `--transport quic` (`forced_quic`), or
+///   * the threshold is `ZERO` (RTT-based switching disabled).
+fn should_switch_to_tcp(forced_quic: bool, threshold: Duration, rtt: Duration) -> bool {
+    !forced_quic && threshold > Duration::ZERO && rtt <= threshold
+}
 
 pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) -> Result<()> {
     // Scan directory before connecting so errors are surfaced early.
@@ -188,7 +213,12 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
     // Try QUIC first (or QUIC only if forced); fall back to TCP+TLS in auto mode if:
     //   • UDP is blocked or the handshake times out, OR
     //   • the measured RTT is ≤ tcp_rtt_threshold (LAN / same-datacenter).
-    let endpoint = make_client_endpoint(config.trusted_fingerprint.as_deref(), destination)?;
+    let endpoint = make_client_endpoint(
+        config.trusted_fingerprint.as_deref(),
+        config.trusted_device.as_deref(),
+        config.client_identity.as_ref(),
+        destination,
+    )?;
     info!("connecting to {destination} (QUIC, {QUIC_CONNECT_TIMEOUT:.1?} timeout)");
     let quic_result = tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
         let connecting = endpoint
@@ -203,7 +233,7 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
             let rtt = conn.stats().path.rtt;
             let threshold = config.tcp_rtt_threshold;
             // RTT-based TCP switch only applies in auto mode.
-            if !forced_quic && threshold > Duration::ZERO && rtt <= threshold {
+            if should_switch_to_tcp(forced_quic, threshold, rtt) {
                 eprintln!(
                     "[mftp] RTT {:.2} ms (≤ {:.2} ms threshold) — switching to TCP+TLS for LAN throughput…",
                     rtt.as_secs_f64() * 1000.0,
@@ -216,7 +246,11 @@ pub async fn send(file: PathBuf, destination: SocketAddr, config: SendConfig) ->
                     "connected via QUIC (RTT {:.1} ms)",
                     rtt.as_secs_f64() * 1000.0
                 );
-                send_quic_with_conn(file, config, conn, dir_entries).await
+                // Multipath (M3): open additional connections to bond as extra
+                // paths. Best-effort — a path that fails to open is skipped and
+                // the transfer proceeds over the connections that did come up.
+                let extra_conns = open_extra_paths(&endpoint, destination, config.paths).await;
+                send_quic_with_conn(file, config, conn, extra_conns, dir_entries).await
             }
         }
         Ok(Err(e)) if forced_quic => {
@@ -271,10 +305,47 @@ fn resolve_source(file: &Path, config: &SendConfig) -> Result<Option<Vec<FileEnt
 
 // ── QUIC path ─────────────────────────────────────────────────────────────────
 
+/// Open up to `paths - 1` additional QUIC connections to `destination` for
+/// link bonding (M3). Returns the connections that came up; failures are logged
+/// and skipped so the transfer still proceeds over whatever paths succeeded.
+async fn open_extra_paths(
+    endpoint: &quinn::Endpoint,
+    destination: SocketAddr,
+    paths: usize,
+) -> Vec<quinn::Connection> {
+    let mut extra = Vec::new();
+    if paths <= 1 {
+        return extra;
+    }
+    for i in 1..paths {
+        match tokio::time::timeout(QUIC_CONNECT_TIMEOUT, async {
+            endpoint
+                .connect(destination, "mftp")
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .await
+        {
+            Ok(Ok(c)) => {
+                debug!("opened additional path {i} to {destination}");
+                extra.push(c);
+            }
+            Ok(Err(e)) => warn!("multipath: extra path {i} failed to connect: {e:#}"),
+            Err(_) => warn!("multipath: extra path {i} timed out connecting"),
+        }
+    }
+    if !extra.is_empty() {
+        info!("multipath: bonded {} connection(s)", extra.len() + 1);
+    }
+    extra
+}
+
 async fn send_quic_with_conn(
     file: PathBuf,
     config: SendConfig,
     conn: quinn::Connection,
+    extra_conns: Vec<quinn::Connection>,
     dir_entries: Option<Vec<FileEntry>>,
 ) -> Result<()> {
     let file_size = if let Some(ref entries) = dir_entries {
@@ -338,7 +409,7 @@ async fn send_quic_with_conn(
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
-            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::messages::advertised_version(),
         },
     )
     .await?;
@@ -370,8 +441,27 @@ async fn send_quic_with_conn(
         );
     }
 
-    let conn_for_workers = conn.clone();
+    // All bonded connections (primary first), shared by the data-stream
+    // workers. Worker `stream_seq` opens its uni stream on `paths[seq % len]`,
+    // round-robining streams across paths; the shared work channel then load-
+    // balances chunks naturally (a faster path drains more). Enlarge the send
+    // window on every path for high-BDP links.
+    let mut paths_vec = Vec::with_capacity(1 + extra_conns.len());
+    paths_vec.push(conn.clone());
+    paths_vec.extend(extra_conns.iter().cloned());
+    if bdp_window > crate::net::connection::SEND_WINDOW {
+        for c in &extra_conns {
+            c.set_send_window(bdp_window);
+        }
+    }
+    let paths_for_workers = Arc::new(paths_vec);
     let peer_version = neg_resp.protocol_version;
+    // v7+: prefix each data stream with a StreamHello frame. Skipped unless both
+    // peers are ≥ v7 so the wire stays identical to v6 against an older receiver.
+    let send_hello = crate::protocol::messages::stream_hello_active(
+        crate::protocol::messages::advertised_version(),
+        peer_version,
+    );
 
     if config.fec.is_some() {
         run_transfer_fec(
@@ -384,11 +474,12 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             &config,
             manifest,
-            move |rx, transfer_id| {
-                let conn = conn_for_workers.clone();
+            move |rx, transfer_id, stream_seq| {
+                let paths = Arc::clone(&paths_for_workers);
                 async move {
+                    let conn = &paths[stream_seq as usize % paths.len()];
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
-                    quic_fec_stream_worker(stream, rx, transfer_id).await
+                    quic_fec_stream_worker(stream, rx, transfer_id, stream_seq, send_hello).await
                 }
             },
         )
@@ -408,11 +499,13 @@ async fn send_quic_with_conn(
             neg_resp.cpu_cores,
             peer_version,
             &config,
-            Some(conn.clone()),
+            Some(Arc::new(crate::transport::QuicTransport::new(conn.clone()))
+                as Arc<dyn crate::transport::Transport>),
             Some(manifest),
-            move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
-                let conn = conn_for_workers.clone();
+            move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
+                let paths = Arc::clone(&paths_for_workers);
                 async move {
+                    let conn = &paths[stream_seq as usize % paths.len()];
                     let stream = conn.open_uni().await.context("open QUIC data stream")?;
                     quic_stream_worker(
                         stream,
@@ -422,6 +515,8 @@ async fn send_quic_with_conn(
                         file_hasher,
                         excess_stop,
                         stats,
+                        stream_seq,
+                        send_hello,
                     )
                     .await
                 }
@@ -435,9 +530,38 @@ async fn send_quic_with_conn(
 
     let _ = ctrl_send.finish();
     conn.close(0u32.into(), b"done");
+    for c in &extra_conns {
+        c.close(0u32.into(), b"done");
+    }
     Ok(())
 }
 
+/// Write the v7 [`StreamHello`] preamble at the start of a data stream, if the
+/// peer negotiated protocol ≥ 7. No-op otherwise (wire stays v6-identical).
+async fn maybe_send_stream_hello<W>(
+    stream: &mut W,
+    transfer_id: [u8; 16],
+    stream_seq: u32,
+    send_hello: bool,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if send_hello {
+        framing::send_message(
+            stream,
+            &crate::protocol::messages::StreamHello {
+                transfer_id,
+                stream_seq,
+            },
+        )
+        .await
+        .context("send StreamHello preamble")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn quic_stream_worker(
     mut stream: quinn::SendStream,
     rx: ac::Receiver<(u64, Vec<u8>)>,
@@ -446,7 +570,10 @@ async fn quic_stream_worker(
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
     stats: CompressionStats,
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_from_channel(
         &mut stream,
         rx,
@@ -464,8 +591,11 @@ async fn quic_stream_worker(
 async fn quic_fec_stream_worker(
     mut stream: quinn::SendStream,
     rx: tokio::sync::mpsc::Receiver<FecChunkData>,
-    _transfer_id: [u8; 16],
+    transfer_id: [u8; 16],
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_fec_from_channel(&mut stream, rx).await?;
     stream.finish()?;
     Ok(())
@@ -500,7 +630,13 @@ async fn send_tcp(
         .unwrap_or(4) as u32;
 
     info!("connecting to {destination} (TCP+TLS)");
-    let ctrl = connect_tls(destination, config.trusted_fingerprint.as_deref()).await?;
+    let ctrl = connect_tls(
+        destination,
+        config.trusted_fingerprint.as_deref(),
+        config.trusted_device.as_deref(),
+        config.client_identity.as_ref(),
+    )
+    .await?;
     let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl);
     info!("connected");
 
@@ -511,7 +647,7 @@ async fn send_tcp(
         &mut ctrl_send,
         &NegotiateRequest {
             cpu_cores: sender_cores,
-            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::messages::advertised_version(),
         },
     )
     .await?;
@@ -519,7 +655,13 @@ async fn send_tcp(
     let rtt = rtt_start.elapsed();
 
     let trusted_fp = config.trusted_fingerprint.clone();
+    let trusted_dev = config.trusted_device.clone();
+    let client_identity = config.client_identity.clone();
     let peer_version = neg_resp.protocol_version;
+    let send_hello = crate::protocol::messages::stream_hello_active(
+        crate::protocol::messages::advertised_version(),
+        peer_version,
+    );
 
     run_transfer(
         &file,
@@ -532,12 +674,17 @@ async fn send_tcp(
         neg_resp.cpu_cores,
         peer_version,
         &config,
-        None, // no quinn connection on TCP path
+        // TCP+TLS exposes only the negotiated-RTT estimate (the kernel owns
+        // congestion control); the engine queries it through the same trait.
+        Some(Arc::new(crate::transport::TcpTransport::new(rtt))
+            as Arc<dyn crate::transport::Transport>),
         None, // TCP can't pipeline: it measures RTT via the negotiate round-trip
-        move |rx, transfer_id, compression, file_hasher, excess_stop, stats| {
+        move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
             let fp = trusted_fp.clone();
+            let dev = trusted_dev.clone();
+            let id = client_identity.clone();
             async move {
-                let stream = connect_tls(destination, fp.as_deref())
+                let stream = connect_tls(destination, fp.as_deref(), dev.as_deref(), id.as_ref())
                     .await
                     .context("open TCP data stream")?;
                 tcp_stream_worker(
@@ -548,6 +695,8 @@ async fn send_tcp(
                     file_hasher,
                     excess_stop,
                     stats,
+                    stream_seq,
+                    send_hello,
                 )
                 .await
             }
@@ -557,6 +706,7 @@ async fn send_tcp(
     // ctrl_send and ctrl_recv drop here, closing the TCP control connection.
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tcp_stream_worker(
     mut stream: crate::net::tcp::ClientTlsStream<tokio::net::TcpStream>,
     rx: ac::Receiver<(u64, Vec<u8>)>,
@@ -565,8 +715,11 @@ async fn tcp_stream_worker(
     file_hasher: Option<Arc<ChunkHasher>>,
     excess_stop: Arc<AtomicUsize>,
     stats: CompressionStats,
+    stream_seq: u32,
+    send_hello: bool,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    maybe_send_stream_hello(&mut stream, transfer_id, stream_seq, send_hello).await?;
     send_from_channel(
         &mut stream,
         rx,
@@ -736,7 +889,9 @@ where
                     }
                     Some(ScaleMsg::Ack(accepted)) if !fec_enabled => {
                         let current = current_streams.load(AtomicOrd::Relaxed);
-                        let new_count = accepted as usize;
+                        // Never let a (buggy/malicious) ack of 0 stop every worker
+                        // while chunks are still queued.
+                        let new_count = (accepted as usize).max(1);
                         if new_count < current {
                             // Receiver accepted fewer streams than we opened — either a
                             // scale-down ack or a partial scale-up (some accepts failed).
@@ -794,7 +949,12 @@ async fn run_transfer<CW, CR, F, Fut>(
     receiver_cores: u32,
     peer_protocol_version: u32,
     config: &SendConfig,
-    qconn: Option<quinn::Connection>,
+    // The selected transport, queried for live path stats (RTT/loss) by the
+    // background sampler task. `None` for transports that expose no live metrics
+    // (the TCP path passes its negotiated-RTT estimate is reflected via `rtt`).
+    // The engine never references a concrete transport type — see
+    // [`crate::transport::Transport`].
+    transport: Option<Arc<dyn crate::transport::Transport>>,
     // `Some` when the caller already pipelined NegotiateRequest + manifest +
     // DirEntries into one flight (QUIC fast path); `None` to build and send the
     // manifest here (TCP path, which can't compute params before the RTT-probing
@@ -812,11 +972,12 @@ where
         Option<Arc<ChunkHasher>>,
         Arc<AtomicUsize>,
         CompressionStats,
+        u32, // stream_seq: 0-based index of this stream within the transfer
     ) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     // For directory transfers, check that receiver supports v3.
-    if entries.is_some() && peer_protocol_version < 3 {
+    if entries.is_some() && !crate::protocol::messages::directory_supported(peer_protocol_version) {
         bail!(
             "the receiver is running an older version of mftp (protocol version {peer_protocol_version}) \
              that does not support directory transfers — please upgrade the receiver to v3+"
@@ -862,7 +1023,7 @@ where
             );
             framing::send_message(ctrl_send, &m).await?;
             // v3+: DirEntries immediately after the manifest (strict ordering).
-            if peer_protocol_version >= 3 {
+            if crate::protocol::messages::directory_supported(peer_protocol_version) {
                 let dir_entries_msg = DirEntries {
                     entries: entries.map(|e| e.to_vec()),
                 };
@@ -893,10 +1054,16 @@ where
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
     let have: HashSet<u64> = match ready {
+        // Ready.total_chunks comes from the peer; only our own manifest value
+        // bounds the chunk indices (a larger one made skip_count exceed
+        // total_chunks and underflowed `remaining`).
         ReceiverMessage::Ready {
             received_bits,
-            total_chunks,
-        } => bits_to_chunk_set(&received_bits, total_chunks),
+            total_chunks: peer_total,
+        } => {
+            check_ready_bits(&received_bits, peer_total, total_chunks)?;
+            bits_to_chunk_set(&received_bits, total_chunks)
+        }
         ReceiverMessage::Error { message, .. } => {
             // The receiver refused before data started (e.g. out of space) — mark
             // it non-retryable so SSH mode doesn't fall back to a doomed SFTP run.
@@ -993,16 +1160,16 @@ where
     let stall_ms_for_reader = Arc::new(AtomicU32::new(0u32));
     let rtt_ms_for_reader = Arc::clone(&rtt_ms_atom);
     let loss_for_reader = Arc::clone(&loss_atom);
-    let _stats_task = qconn.map(|c| {
+    let _stats_task = transport.map(|t| {
         let rtt_a = rtt_ms_atom;
         let loss_a = loss_atom;
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 iv.tick().await;
-                let s = c.stats();
-                rtt_a.store(s.path.rtt.as_millis() as u32, AtomicOrd::Relaxed);
-                loss_a.store(s.path.lost_packets, AtomicOrd::Relaxed);
+                let s = t.path_stats();
+                rtt_a.store(s.rtt.as_millis() as u32, AtomicOrd::Relaxed);
+                loss_a.store(s.lost_packets, AtomicOrd::Relaxed);
             }
         })
     });
@@ -1228,7 +1395,7 @@ where
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     let feeders: Vec<tokio::task::JoinHandle<Result<()>>> = if let Some(ents) = entries {
         // Directory path: always use a single sequential feeder over the concat
-        // stream.  The pre-reading optimisation in feed_chunks_concat already
+        // stream.  The cached-handle reads in feed_chunks_concat already
         // handles NVMe efficiently; parallel-reads is not useful for the
         // scatter-gather read pattern needed here.
         let root = file.to_owned();
@@ -1273,13 +1440,19 @@ where
     // worker gets a clone of the shared MPMC receiver (all clones drain the same
     // queue) and an Arc of the file hasher.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    // Monotonic per-stream sequence number, handed to each worker for its
+    // StreamHello preamble (v7+). Survives scale-down/scale-up: a re-added
+    // stream gets a fresh number, which is fine — seq is informational.
+    let stream_seq_ctr = Arc::new(AtomicU32::new(0));
     let spawn_one = {
         let work_rx = work_rx.clone();
         let compression = compression.clone();
         let file_hasher = file_hasher.clone();
         let excess_stop = excess_stop.clone();
         let cs = (Arc::clone(&compress_stats.0), Arc::clone(&compress_stats.1));
+        let stream_seq_ctr = Arc::clone(&stream_seq_ctr);
         move |tasks: &mut JoinSet<Result<()>>| {
+            let stream_seq = stream_seq_ctr.fetch_add(1, AtomicOrd::Relaxed);
             tasks.spawn(spawn_worker(
                 work_rx.clone(),
                 transfer_id,
@@ -1287,6 +1460,7 @@ where
                 file_hasher.clone(),
                 excess_stop.clone(),
                 (Arc::clone(&cs.0), Arc::clone(&cs.1)),
+                stream_seq,
             ));
         }
     };
@@ -1311,7 +1485,11 @@ where
     )
     .await?;
 
-    // Workers done; all feeders should have finished by now (channel closed).
+    // Workers done.  Normally the feeders finished and closed the channel, but
+    // if every worker exited early (e.g. scale-down overshoot) a feeder would
+    // block forever in send_blocking; dropping the last receiver unblocks it
+    // with an error instead.
+    drop(work_rx);
     for feeder in feeders {
         feeder.await.context("feeder task panicked")??;
     }
@@ -1319,11 +1497,18 @@ where
     pb.set_message("verifying…");
 
     let file_hash: [u8; 32] = match file_hasher {
-        Some(h) => Arc::try_unwrap(h)
-            .expect(
+        Some(h) => {
+            let h = Arc::try_unwrap(h).expect(
                 "all stream workers have completed; no other Arc<ChunkHasher> references remain",
-            )
-            .finish()?,
+            );
+            if h.is_abandoned() {
+                // Inline collection overflowed (one worker far behind); hash
+                // the source from disk like the resume path does.
+                hash_source_from_disk(file, entries, chunk_size).await?
+            } else {
+                h.finish()?
+            }
+        }
         None => hash_task
             .expect("resume path always spawns hash_task")
             .await
@@ -1361,6 +1546,24 @@ where
     )?;
 
     Ok(())
+}
+
+/// Hash the transfer source from disk (single file or directory concat
+/// stream) off the async runtime.  Used when inline hash collection was
+/// skipped (resume) or abandoned.
+async fn hash_source_from_disk(
+    file: &Path,
+    entries: Option<&[FileEntry]>,
+    chunk_size: usize,
+) -> Result<[u8; 32]> {
+    let path = file.to_owned();
+    let ents = entries.map(|e| e.to_vec());
+    tokio::task::spawn_blocking(move || match ents {
+        Some(ents) => crate::transfer::hash::hash_concat_sync(&ents, &path, chunk_size),
+        None => hash_file_sync(&path, chunk_size),
+    })
+    .await
+    .context("hash task panicked")?
 }
 
 // ── Incremental repair (protocol v5) ───────────────────────────────────────────
@@ -1539,6 +1742,11 @@ fn ack_timeout(rtt: Duration, file_size: u64) -> Duration {
 /// truly in parallel with the async executor.  Workers can therefore call
 /// `try_recv` immediately and find a chunk waiting, enabling the
 /// compress/hash pipeline to overlap with network sends.
+/// Feeder error when every stream worker is gone before all chunks were
+/// handed out.  On an aborted transfer this error is never observed (the
+/// feeder is detached); otherwise it surfaces instead of a silent hang.
+const WORKERS_GONE: &str = "all stream workers exited before every chunk was dispatched";
+
 fn feed_chunks(
     path: &Path,
     file_size: u64,
@@ -1572,7 +1780,7 @@ fn feed_chunks(
         // feeder waits here, naturally throttling disk reads to the network
         // send rate.  An Err means all receivers (workers) have closed.
         if tx.send_blocking((idx, raw)).is_err() {
-            break;
+            bail!(WORKERS_GONE);
         }
     }
 
@@ -1815,6 +2023,22 @@ fn print_completion(
     Ok(())
 }
 
+/// Sanity-check a receiver's `Ready` against our manifest: it must describe the
+/// same number of chunks and carry no more bitvector words than that needs.
+fn check_ready_bits(bits: &[u64], peer_total: u64, total_chunks: u64) -> Result<()> {
+    if peer_total != total_chunks {
+        bail!("receiver Ready reports {peer_total} chunks, but this transfer has {total_chunks}");
+    }
+    let max_words = total_chunks.div_ceil(64);
+    if bits.len() as u64 > max_words {
+        bail!(
+            "receiver Ready bitvector has {} words, expected at most {max_words}",
+            bits.len()
+        );
+    }
+    Ok(())
+}
+
 /// Reconstruct a `HashSet` of chunk indices from a packed bitvector.
 fn bits_to_chunk_set(bits: &[u64], total_chunks: u64) -> HashSet<u64> {
     bits.iter()
@@ -1901,7 +2125,7 @@ fn feed_chunks_range(
         let raw = crate::fs_ext::read_exact_at_vec(&file, len, offset)
             .with_context(|| format!("read chunk {idx}"))?;
         if tx.send_blocking((idx, raw)).is_err() {
-            break;
+            bail!(WORKERS_GONE);
         }
     }
     Ok(())
@@ -1909,15 +2133,13 @@ fn feed_chunks_range(
 
 // ── Recursive directory support ───────────────────────────────────────────────
 
-/// Threshold below which a file's contents are pre-read into memory during
-/// directory scan.  Pre-reading small files avoids `open()`/`close()` overhead
-/// for every chunk that spans many tiny files.
-const PREREAD_THRESHOLD: u64 = 256 * 1024; // 256 KiB
+/// Files at or below this size skip the `POSIX_FADV_SEQUENTIAL` hint when the
+/// directory feeder opens them (read-ahead tuning is pointless for a file that
+/// is read in one or two `pread`s).
+const SMALL_FILE_THRESHOLD: u64 = 256 * 1024; // 256 KiB
 
 /// Walk `root` and return a sorted list of `FileEntry` items representing the
 /// complete directory tree.  Symlinks are preserved (not followed).
-/// Files ≥ 1 entry and ≤ PREREAD_THRESHOLD are flagged for pre-reading by the
-/// caller.
 pub(crate) fn scan_directory(root: &Path, preserve: bool) -> Result<Vec<FileEntry>> {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -2038,9 +2260,12 @@ fn directory_transfer_id(
 /// Read file entries into the per-chunk feeder channel, treating all File
 /// entries as a single virtual concatenated byte stream.
 ///
-/// Small files (≤ PREREAD_THRESHOLD) are pre-read into memory up front so the
-/// inner loop only does memory copies for them, avoiding repeated `open()`
-/// overhead when a single chunk spans many tiny files.
+/// Files are opened lazily as the chunk being assembled reaches them, and the
+/// current handle is kept open across consecutive chunks, so every file is
+/// opened once and memory stays bounded by the in-flight chunks (small files
+/// used to be pre-read into RAM up front — the whole tree for a tree of small
+/// files).  A file that shrank since the scan fails the transfer with an error
+/// instead of panicking or sending short data.
 ///
 /// Designed to run in `tokio::task::spawn_blocking`.
 fn feed_chunks_concat(
@@ -2057,21 +2282,6 @@ fn feed_chunks_concat(
         .filter(|e| matches!(e.kind, FileKind::File) && e.size > 0)
         .collect();
 
-    // Pre-read small files into memory.
-    let preread: Vec<Option<Vec<u8>>> = file_entries
-        .iter()
-        .map(|e| {
-            if e.size <= PREREAD_THRESHOLD {
-                let path = root.join(&e.path);
-                std::fs::read(&path)
-                    .with_context(|| format!("pre-read {}", path.display()))
-                    .ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-
     // Build prefix sums over file sizes.
     let mut prefix_sums: Vec<u64> = Vec::with_capacity(file_entries.len() + 1);
     let mut acc = 0u64;
@@ -2083,9 +2293,10 @@ fn feed_chunks_concat(
 
     let total_chunks = total_bytes.div_ceil(chunk_size as u64);
 
-    // Keep one open large-file handle to avoid repeated open/close when
-    // many consecutive chunks land in the same large file.
-    let mut cur_large: Option<(usize, std::fs::File)> = None;
+    // Keep the current file's handle open: consecutive chunks usually land in
+    // the same (large) file, and a small file spanning a chunk boundary is
+    // read across two chunks — either way it is opened only once.
+    let mut cur: Option<(usize, std::fs::File)> = None;
 
     for idx in 0..total_chunks {
         if skip.contains(&idx) {
@@ -2111,45 +2322,31 @@ fn feed_chunks_concat(
             let remaining_in_file = (file_end - pos) as usize;
             let take = remaining_in_file.min(chunk_len - written);
 
-            if let Some(ref data) = preread[fi] {
-                // Small file: copy from pre-read buffer.
-                let src_start = offset_in_file as usize;
-                buf[written..written + take].copy_from_slice(&data[src_start..src_start + take]);
-            } else {
-                // Large file: use cached handle or open new one.
-                let file = match &cur_large {
-                    Some((open_fi, _)) if *open_fi == fi => {
-                        cur_large.as_ref().map(|(_, f)| f).unwrap()
-                    }
-                    _ => {
-                        let path = root.join(&file_entries[fi].path);
-                        let f = std::fs::File::open(&path)
-                            .with_context(|| format!("open {}", path.display()))?;
+            let file = match &cur {
+                Some((open_fi, f)) if *open_fi == fi => f,
+                _ => {
+                    let path = root.join(&file_entries[fi].path);
+                    let f = std::fs::File::open(&path)
+                        .with_context(|| format!("open {}", path.display()))?;
 
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::unix::io::AsRawFd;
-                            unsafe {
-                                libc::posix_fadvise(
-                                    f.as_raw_fd(),
-                                    0,
-                                    0,
-                                    libc::POSIX_FADV_SEQUENTIAL,
-                                );
-                            }
+                    #[cfg(target_os = "linux")]
+                    if file_entries[fi].size > SMALL_FILE_THRESHOLD {
+                        use std::os::unix::io::AsRawFd;
+                        unsafe {
+                            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
                         }
-
-                        cur_large = Some((fi, f));
-                        cur_large.as_ref().map(|(_, f)| f).unwrap()
                     }
-                };
-                crate::fs_ext::read_exact_at(
-                    file,
-                    &mut buf[written..written + take],
-                    offset_in_file,
+
+                    &cur.insert((fi, f)).1
+                }
+            };
+            crate::fs_ext::read_exact_at(file, &mut buf[written..written + take], offset_in_file)
+                .with_context(|| {
+                format!(
+                    "read {} at {offset_in_file} (file changed since scan?)",
+                    file_entries[fi].path
                 )
-                .with_context(|| format!("read file[{fi}] at {offset_in_file}"))?;
-            }
+            })?;
 
             written += take;
             pos += take as u64;
@@ -2157,7 +2354,7 @@ fn feed_chunks_concat(
         }
 
         if tx.send_blocking((idx, buf)).is_err() {
-            break; // workers closed — abort cleanly
+            bail!(WORKERS_GONE);
         }
     }
 
@@ -2170,7 +2367,7 @@ fn feed_chunks_concat(
 /// byte offset where the chunk starts, walk the prefix-sum table to find the
 /// file(s) the chunk spans and read each overlapping slice in turn.  Used by
 /// the in-band repair path to re-read a chunk by its global index without the
-/// feeder's pre-read cache (repair handles only a bounded handful of chunks).
+/// feeder's cached handle (repair handles only a bounded handful of chunks).
 fn read_concat_chunk_into(
     root: &Path,
     file_entries: &[&FileEntry],
@@ -2496,7 +2693,7 @@ async fn run_transfer_fec<CW, CR, F, Fut>(
 where
     CW: AsyncWrite + Unpin,
     CR: AsyncRead + Unpin + Send + 'static,
-    F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16]) -> Fut,
+    F: Fn(tokio::sync::mpsc::Receiver<FecChunkData>, [u8; 16], u32) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let fec_params = manifest
@@ -2538,7 +2735,8 @@ where
             received_bits,
             total_chunks: tc,
         } => {
-            let s = complete_fec_stripes(&received_bits, tc, fec_params.data_shards);
+            check_ready_bits(&received_bits, tc, total_chunks)?;
+            let s = complete_fec_stripes(&received_bits, total_chunks, fec_params.data_shards);
             let skipped_chunks = s.len() as u64 * fec_params.data_shards as u64;
             let remaining_chunks = total_chunks.saturating_sub(skipped_chunks);
             info!(
@@ -2695,8 +2893,8 @@ where
 
     // Spawn N QUIC stream workers.
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    for rx in worker_rxs {
-        tasks.spawn(spawn_worker(rx, transfer_id));
+    for (stream_seq, rx) in worker_rxs.into_iter().enumerate() {
+        tasks.spawn(spawn_worker(rx, transfer_id, stream_seq as u32));
     }
     while let Some(res) = tasks.join_next().await {
         match res? {
@@ -2722,9 +2920,15 @@ where
     pb.set_message("verifying…");
 
     let file_hash: [u8; 32] = match file_hasher {
-        Some(h) => Arc::try_unwrap(h)
-            .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain")
-            .finish()?,
+        Some(h) => {
+            let h = Arc::try_unwrap(h)
+                .expect("all encoder tasks finished; no other Arc<ChunkHasher> references remain");
+            if h.is_abandoned() {
+                hash_source_from_disk(file, None, chunk_size).await?
+            } else {
+                h.finish()?
+            }
+        }
         None => hash_task
             .expect("resume path always spawns hash_task")
             .await
@@ -2769,6 +2973,41 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::sync::{mpsc, Semaphore};
+
+    #[test]
+    fn tcp_switch_fires_only_in_auto_mode_at_or_below_threshold() {
+        let thr = Duration::from_millis(15);
+
+        // Auto mode: switch when RTT is below or exactly at the threshold
+        // (≤ is inclusive)…
+        assert!(should_switch_to_tcp(false, thr, Duration::from_millis(2)));
+        assert!(should_switch_to_tcp(false, thr, thr));
+        // …but stay on QUIC above it.
+        assert!(!should_switch_to_tcp(false, thr, Duration::from_millis(16)));
+
+        // Pinned `--transport quic` never switches, even on a fast link.
+        assert!(!should_switch_to_tcp(true, thr, Duration::from_millis(1)));
+
+        // A ZERO threshold disables RTT-based switching entirely.
+        assert!(!should_switch_to_tcp(
+            false,
+            Duration::ZERO,
+            Duration::from_millis(1)
+        ));
+        assert!(!should_switch_to_tcp(false, Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn ready_bits_bounded_by_our_manifest() {
+        // Matching total and bitvector length is fine.
+        assert!(check_ready_bits(&[u64::MAX; 2], 100, 100).is_ok());
+        // A receiver claiming more chunks than we have must be rejected …
+        assert!(check_ready_bits(&[u64::MAX; 2], 1_000, 100).is_err());
+        // … as must an oversized bitvector.
+        assert!(check_ready_bits(&[0; 3], 100, 100).is_err());
+        // Bits past our total are ignored, so skip_count ≤ total_chunks.
+        assert_eq!(bits_to_chunk_set(&[u64::MAX; 2], 100).len(), 100);
+    }
 
     /// Regression test for the late-scaling end-of-transfer deadlock.
     ///

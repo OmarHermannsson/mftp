@@ -5,7 +5,62 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
-_Nothing user-facing yet._
+### Security
+- **Daemon authorization fails closed.** A malformed/unreadable `acl.toml` or
+  `authorized_devices` is a startup error (SIGHUP keeps the previous policy);
+  an existing-but-empty allowlist denies everyone instead of opening the
+  receiver. `daemon-trust` changes apply live and are refused when `acl.toml`
+  governs; status/list report the effective policy.
+- ACL `output_subdir`s must be distinct, non-nested, and not empty/`.`; ACL
+  keys are normalized like the TLS allowlist.
+- LAN discovery no longer pins an unauthenticated announcement's Device ID —
+  the receiver goes through TOFU (or `--trust-device`), and conflicting
+  answers for one name are an error.
+- HTTP dashboard: header timeout/size cap, connection cap, DNS-rebinding Host
+  check, warning when bound to a non-loopback address.
+- Control socket is 0600 in a 0700 dir and is never stolen from a live daemon.
+- Device identity: DeviceId always derived from the cert, key/cert mismatch and
+  partial identities are errors, keys kept at 0600, persist errors propagate.
+- At-rest encryption format v2 (`MFE2`): per-file keys, truncation and reorder
+  detection.
+- Directory transfers can no longer write outside the destination through
+  symlinks (leading `..` in targets, or entries under a transfer-created link).
+- Quotas are enforced against the incoming transfer's size once its manifest
+  is read, not only at connect time.
+- The SSH-launched one-shot receiver only accepts the launching sender's
+  DeviceId (QUIC and TCP+TLS, which now supports client-cert auth).
+- Rendezvous registration requires proof of DeviceId key possession; the
+  relay's sender slot requires a session token (printed by `mftp relay`, given
+  to senders as `MFTP_RELAY_TOKEN`).
+- SSH: the remote bootstrap runs as one `sh -c` word, verifies the uploaded or
+  cached binary's SHA-256 before running it, and never caches in a shared
+  `/tmp`; destinations starting with `-` are rejected.
+- Receiver-side checks on peer-supplied lengths/indices (FEC frames, repair
+  chunks, `Ready`), bounded opening-flight reads, and TLS handshake timeouts.
+
+### Added
+- `mftp daemon --encrypt-at-rest <KEY_FILE>` stores received files encrypted;
+  `mftp decrypt` recovers them.
+- The daemon records every transfer in the persistent queue
+  (`~/.config/mftp/queue.json`), so the Web UI / `/queue` show real jobs.
+- `TcpServer::serve` (TCP+TLS on `receive`/`listen`) runs transfers
+  concurrently, routing data connections by their v7 `StreamHello`.
+- A sender reconnecting for the same transfer supersedes its stale QUIC
+  connection instead of being refused until it times out.
+
+### Fixed
+- A single corrupt chunk on a large fresh transfer no longer fails it fatally;
+  it is repaired in-band.
+- Overwriting a larger existing file no longer leaves its old tail behind; the
+  fallocate fallback no longer wipes resumed data.
+- FEC: late parity shards no longer leak memory or re-reconstruct stripes.
+- Stream-count targets can't truncate to 0 on ≥128-core hosts (sender hang).
+- Concurrent resume snapshots no longer race on one temp file.
+- Directory sends read small files lazily instead of all up front; directory
+  receives cache open file handles.
+- `-n 0`, `--chunk-size 0`/absurd sizes and negative/NaN `--tcp-below-rtt`
+  (CLI or config.toml) are rejected with a clear error instead of panicking.
+- `--help` no longer recommends `--fec` for lossy links.
 
 ## [0.2.2] — 2026-06-05
 

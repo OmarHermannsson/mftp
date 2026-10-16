@@ -43,10 +43,21 @@ struct Inner {
     total: u64,
     /// Chunk hashes that arrived before their turn.
     pending: HashMap<u64, [u8; 32]>,
-    /// Maximum out-of-order hashes we hold before treating the situation as
-    /// an error.  Derived from stream count so legitimate high-stream
+    /// Maximum out-of-order hashes we hold before giving up on inline
+    /// collection.  Derived from stream count so legitimate high-stream
     /// transfers never hit the cap.
     max_pending: usize,
+    /// Set once inline collection has been abandoned (a chunk was dropped, or
+    /// the pending buffer overflowed).  Further `feed` calls are no-ops and the
+    /// caller must compute the file hash from disk instead.
+    abandoned: bool,
+}
+
+/// Pending-buffer limit for `stream_count` parallel streams.  Shared by
+/// [`ChunkHasher::new`] and [`ChunkHasher::update_stream_count`] so the cap is
+/// the same whether the stream count was known up front or reached by scaling.
+fn pending_limit(stream_count: usize) -> usize {
+    (stream_count * 64).max(256)
 }
 
 impl ChunkHasher {
@@ -65,7 +76,7 @@ impl ChunkHasher {
     /// hash), so 1024 entries is 40 KiB — negligible memory.
     /// The floor of 256 handles tiny files or single-stream transfers gracefully.
     pub fn new(total_chunks: u64, stream_count: usize) -> Self {
-        let max_pending = (stream_count * 64).max(256);
+        let max_pending = pending_limit(stream_count);
         Self {
             inner: Mutex::new(Inner {
                 collected: Vec::with_capacity(total_chunks as usize),
@@ -73,6 +84,7 @@ impl ChunkHasher {
                 total: total_chunks,
                 pending: HashMap::new(),
                 max_pending,
+                abandoned: false,
             }),
         }
     }
@@ -83,10 +95,16 @@ impl ChunkHasher {
     /// ordered list immediately, and any buffered successive chunks are drained.
     /// Otherwise the hash is stored until its turn comes.
     ///
-    /// Returns an error if the pending buffer is full, indicating a malicious
-    /// sender withholding early chunks to exhaust receiver memory.
+    /// If the pending buffer is full (one chunk is far behind — a dropped or
+    /// withheld chunk, or a long disk stall on one stream) inline collection is
+    /// abandoned instead of failing the transfer: the buffer is freed (bounding
+    /// memory against a peer withholding early chunks) and the caller falls
+    /// back to hashing from disk (see [`is_abandoned`](Self::is_abandoned)).
     pub fn feed(&self, chunk_index: u64, hash: [u8; 32]) -> Result<()> {
         let mut g = self.inner.lock().expect("hash-tree mutex poisoned");
+        if g.abandoned {
+            return Ok(());
+        }
         if chunk_index == g.next {
             g.collected.push(hash);
             g.next += 1;
@@ -103,14 +121,43 @@ impl ChunkHasher {
         } else {
             let limit = g.max_pending;
             if g.pending.len() >= limit && !g.pending.contains_key(&chunk_index) {
-                bail!(
-                    "hasher pending buffer full ({limit} out-of-order chunks buffered) — \
-                     one stream is far behind the others; the transfer may be stalled"
+                tracing::warn!(
+                    limit,
+                    waiting_for = g.next,
+                    "hasher pending buffer full; falling back to hashing from disk"
                 );
+                Self::abandon_locked(&mut g);
+                return Ok(());
             }
             g.pending.insert(chunk_index, hash);
         }
         Ok(())
+    }
+
+    /// Stop collecting hashes inline and free the buffers.
+    ///
+    /// Called when a chunk is dropped (hash mismatch, lost FEC shard) and will
+    /// only arrive later via repair, which bypasses the hasher — so `next`
+    /// could otherwise never advance past it and the pending buffer would fill
+    /// up.  After this the caller must hash the output from disk.
+    pub fn abandon(&self) {
+        let mut g = self.inner.lock().expect("hash-tree mutex poisoned");
+        Self::abandon_locked(&mut g);
+    }
+
+    fn abandon_locked(g: &mut Inner) {
+        g.abandoned = true;
+        g.pending = HashMap::new();
+        g.collected = Vec::new();
+    }
+
+    /// True once inline collection has been abandoned; [`finish`](Self::finish)
+    /// then errors and the file hash must be computed from disk.
+    pub fn is_abandoned(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("hash-tree mutex poisoned")
+            .abandoned
     }
 
     /// Increase the pending-buffer limit to accommodate a higher stream count.
@@ -119,7 +166,7 @@ impl ChunkHasher {
     /// The limit only ever increases (decreasing would risk spurious errors
     /// while buffered hashes are still in flight).
     pub fn update_stream_count(&self, new_count: usize) {
-        let new_limit = (new_count * 16).max(64);
+        let new_limit = pending_limit(new_count);
         let mut g = self.inner.lock().expect("hash-tree mutex poisoned");
         if new_limit > g.max_pending {
             g.max_pending = new_limit;
@@ -132,7 +179,10 @@ impl ChunkHasher {
     /// BLAKE3.  Must be called after all `feed` calls are complete.
     /// Returns an error if not all chunks were fed.
     pub fn finish(self) -> Result<[u8; 32]> {
-        let g = self.inner.into_inner().unwrap();
+        let g = self.inner.into_inner().expect("hash-tree mutex poisoned");
+        if g.abandoned {
+            bail!("chunk hasher was abandoned; hash the output from disk instead");
+        }
         if g.next != g.total {
             bail!(
                 "chunk hasher incomplete: collected {}/{} chunks ({} still buffered)",
@@ -294,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_cap_triggers_error() {
+    fn pending_cap_abandons_instead_of_failing() {
         // stream_count=1 → max_pending = max(1*64, 256) = 256
         let limit: u64 = 256;
         let hasher = ChunkHasher::new(limit + 2, 1);
@@ -302,9 +352,34 @@ mod tests {
         for i in 1..=limit {
             hasher.feed(i, [0u8; 32]).unwrap();
         }
-        // One more beyond the limit should error.
-        let result = hasher.feed(limit + 1, [0u8; 32]);
-        assert!(result.is_err());
+        assert!(!hasher.is_abandoned());
+        // One more beyond the limit abandons inline collection (no error) …
+        hasher.feed(limit + 1, [0u8; 32]).unwrap();
+        assert!(hasher.is_abandoned());
+        // … later feeds are no-ops, and finish refuses to produce a hash.
+        hasher.feed(0, [0u8; 32]).unwrap();
+        assert!(hasher.finish().is_err());
+    }
+
+    #[test]
+    fn explicit_abandon_disables_finish() {
+        let hasher = ChunkHasher::new(2, 1);
+        hasher.feed(0, [0u8; 32]).unwrap();
+        hasher.abandon();
+        hasher.feed(1, [0u8; 32]).unwrap();
+        assert!(hasher.is_abandoned());
+        assert!(hasher.finish().is_err());
+    }
+
+    #[test]
+    fn scaling_uses_same_pending_limit_as_new() {
+        let hasher = ChunkHasher::new(10_000, 4);
+        hasher.update_stream_count(16);
+        // 16 streams → 1024 like ChunkHasher::new(_, 16); 1000 pending is fine.
+        for i in 1..=1000u64 {
+            hasher.feed(i, [0u8; 32]).unwrap();
+        }
+        assert!(!hasher.is_abandoned());
     }
 
     #[test]

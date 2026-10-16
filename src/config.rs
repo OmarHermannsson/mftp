@@ -16,6 +16,47 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Smallest accepted `--chunk-size` / `chunk_size` (bytes). Mirrors the
+/// receiver's manifest validation, so an out-of-range value is rejected
+/// locally with a clear message instead of failing the handshake.
+pub const MIN_CHUNK_SIZE: usize = 4 * 1024;
+/// Largest accepted chunk size (bytes); see [`MIN_CHUNK_SIZE`].
+pub const MAX_CHUNK_SIZE: usize = 128 * 1024 * 1024;
+/// Largest accepted `-n` / `--streams` value (the receiver's limit).
+pub const MAX_STREAMS: usize = 1024;
+/// Largest accepted `--tcp-below-rtt` (ms). Anything near this already means
+/// "always TCP"; the cap keeps `Duration::from_secs_f64` far from overflow.
+pub const MAX_TCP_BELOW_RTT_MS: f64 = 60_000.0;
+
+/// Validate a parallel-stream count (1..=[`MAX_STREAMS`]).
+pub fn validate_streams(n: usize) -> Result<usize> {
+    if n == 0 || n > MAX_STREAMS {
+        anyhow::bail!("streams must be between 1 and {MAX_STREAMS} (got {n})");
+    }
+    Ok(n)
+}
+
+/// Validate a chunk size in bytes ([`MIN_CHUNK_SIZE`]..=[`MAX_CHUNK_SIZE`]).
+pub fn validate_chunk_size(n: usize) -> Result<usize> {
+    if !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&n) {
+        anyhow::bail!(
+            "chunk size must be between {MIN_CHUNK_SIZE} and {MAX_CHUNK_SIZE} bytes (got {n})"
+        );
+    }
+    Ok(n)
+}
+
+/// Validate a TCP-fallback RTT threshold in ms: finite, `>= 0`, and at most
+/// [`MAX_TCP_BELOW_RTT_MS`].
+pub fn validate_tcp_below_rtt(ms: f64) -> Result<f64> {
+    if !ms.is_finite() || !(0.0..=MAX_TCP_BELOW_RTT_MS).contains(&ms) {
+        anyhow::bail!(
+            "tcp_below_rtt must be a number of ms between 0 and {MAX_TCP_BELOW_RTT_MS} (got {ms})"
+        );
+    }
+    Ok(ms)
+}
+
 /// All-optional mirror of the persistent tuning knobs exposed on the CLI.
 ///
 /// Only knobs that make sense to pin for a recurring link are included.
@@ -72,7 +113,22 @@ impl Config {
     /// parsing logic is testable without touching the filesystem.
     pub fn parse(contents: &str) -> Result<Config> {
         let cfg: Config = toml::from_str(contents)?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Range-check the numeric knobs (the same bounds the CLI flags enforce).
+    fn validate(&self) -> Result<()> {
+        if let Some(n) = self.streams {
+            validate_streams(n).context("config `streams`")?;
+        }
+        if let Some(n) = self.chunk_size {
+            validate_chunk_size(n).context("config `chunk_size`")?;
+        }
+        if let Some(ms) = self.tcp_below_rtt {
+            validate_tcp_below_rtt(ms).context("config `tcp_below_rtt`")?;
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +177,23 @@ mod tests {
     fn malformed_config_is_error() {
         assert!(Config::parse("streams = \"not a number\"\n").is_err());
         assert!(Config::parse("this is not toml { ").is_err());
+    }
+
+    #[test]
+    fn out_of_range_values_are_errors() {
+        for bad in [
+            "streams = 0\n",
+            "streams = 100000\n",
+            "chunk_size = 0\n",
+            "chunk_size = 1099511627776\n",
+            "tcp_below_rtt = -1.0\n",
+            "tcp_below_rtt = nan\n",
+            "tcp_below_rtt = inf\n",
+            "tcp_below_rtt = 1e300\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(Config::parse("streams = 1\nchunk_size = 4096\ntcp_below_rtt = 0.0\n").is_ok());
     }
 
     #[test]

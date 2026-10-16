@@ -25,8 +25,15 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **Reed-Solomon FEC** | Optional parity shards (`--fec DATA:PARITY`). Note: does *not* improve throughput over QUIC (which already recovers loss) — see [Reed-Solomon FEC](#reed-solomon-fec) |
 | **End-to-end integrity** | BLAKE3 per chunk (raw bytes) + full-file BLAKE3 verified on arrival |
 | **RTT-aware negotiation** | Stream count and chunk size auto-tuned from measured round-trip time |
+| **Multipath / link bonding** | `--paths N` bonds N QUIC connections for one transfer and stripes the data streams across them; each path runs its own congestion control, so a faster link naturally carries more chunks. For multi-homed hosts (Wi-Fi + wired, dual WAN). QUIC only |
 | **Resumable transfers** | Crash-safe bit-vector tracks received chunks; transfers continue where they left off |
 | **TOFU authentication** | Self-signed certs; fingerprint confirmed once per session; `--trust` pins it for scripted use |
+| **Persistent device identity** | The receiver keeps a stable Ed25519 key + certificate in `~/.config/mftp/`, so its fingerprint no longer changes across restarts. `mftp receive` prints a stable **Device ID**; `--trust-device <id>` pins the device key (survives certificate re-issuance, unlike `--trust`) |
+| **`mftpd` daemon (Unix)** | `mftp daemon` runs a persistent accept-many receiver with a local control socket (`mftp daemon-status`, `mftp daemon-trust add/remove/list`). Adding authorized sender Device IDs enforces **mutual-TLS identity auth** — only allowlisted devices can send |
+| **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP (the receiver is still verified via TOFU or `--trust-device`; announcements are unauthenticated) |
+| **Rendezvous (NAT traversal)** | `mftp rendezvous` runs a signaling-only broker; receivers register by Device ID and senders reach them with `mftp send <file> <device-id> --rendezvous <broker>`. Candidates are exchanged for UDP hole punching; the broker never sees file data |
+| **Zero-knowledge relay** | When hole punching fails (symmetric NAT), `mftp relay --to <receiver>` blindly forwards the QUIC datagrams. End-to-end TLS means the relay only ever sees ciphertext — it cannot read or alter the transfer |
+| **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota) and optionally serves a read-only Web UI / JSON status API (`mftp daemon --http`). Every received transfer is recorded in a persistent queue (`~/.config/mftp/queue.json`, shown in the Web UI), and `--encrypt-at-rest <KEY_FILE>` stores received files encrypted (streaming AES-256-GCM, per-file keys; recover with `mftp decrypt`) |
 
 ---
 
@@ -34,7 +41,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 
 ### Install
 
-**Download a prebuilt binary** — latest release: **[v0.1.130](https://github.com/OmarHermannsson/mftp/releases/latest)** (Linux x86_64, macOS Intel + Apple Silicon, Windows x86_64; each with a `.sha256`):
+**Download a prebuilt binary** — from the **[latest release](https://github.com/OmarHermannsson/mftp/releases/latest)** (Linux x86_64, macOS Intel + Apple Silicon, Windows x86_64; each with a `.sha256`):
 
 ```sh
 # Linux x86_64 — verify the checksum, then install
@@ -144,6 +151,8 @@ mftp send [OPTIONS] <FILE> <DESTINATION>
 `DESTINATION` is either:
 - `host:port` — connect to an already-running `mftp receive`. The port must be reachable (UDP for QUIC, TCP for TCP+TLS).
 - `[user@]host:/remote/path` — launch the receiver via SSH (recommended). Falls back through QUIC → TCP+TLS → SFTP automatically.
+- `<name>` — a receiver advertised by name on the LAN (see `mftp daemon --name`); resolved via discovery to an address only. Announcements are unauthenticated, so the receiver is still verified via TOFU / `--trust`, or by `--trust-device <id>` (which also picks that device if several answer). Distinct devices answering for one name is an error.
+- `<device-id>` with `--rendezvous <broker>` — reach a NATed receiver by Device ID through a rendezvous broker.
 
 ```
 Options:
@@ -152,6 +161,18 @@ Options:
                            prompted to accept it once per session; it is not
                            automatically stored between sessions).
                            Ignored in SSH mode — fingerprint is read from the server.
+  --trust-device <HEX>     Pin the receiver's Ed25519 Device ID (as printed by
+                           `mftp receive`). Unlike --trust this survives the
+                           receiver re-issuing its certificate, and takes
+                           precedence over --trust. Ignored in SSH mode.
+  --rendezvous <HOST:PORT> Reach the receiver by Device ID (passed as DESTINATION)
+                           through a rendezvous broker at this address instead of a
+                           direct host:port. Candidates are exchanged for hole
+                           punching; the transfer itself stays peer-to-peer.
+  --paths <N>              Bond N QUIC connections for one transfer and stripe the
+                           data streams across them (link bonding for multi-homed
+                           hosts; default 1). Each path runs its own congestion
+                           control. QUIC only; ignored on TCP/SFTP.
   --remote-mftp <PATH>     Path to a pre-installed mftp on the remote host.
                            By default mftp pipes itself over SSH stdin on first use
                            and caches it at ~/.cache/mftp-<hash> on the remote.
@@ -223,10 +244,70 @@ Options:
 
 FEC parameters are negotiated automatically via the `TransferManifest` — no `--fec` flag needed on the receiver.
 
+### `mftp daemon` (Unix)
+
+```
+mftp daemon [OPTIONS] [BIND]
+```
+
+Runs a persistent **accept-many** receiver plus a local control socket — the v2 service mode. Unlike `mftp receive` (one transfer, then exit), the daemon stays up and serves transfers over time.
+
+```
+Options:
+  -o, --output-dir <DIR>   Directory to write received files into (default: .).
+      --socket <PATH>      Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock).
+      --name <NAME>        LAN discovery name to announce as (default: hostname).
+                           Senders can then use `mftp send <file> <name>`.
+      --http <HOST:PORT>   Also serve a read-only Web UI / JSON status API here.
+                           Unauthenticated: bind it to 127.0.0.1 (a non-loopback
+                           address prints a warning). Requests must carry an
+                           IP-literal or localhost Host header (DNS-rebinding guard).
+      --encrypt-at-rest <KEY_FILE>
+                           Store every received file encrypted as <name>.enc, under
+                           the master key in KEY_FILE (32 raw bytes or 64 hex
+                           digits; must be mode 0600).
+```
+
+Every transfer the daemon receives is recorded in `~/.config/mftp/queue.json` (active → completed/failed, with progress and the failure reason), which the dashboard's transfer table and `/queue` report; jobs a crashed daemon left active are marked failed on restart, and old finished jobs are pruned.
+
+With `--encrypt-at-rest`, each file is encrypted right after its transfer verifies (the plaintext exists only while it is being received) and the job is marked completed once that succeeds. Recover a file with:
+
+```bash
+mftp decrypt --key ~/.config/mftp/at-rest.key data.bin.enc        # → data.bin
+mftp decrypt --key ~/.config/mftp/at-rest.key data.bin.enc -o out.bin
+```
+
+Generate a key with e.g. `(umask 077; openssl rand -hex 32 > ~/.config/mftp/at-rest.key)` and keep a copy somewhere safe: files can't be recovered without it.
+
+When an authorization file exists (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
+
+Authorization **fails closed**:
+- A malformed or unreadable `acl.toml` / `authorized_devices` stops the daemon from starting; a SIGHUP reload that hits one logs an error and keeps the policy already in force.
+- Removing the last device (`daemon-trust remove`) leaves an empty allowlist, which **denies everyone** rather than re-opening the receiver. Open mode requires that neither `acl.toml` nor `authorized_devices` exists — delete the file explicitly and restart (or SIGHUP) to go back to open.
+- `acl.toml` peers must each have a distinct, non-nested `output_subdir` (not empty or `.`); quotas are checked against the peer's existing usage when it connects.
+
+### `mftp daemon-status` / `mftp daemon-trust` (Unix)
+
+```
+mftp daemon-status [--socket <PATH>]
+mftp daemon-trust  [--socket <PATH>] <add <id> | remove <id> | list>
+```
+
+`daemon-status` prints the running daemon's listen address, identity, and counters over its control socket. `daemon-trust` manages the authorized-sender Device ID allowlist (`add`/`remove`/`list`); changes take effect immediately. When `acl.toml` governs authorization, `add`/`remove` are refused — edit `acl.toml` and send SIGHUP instead. `list` and `daemon-status` always show the effective set the daemon is enforcing. The control socket is created 0600 and the daemon refuses to start if another daemon is already listening on it.
+
+### `mftp rendezvous` / `mftp relay`
+
+```
+mftp rendezvous [BIND]            # default 0.0.0.0:7779
+mftp relay --to <HOST:PORT> [BIND]  # default 0.0.0.0:7780
+```
+
+`rendezvous` runs a **signaling-only** broker so NATed peers can find each other by Device ID and exchange candidates for UDP hole punching — it never sees file data. `relay` runs a **zero-knowledge** UDP forwarder for when hole punching fails (symmetric NAT): it blindly forwards QUIC datagrams to `--to`, and because TLS terminates at the two endpoints it only ever sees ciphertext. Both are opt-in; direct and SSH transfers need neither.
+
 ### `mftp --version`
 
 ```
-mftp 0.1.119
+mftp 0.2.15
 ```
 
 ---
@@ -248,7 +329,7 @@ Sender                                    Receiver
                                              │  requires: SSH port 22 only
 ```
 
-The QUIC and TCP+TLS paths use TLS 1.3 with a freshly generated self-signed certificate shared between both transports (same fingerprint). The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
+The QUIC and TCP+TLS paths use TLS 1.3 with a self-signed certificate shared between both transports (same fingerprint). The certificate is bound to the receiver's persistent Ed25519 device key (`~/.config/mftp/`), so its fingerprint is stable across restarts. The SFTP path bypasses the mftp receiver entirely and writes directly to the remote filesystem via the sshd built-in sftp-server subsystem.
 
 ### SSH-assisted launch
 
@@ -432,10 +513,10 @@ The resume file is deleted on successful completion. Resume is not available on 
 
 mftp uses self-signed TLS certificates with a TOFU (Trust On First Use) model, similar to SSH:
 
-- The receiver generates a fresh key pair on every start
-- It prints the SHA-256 fingerprint of its certificate
-- On first connect to a new server the sender prompts for confirmation (requires a TTY; non-interactive invocations without `--trust` are rejected)
-- Pass `--trust <fingerprint>` to pin a fingerprint for scripted or non-interactive use; the fingerprint is not stored between sessions automatically
+- The receiver keeps a **persistent** Ed25519 device key and self-signed certificate in `~/.config/mftp/` (key at mode 0600), generating them on first run and reusing them thereafter
+- It prints the SHA-256 fingerprint of its certificate and a stable **Device ID** (SHA-256 of the Ed25519 public key); because the cert is bound to the persistent key, **both are stable across restarts**
+- On first connect to a new server the sender prompts for confirmation (requires a TTY; non-interactive invocations without `--trust`/`--trust-device` are rejected)
+- Pass `--trust <fingerprint>` to pin the certificate fingerprint, or `--trust-device <id>` to pin the Device ID (which survives the receiver re-issuing its certificate). Neither is stored between sessions automatically; precedence is `--trust-device` > `--trust` > TOFU
 
 For SSH-assisted transfers the fingerprint is obtained automatically over the existing SSH channel — no manual verification step required.
 
@@ -567,6 +648,8 @@ MACOSX_DEPLOYMENT_TARGET = "12.0"
 ## Roadmap
 
 - **Fingerprint persistence** — store `--trust` fingerprints across sessions (keyed by host)
+
+**[mftp v2 — Vision & Roadmap](docs/V2_VISION.md)** sketches the next major shape: a persistent `mftpd` daemon, a pluggable transport layer (multipath/link bonding), NAT traversal + rendezvous/relay for zero-config reach, and a multi-tenant service mode — all reusing today's chunk/BLAKE3/resume data plane, with classic point-to-point mode kept working.
 
 For shipped features and per-release history, see [CHANGELOG.md](CHANGELOG.md) and the [releases page](https://github.com/OmarHermannsson/mftp/releases).
 

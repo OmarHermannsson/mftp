@@ -10,10 +10,11 @@
 //!
 //! When `--remote-mftp` is not given the local binary is piped to the remote
 //! over SSH stdin.  The remote shell writes it to a content-addressed cache
-//! path (`~/.cache/mftp-<hash16>`), making subsequent transfers with the same
-//! binary version instant (the remote already has it; stdin is drained to
-//! `/dev/null`).  Only the first transfer — or after a version upgrade — pays
-//! the copy cost.
+//! path in a private per-user directory (`~/.cache/mftp/mftp-<os>-<arch>-<hash16>`),
+//! verifying its SHA-256 before installing it and again before reusing it, so
+//! subsequent transfers with the same binary version skip the install (stdin is
+//! drained to `/dev/null`).  Only the first transfer — or after a version
+//! upgrade — pays the install cost.  See [`remote_bootstrap_script`].
 //!
 //! When the remote OS/arch differs from the local machine, mftp can instead
 //! download the matching release binary from GitHub and pipe *that*.  Such
@@ -129,10 +130,7 @@ fn parse_remote_platform_output(output: &str) -> Option<RemotePlatform> {
 async fn probe_remote_platform(dest: &SshDest) -> Result<Option<RemotePlatform>> {
     // `uname -sm` on Unix; `ver` on Windows cmd.exe.  Both are run; one will
     // produce noise, the other the expected string — the parser skips noise.
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg(&dest.user_host)
+    let mut child = ssh_command(dest)
         .arg("uname -sm 2>/dev/null; ver 2>NUL")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -304,60 +302,40 @@ fn parse_sha256_line(body: &str) -> Option<String> {
         .map(|h| h.to_owned())
 }
 
-/// Pipe `binary` to the remote over SSH stdin and run it as a server.
+/// Pipe `binary` (built for `platform`) to the remote over SSH stdin and run
+/// it as a one-shot server.
 ///
-/// Behaves like `pipe_self_to_remote` but accepts arbitrary bytes and uses
-/// `platform` for the remote cache path so cross-platform binaries are stored
-/// separately from the local binary.
+/// The remote side caches the binary under a content-addressed name (see
+/// [`remote_bootstrap_script`]) so later transfers with the same binary skip
+/// the install; the bytes are still streamed and drained on a cache hit.
 async fn pipe_binary_to_remote(
     dest: &SshDest,
     binary: &[u8],
     platform: &RemotePlatform,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
-    let hash: String = {
-        let digest: [u8; 32] = Sha256::digest(binary).into();
-        hex::encode(&digest[..8])
-    };
-
-    let os = &platform.os;
-    let arch = &platform.arch;
-    let quoted_dir = shell_quote(&dest.remote_path);
-    let port_arg = match remote_port {
-        Some(p) => format!(" --port {p}"),
-        None => String::new(),
-    };
-
-    let remote_cmd = format!(
-        r#"set -e
-f="${{HOME:-/tmp}}/.cache/mftp-{os}-{arch}-{hash}"
-if [ ! -x "$f" ]; then
-  mkdir -p "$(dirname "$f")"
-  cat > "$f"
-  chmod +x "$f"
-  printf '[mftp] binary installed (%s)\n' "$(du -sh "$f" 2>/dev/null | cut -f1 || echo '?')" >&2
-else
-  cat > /dev/null
-  printf '[mftp] using cached binary\n' >&2
-fi
-d={quoted_dir}
-if [ ! -d "$d" ]; then d=$(dirname "$d"); fi
-exec "$f" server --output-dir "$d"{port_arg}"#
+    let digest: [u8; 32] = Sha256::digest(binary).into();
+    let script = remote_bootstrap_script(
+        &platform.os,
+        &platform.arch,
+        &hex::encode(digest),
+        binary.len() as u64,
+        &dest.remote_path,
+        remote_port,
+        require_peer,
     );
 
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg(&dest.user_host)
-        .arg("sh")
-        .arg("-c")
-        .arg(&remote_cmd)
+    let mut child = ssh_command(dest)
+        .arg(remote_sh_command(&script))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to spawn ssh(1)")?;
+        .context("failed to spawn ssh(1) — is it installed and in PATH?")?;
 
+    // Write the binary to ssh's stdin, then close it so the remote `cat`
+    // sees EOF and the script continues to the exec.
     let mut stdin = child.stdin.take().expect("stdin is piped");
     stdin
         .write_all(binary)
@@ -366,6 +344,115 @@ exec "$f" server --output-dir "$d"{port_arg}"#
     drop(stdin);
 
     Ok(child)
+}
+
+/// Build the POSIX `sh` script that installs (or reuses) the piped binary on
+/// the remote and execs it as `mftp server`.
+///
+/// * **Cache location** — `$XDG_CACHE_HOME/mftp`, else `$HOME/.cache/mftp`,
+///   else `${TMPDIR:-/tmp}/mftp-<uid>`.  The directory must be owned by the
+///   login user and must not be a symlink (so a directory pre-planted in a
+///   shared `/tmp` is rejected); otherwise a private `mktemp -d` directory is
+///   used for this run only.  It is `chmod 700` and files are created under
+///   `umask 077`.
+/// * **Integrity** — the full SHA-256 is checked with `sha256sum` or
+///   `shasum -a 256` (falling back to a byte-count check, with a warning, on
+///   hosts with neither).  A cached file that fails the check is replaced.  A
+///   fresh upload is written to a temp file, verified, `chmod`ed and only then
+///   atomically `mv`ed into place, so a truncated or interrupted upload can
+///   never be executed or poison the cache.
+///
+/// The script is a **single line** containing no `!` and no backslashes, so it
+/// survives being quoted for the remote login shell even when that shell is
+/// csh/tcsh (no multi-line quoted strings) or fish (which treats backslash
+/// sequences inside single quotes specially).
+fn remote_bootstrap_script(
+    os: &str,
+    arch: &str,
+    sha256_hex: &str,
+    size: u64,
+    remote_path: &str,
+    remote_port: Option<u16>,
+    require_peer: Option<&str>,
+) -> String {
+    let short = &sha256_hex[..16.min(sha256_hex.len())];
+    let env_prefix = require_peer_env(require_peer);
+    let quoted_dir = shell_quote(remote_path);
+    let port_arg = match remote_port {
+        Some(p) => format!(" --port {p}"),
+        None => String::new(),
+    };
+    [
+        "set -e;".to_owned(),
+        "umask 077;".to_owned(),
+        format!("want={sha256_hex};"),
+        // Pick a per-user cache directory; never a shared world-writable one.
+        r#"if [ -n "${XDG_CACHE_HOME:-}" ]; then c="$XDG_CACHE_HOME/mftp"; elif [ -n "${HOME:-}" ]; then c="$HOME/.cache/mftp"; else c="${TMPDIR:-/tmp}/mftp-$(id -u)"; fi;"#.to_owned(),
+        r#"mkdir -p "$c" 2>/dev/null || c=$(mktemp -d);"#.to_owned(),
+        // Reject a symlink or a directory owned by someone else.
+        r#"if [ -L "$c" ]; then c=$(mktemp -d); elif [ -O "$c" ]; then :; else c=$(mktemp -d); fi;"#.to_owned(),
+        r#"chmod 700 "$c";"#.to_owned(),
+        // ok FILE: does FILE have the expected content?
+        format!(
+            r#"ok() {{ if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum "$1" | cut -d" " -f1); elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 "$1" | cut -d" " -f1); else echo "[mftp] warning: no sha256sum/shasum on remote; checking size only" >&2; [ "$(wc -c < "$1" | tr -d " ")" = {size} ]; return; fi; [ "$h" = "$want" ]; }};"#
+        ),
+        format!(r#"f="$c/mftp-{os}-{arch}-{short}";"#),
+        r#"if [ -x "$f" ] && ok "$f"; then cat > /dev/null; echo "[mftp] using cached binary" >&2;"#.to_owned(),
+        r#"else t="$f.tmp.$$"; rm -f "$t"; cat > "$t";"#.to_owned(),
+        r#"if ok "$t"; then chmod 700 "$t"; mv -f "$t" "$f"; echo "[mftp] binary installed ($(wc -c < "$f" | tr -d " ") bytes)" >&2;"#.to_owned(),
+        r#"else rm -f "$t"; echo "[mftp] uploaded binary failed integrity verification; refusing to run it" >&2; exit 1; fi; fi;"#.to_owned(),
+        // scp-like destination semantics: a non-directory path is a file
+        // destination whose parent is the output dir.
+        format!(r#"d={quoted_dir}; if [ -d "$d" ]; then :; else d=$(dirname "$d"); fi;"#),
+        format!(r#"exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
+    ]
+    .join(" ")
+}
+
+/// Environment variable through which the SSH launcher hands the remote
+/// one-shot `mftp server` the sender's DeviceId to require.
+pub const REQUIRE_PEER_ENV: &str = "MFTP_REQUIRE_PEER";
+
+/// `env MFTP_REQUIRE_PEER=<id> ` prefix for the remote server command (empty
+/// when no id). `env` works from any login shell, and a binary predating the
+/// variable just ignores it. Ids that aren't plain hex are dropped rather than
+/// interpolated into the remote command.
+fn require_peer_env(require_peer: Option<&str>) -> String {
+    match require_peer {
+        Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("env {REQUIRE_PEER_ENV}={id} ")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Wrap `script` as a single remote command string `sh -c '<script>'`.
+///
+/// OpenSSH concatenates every argument after the destination with spaces and
+/// hands the result to the remote user's *login shell*.  Passing `sh`, `-c`,
+/// `script` as separate argv entries therefore makes the login shell run
+/// `sh -c set -e …` — `sh` receives only `set` as its script and the login
+/// shell (possibly fish/csh) interprets the rest itself, so `set -e` is
+/// ineffective.  Quoting the whole script as one word makes every shell hand
+/// it to `sh` verbatim.
+fn remote_sh_command(script: &str) -> String {
+    format!("sh -c {}", shell_quote(script))
+}
+
+/// Base `ssh(1)` invocation for `dest`.
+///
+/// `ControlPath=none` avoids reusing a multiplexed master (whose stdio
+/// plumbing interferes with piping the binary).  `--` terminates option
+/// parsing so the destination can never be interpreted as an ssh option, even
+/// if validation in [`parse_ssh_dest`] were bypassed.
+fn ssh_command(dest: &SshDest) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.arg("-o").arg("ControlPath=none");
+    if let Some(port) = dest.port {
+        cmd.arg("-p").arg(port.to_string());
+    }
+    cmd.arg("--").arg(&dest.user_host);
+    cmd
 }
 
 /// Prompt the user on `/dev/tty` to confirm downloading a cross-platform binary.
@@ -412,6 +499,9 @@ pub struct SshDest {
     pub host: String,
     /// Remote filesystem path for the output directory.
     pub remote_path: String,
+    /// SSH port, when given explicitly (`ssh://host:port/path`); `None` lets
+    /// `ssh(1)` use its config/default and the SFTP fallback use 22.
+    pub port: Option<u16>,
 }
 
 /// Try to parse `dest` as an SSH destination.
@@ -421,7 +511,18 @@ pub struct SshDest {
 /// valid port number.
 /// Returns `Err` if the destination looks like an SSH path but no username
 /// can be determined (no `user@` prefix and `$USER`/`$LOGNAME` are both unset).
+///
+/// The URL form `ssh://[user@]host[:port][/path]` is also accepted and is the
+/// way to give a non-default SSH port (the port is passed to `ssh -p` and used
+/// by the SFTP fallback).  IPv6 hosts may be bracketed (`user@[::1]:/path`).
+///
+/// Destinations whose user or host begins with `-` are rejected: `ssh(1)`
+/// would otherwise parse them as options (e.g. `-oProxyCommand=…`).
 pub fn parse_ssh_dest(dest: &str) -> Result<Option<SshDest>> {
+    if let Some(rest) = dest.strip_prefix("ssh://") {
+        return parse_ssh_url(dest, rest).map(Some);
+    }
+
     let Some(colon) = dest.rfind(':') else {
         return Ok(None);
     };
@@ -433,30 +534,119 @@ pub fn parse_ssh_dest(dest: &str) -> Result<Option<SshDest>> {
         return Ok(None);
     }
 
-    let (user_host, user, host) = if let Some(at) = before.find('@') {
-        (
-            before.to_owned(),
-            before[..at].to_owned(),
-            before[at + 1..].to_owned(),
-        )
-    } else {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "cannot determine SSH username for {dest:?}: \
-                     no user@host prefix and $USER/$LOGNAME are not set"
-                )
-            })?;
-        (before.to_owned(), user, before.to_owned())
-    };
+    let (user, host) = split_user_host(before);
+    build_dest(dest, user, host, after.to_owned(), None).map(Some)
+}
 
-    Ok(Some(SshDest {
+/// Parse the part after `ssh://`: `[user@]host[:port][/path]`.
+fn parse_ssh_url(dest: &str, rest: &str) -> Result<SshDest> {
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_owned()),
+        None => (rest, ".".to_owned()),
+    };
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        // [v6]:port or [v6]
+        let close = inner
+            .find(']')
+            .with_context(|| format!("unterminated '[' in SSH destination {dest:?}"))?;
+        let port = match &inner[close + 1..] {
+            "" => None,
+            p => Some(p.strip_prefix(':').unwrap_or(p)),
+        };
+        (&inner[..close], port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let port = port
+        .map(|p| {
+            p.parse::<u16>()
+                .ok()
+                .filter(|&p| p != 0)
+                .with_context(|| format!("invalid SSH port {p:?} in {dest:?}"))
+        })
+        .transpose()?;
+    build_dest(
+        dest,
+        userinfo.map(str::to_owned),
+        host.to_owned(),
+        path,
+        port,
+    )
+}
+
+/// Split `[user@]host` (host optionally `[bracketed]`).
+fn split_user_host(before: &str) -> (Option<String>, String) {
+    let (user, host) = match before.find('@') {
+        Some(at) => (Some(before[..at].to_owned()), &before[at + 1..]),
+        None => (None, before),
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    (user, host.to_owned())
+}
+
+fn default_user(dest: &str) -> Result<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "cannot determine SSH username for {dest:?}: \
+                 no user@host prefix and $USER/$LOGNAME are not set"
+            )
+        })
+}
+
+/// Validate the components and assemble an [`SshDest`].
+///
+/// With no explicit user, `user_host` is just the host so `ssh(1)` still
+/// applies any `User` from ssh_config; `user` (for the SFTP fallback, which
+/// does not read ssh_config) defaults to `$USER`/`$LOGNAME`.
+fn build_dest(
+    dest: &str,
+    explicit_user: Option<String>,
+    host: String,
+    remote_path: String,
+    port: Option<u16>,
+) -> Result<SshDest> {
+    let user = match &explicit_user {
+        Some(u) => u.clone(),
+        None => default_user(dest)?,
+    };
+    if host.is_empty() {
+        bail!("SSH destination {dest:?} has no host");
+    }
+    if user.is_empty() {
+        bail!("SSH destination {dest:?} has an empty user name");
+    }
+    // ssh(1) would parse a leading '-' as an option (e.g. -oProxyCommand=…).
+    if host.starts_with('-') || user.starts_with('-') {
+        bail!("refusing SSH destination {dest:?}: user/host must not start with '-'");
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) || user.contains(char::is_control)
+    {
+        bail!("refusing SSH destination {dest:?}: invalid characters in user/host");
+    }
+    // ssh(1) takes IPv6 literals unbracketed.
+    let user_host = match explicit_user {
+        Some(_) => format!("{user}@{host}"),
+        None => host.clone(),
+    };
+    Ok(SshDest {
         user_host,
         user,
         host,
-        remote_path: after.to_owned(),
-    }))
+        remote_path,
+        port,
+    })
 }
 
 // ── SSH launch + transfer ─────────────────────────────────────────────────────
@@ -512,8 +702,14 @@ pub async fn send_via_ssh(
     // When no pre-installed binary is specified we pipe the local binary to the
     // remote.  That only works if the remote runs the same OS and architecture;
     // probe first so we fail clearly instead of hanging on a bad exec.
+    // Lock the one-shot remote server to our own DeviceId so another host that
+    // reaches its port first can't take the transfer slot.
+    let require_peer = config
+        .client_identity
+        .as_ref()
+        .map(|id| id.device_id.as_str());
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port, require_peer)?,
         None => {
             let local = local_platform();
             let remote_platform = probe_remote_platform(&dest).await?;
@@ -552,7 +748,15 @@ pub async fn send_via_ssh(
                     match download_remote_binary(rp, binary_sha256.as_deref()).await {
                         Ok(binary) => {
                             eprintln!("[mftp] piping downloaded binary to remote ({remote_desc})…");
-                            match pipe_binary_to_remote(&dest, &binary, rp, remote_port).await {
+                            match pipe_binary_to_remote(
+                                &dest,
+                                &binary,
+                                rp,
+                                remote_port,
+                                require_peer,
+                            )
+                            .await
+                            {
                                 Ok(child) => child,
                                 Err(e) => {
                                     eprintln!(
@@ -579,7 +783,7 @@ pub async fn send_via_ssh(
                     return crate::sftp::send_via_sftp(file, dest, n).await;
                 }
             } else {
-                pipe_self_to_remote(&dest, remote_port).await?
+                pipe_self_to_remote(&dest, remote_port, require_peer).await?
             }
         }
     };
@@ -724,6 +928,7 @@ fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let port_arg = match remote_port {
         Some(p) => format!(" --port {p}"),
@@ -734,17 +939,15 @@ fn spawn_remote_binary(
     // E.g. host:/data/file writes to /data/file (parent = /data, filename from manifest).
     let quoted_dir = shell_quote(&dest.remote_path);
     let remote_cmd = format!(
-        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {} server --output-dir \"$d\"{}",
+        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {}{} server --output-dir \"$d\"{}",
+        require_peer_env(require_peer),
         shell_quote(bin),
         port_arg,
     );
     // Pass the command as a single argument so SSH sends it verbatim to the
     // remote login shell.  Using `sh -c <script>` here would make `server`
     // and `--output-dir` become $0/$1 (ignored) instead of mftp arguments.
-    tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg(&dest.user_host)
+    ssh_command(dest)
         .arg(&remote_cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -755,80 +958,21 @@ fn spawn_remote_binary(
 
 /// Pipe the local binary to the remote over SSH stdin and run it as a server.
 ///
-/// The remote shell script caches the binary at `~/.cache/mftp-<hash16>` so
-/// that a second call with an identical binary skips the copy and just runs
-/// the cached file.
+/// The remote caches the binary under a content-addressed name so a second
+/// call with an identical binary skips the install; see
+/// [`remote_bootstrap_script`] for the caching and integrity checks.
 async fn pipe_self_to_remote(
     dest: &SshDest,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
         .await
         .with_context(|| format!("cannot read {}", exe.display()))?;
-
-    // 16 hex chars of SHA-256 — enough to identify a binary version uniquely.
-    let hash: String = {
-        let digest: [u8; 32] = Sha256::digest(&binary).into();
-        hex::encode(&digest[..8])
-    };
-
-    // Embed OS + arch in the cache name so that a shared remote receiving
-    // from clients of different platforms stores binaries separately.
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-
-    let quoted_dir = shell_quote(&dest.remote_path);
-    let port_arg = match remote_port {
-        Some(p) => format!(" --port {p}"),
-        None => String::new(),
-    };
-
-    // Remote script:
-    //   • Derive a stable cache path from OS, arch, and binary content hash.
-    //   • If the cached file does not exist: write stdin to it and chmod +x.
-    //   • Otherwise: drain stdin (cat > /dev/null) so the pipe is clean.
-    //   • Exec the cached binary as a one-shot server.
-    let remote_cmd = format!(
-        r#"set -e
-f="${{HOME:-/tmp}}/.cache/mftp-{os}-{arch}-{hash}"
-if [ ! -x "$f" ]; then
-  mkdir -p "$(dirname "$f")"
-  cat > "$f"
-  chmod +x "$f"
-  printf '[mftp] binary installed (%s)\n' "$(du -sh "$f" 2>/dev/null | cut -f1 || echo '?')" >&2
-else
-  cat > /dev/null
-  printf '[mftp] using cached binary\n' >&2
-fi
-d={quoted_dir}
-if [ ! -d "$d" ]; then d=$(dirname "$d"); fi
-exec "$f" server --output-dir "$d"{port_arg}"#
-    );
-
-    let mut child = tokio::process::Command::new("ssh")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg(&dest.user_host)
-        .arg("sh")
-        .arg("-c")
-        .arg(&remote_cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("failed to spawn ssh(1) — is it installed and in PATH?")?;
-
-    // Write the binary to ssh's stdin, then close it so the remote `cat`
-    // sees EOF and the script continues to the exec.
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    stdin
-        .write_all(&binary)
-        .await
-        .context("writing binary to ssh stdin")?;
-    drop(stdin);
-
-    Ok(child)
+    // OS + arch are part of the cache name so a shared remote receiving from
+    // clients of different platforms stores binaries separately.
+    pipe_binary_to_remote(dest, &binary, &local_platform(), remote_port, require_peer).await
 }
 
 /// Single-quote a string for safe embedding in a POSIX shell command.
@@ -859,8 +1003,210 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use super::{
         download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
-        platform_matches, shell_quote, RemotePlatform,
+        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command,
+        require_peer_env, shell_quote, RemotePlatform, REQUIRE_PEER_ENV,
     };
+
+    /// The remote command must be ONE shell word after `sh -c`, on one line,
+    /// with no `!`/backslashes inside the script (csh/fish compatibility).
+    #[test]
+    fn remote_command_is_single_quoted_sh_c() {
+        let script = remote_bootstrap_script(
+            "linux",
+            "x86_64",
+            &"ab".repeat(32),
+            1234,
+            "/data/it's here",
+            Some(9000),
+            Some(&"cd".repeat(32)),
+        );
+        assert!(!script.contains('\n'), "script must be a single line");
+        assert!(!script.contains('!'), "no history-expansion characters");
+        // The only backslashes come from shell_quote escaping the path's `'`.
+        assert!(!script.replace(r"'\''", "").contains('\\'));
+        let cmd = remote_sh_command(&script);
+        assert!(cmd.starts_with("sh -c '"));
+        assert!(cmd.ends_with('\''));
+        assert!(script.contains("--port 9000"));
+        assert!(script.contains(&format!("env {REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        // Anything but plain hex is never interpolated into the command.
+        assert_eq!(require_peer_env(Some("x; rm -rf ~")), "");
+    }
+
+    /// Run the bootstrap exactly as the remote login shell would (`sh -c` of
+    /// the quoted command) against a fake "binary", covering install, cache
+    /// hit, a tampered cache entry, and a corrupt upload.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_script_installs_verifies_and_rejects() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let home = tempfile::TempDir::new().unwrap();
+        let out = tempfile::TempDir::new().unwrap();
+        let binary = b"#!/bin/sh\necho \"ARGS:$*\"\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&binary));
+        let script = remote_bootstrap_script(
+            "linux",
+            "x86_64",
+            &hash,
+            binary.len() as u64,
+            out.path().to_str().unwrap(),
+            None,
+            None,
+        );
+        let cmd = remote_sh_command(&script);
+
+        let run = |stdin_bytes: &[u8]| {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("HOME", home.path())
+                .env_remove("XDG_CACHE_HOME")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(stdin_bytes).unwrap();
+            let o = child.wait_with_output().unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        let expected = format!("ARGS:server --output-dir {}", out.path().display());
+        let cache_dir = home.path().join(".cache/mftp");
+        let cached = cache_dir.join(format!("mftp-linux-x86_64-{}", &hash[..16]));
+
+        // 1. First run installs.
+        let (ok, stdout, stderr) = run(&binary);
+        assert!(ok, "install failed: {stderr}");
+        assert_eq!(stdout.trim(), expected);
+        assert!(stderr.contains("binary installed"), "{stderr}");
+        let mode = std::fs::metadata(&cache_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "cache dir must be private");
+
+        // 2. Second run hits the cache.
+        let (ok, stdout, stderr) = run(&binary);
+        assert!(ok, "{stderr}");
+        assert_eq!(stdout.trim(), expected);
+        assert!(stderr.contains("using cached binary"), "{stderr}");
+
+        // 3. A tampered cache entry is detected and replaced.
+        std::fs::write(&cached, b"#!/bin/sh\necho EVIL\n").unwrap();
+        let (ok, stdout, stderr) = run(&binary);
+        assert!(ok, "{stderr}");
+        assert_eq!(stdout.trim(), expected, "tampered binary must not run");
+        assert!(stderr.contains("binary installed"), "{stderr}");
+
+        // 4. A corrupt upload is refused and never installed.
+        std::fs::remove_file(&cached).unwrap();
+        let (ok, stdout, stderr) = run(b"#!/bin/sh\necho CORRUPT\n");
+        assert!(!ok, "corrupt upload must fail");
+        assert!(!stdout.contains("CORRUPT"));
+        assert!(stderr.contains("integrity"), "{stderr}");
+        assert!(!cached.exists(), "corrupt upload must not reach the cache");
+        let leftovers: Vec<_> = std::fs::read_dir(&cache_dir).unwrap().collect();
+        assert!(leftovers.is_empty(), "temp file must be cleaned up");
+    }
+
+    /// With HOME unset the cache must not land in a shared `/tmp/.cache`; a
+    /// per-uid directory under TMPDIR is used instead, and a directory planted
+    /// there as a symlink is refused.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_script_without_home_uses_private_tmpdir() {
+        use sha2::{Digest, Sha256};
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tempfile::TempDir::new().unwrap();
+        let binary = b"#!/bin/sh\necho OK\n".to_vec();
+        let hash = hex::encode(Sha256::digest(&binary));
+        let cmd = remote_sh_command(&remote_bootstrap_script(
+            "linux",
+            "x86_64",
+            &hash,
+            binary.len() as u64,
+            out.path().to_str().unwrap(),
+            None,
+            None,
+        ));
+        // Plant a symlink where the per-uid dir would go, pointing elsewhere.
+        let uid = unsafe { libc::getuid() };
+        let decoy = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(decoy.path(), tmp.path().join(format!("mftp-{uid}"))).unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env_remove("HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env("TMPDIR", tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&binary).unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "OK");
+        assert!(
+            std::fs::read_dir(decoy.path()).unwrap().next().is_none(),
+            "nothing may be written through a planted symlink"
+        );
+    }
+
+    #[test]
+    fn parse_dest_rejects_option_injection() {
+        for d in [
+            "-oProxyCommand=touch /tmp/pwn:/x",
+            "-oProxyCommand=x@host:/x",
+            "user@-oProxyCommand=x:/x",
+            "ssh://-oProxyCommand=x/x",
+            "ssh://user@-host/x",
+        ] {
+            assert!(parse_ssh_dest(d).is_err(), "{d:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_dest_forms() {
+        let d = parse_ssh_dest("alice@example.com:/data").unwrap().unwrap();
+        assert_eq!(
+            (d.user.as_str(), d.host.as_str(), d.user_host.as_str()),
+            ("alice", "example.com", "alice@example.com")
+        );
+        assert_eq!((d.remote_path.as_str(), d.port), ("/data", None));
+
+        // Plain host:port stays a direct address.
+        assert!(parse_ssh_dest("example.com:4433").unwrap().is_none());
+
+        // ssh:// URL with a port.
+        let d = parse_ssh_dest("ssh://bob@host.example:2222/srv/in")
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.user.as_str(), d.host.as_str()), ("bob", "host.example"));
+        assert_eq!((d.remote_path.as_str(), d.port), ("/srv/in", Some(2222)));
+
+        // Bracketed IPv6, both forms.
+        let d = parse_ssh_dest("ssh://carol@[::1]:2200/tmp")
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.host.as_str(), d.port), ("::1", Some(2200)));
+        let d = parse_ssh_dest("carol@[fe80::1]:/tmp").unwrap().unwrap();
+        assert_eq!(d.host, "fe80::1");
+
+        // Bad ports.
+        assert!(parse_ssh_dest("ssh://h:0/x").is_err());
+        assert!(parse_ssh_dest("ssh://h:99999/x").is_err());
+    }
 
     #[test]
     fn shell_quote_plain() {

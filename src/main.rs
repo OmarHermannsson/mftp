@@ -27,8 +27,12 @@ EXAMPLES:
   # Recursive directory transfer, preserving mode + mtime
   mftp send -r ./dataset user@host:/data/ --preserve
 
-  # Lossy/satellite link: add Reed-Solomon FEC (8 data : 2 parity shards)
-  mftp send bigfile.tar user@host:/data/ --fec 8:2
+  # Lossy/satellite link: no extra flags needed — QUIC retransmits lost packets.
+  # (Don't add --fec for throughput: parity is pure overhead on reliable streams.)
+  mftp send bigfile.tar user@host:/data/
+
+  # Fast link where zstd is the bottleneck: skip compression
+  mftp send bigfile.tar user@host:/data/ --no-compress
 
   # Pin a fingerprint for unattended/scripted runs (no TOFU prompt)
   mftp send bigfile.tar 203.0.113.7:7777 --trust <hex-sha256>
@@ -66,65 +70,6 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of parallel streams.
-    /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
-    /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
-    /// scales linearly — raise to 12 if the remote sshd allows it).
-    #[arg(short = 'n', long, global = true, value_name = "N")]
-    streams: Option<usize>,
-
-    /// Chunk size in bytes (default: auto-negotiated from RTT)
-    #[arg(long, global = true)]
-    chunk_size: Option<usize>,
-
-    /// Disable adaptive zstd compression
-    #[arg(long, global = true)]
-    no_compress: bool,
-
-    /// Enable Reed-Solomon forward error correction.
-    ///
-    /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead).
-    /// NOTE: this does NOT improve throughput. mftp's chunks ride reliable QUIC
-    /// streams, which already retransmit lost packets, so the parity is pure
-    /// overhead competing for the link (benchmarked a wash-to-worse up to 30%
-    /// loss). Leave it off unless you specifically want the receiver to
-    /// reconstruct an occasional corrupt chunk without an in-band repair round.
-    /// Automatically disabled when the transport falls back to TCP (reliable delivery).
-    #[arg(long, global = true, value_name = "DATA:PARITY")]
-    fec: Option<String>,
-
-    /// Force a specific transport path.
-    ///
-    /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
-    ///
-    /// tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
-    ///
-    /// sftp — parallel SFTP through SSH port 22 (SSH mode only; ~22 MiB/s cap).
-    ///        Skips the remote mftp server launch — port 22 is all that's needed.
-    ///
-    /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
-    #[arg(long, global = true, value_name = "TRANSPORT")]
-    transport: Option<Transport>,
-
-    /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
-    /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
-    /// congestion window ramp-up.  Set 0 to always use QUIC, or higher to widen the
-    /// TCP window.  Ignored when --transport is set.
-    ///
-    /// Left as `Option` (rather than a clap `default_value`) so the config file
-    /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
-    /// is applied in `main` after merging CLI > config.
-    #[arg(long, global = true, value_name = "MS")]
-    tcp_below_rtt: Option<f64>,
-
-    /// Use multiple parallel file readers instead of a single sequential reader.
-    ///
-    /// Splits the file into one range per stream and reads them concurrently.
-    /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
-    /// effect on network-bound transfers or spinning disks.
-    #[arg(long, global = true, hide = true)]
-    parallel_reads: bool,
-
     /// Verbosity (-v = info, -vv = debug, -vvv = trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -154,6 +99,17 @@ enum Command {
         /// Ignored in SSH mode — fingerprint is obtained automatically.
         #[arg(long)]
         trust: Option<String>,
+        /// Reach the receiver by Ed25519 DeviceId through a rendezvous broker at
+        /// this address, instead of a direct host:port. The broker exchanges
+        /// candidate addresses; the transfer itself stays peer-to-peer.
+        #[arg(long, value_name = "HOST:PORT")]
+        rendezvous: Option<String>,
+        /// Pin the receiver's Ed25519 DeviceId (hex), as printed by `mftp receive`
+        /// ("Device ID: …"). Unlike --trust this survives the receiver re-issuing
+        /// its certificate, and takes precedence over --trust when both are given.
+        /// Ignored in SSH mode.
+        #[arg(long, value_name = "HEX")]
+        trust_device: Option<String>,
         /// Path to a pre-installed mftp binary on the remote (SSH mode only).
         /// By default mftp pipes itself over SSH stdin and caches it at
         /// ~/.cache/mftp-<hash> on the remote; subsequent transfers with the
@@ -199,6 +155,67 @@ enum Command {
         /// Has no effect when the receiver runs on Windows.
         #[arg(long)]
         preserve: bool,
+        /// Number of parallel streams.
+        /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
+        /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
+        /// scales linearly — raise to 12 if the remote sshd allows it).
+        #[arg(short = 'n', long, value_name = "N", value_parser = parse_streams_arg)]
+        streams: Option<usize>,
+        /// Chunk size in bytes, 4096..=134217728 (default: auto-negotiated from RTT)
+        #[arg(long, value_parser = parse_chunk_size_arg)]
+        chunk_size: Option<usize>,
+        /// Number of QUIC connections (paths) to bond for one transfer (default 1).
+        ///
+        /// Values above 1 open that many connections to the receiver and stripe the
+        /// data streams across them — link bonding for multi-homed hosts (e.g. Wi-Fi
+        /// plus wired, or two WAN uplinks). Each path runs its own congestion
+        /// control, so a faster path naturally carries more chunks. QUIC only;
+        /// ignored on the TCP and SFTP paths.
+        #[arg(long, value_name = "N")]
+        paths: Option<usize>,
+        /// Disable adaptive zstd compression
+        #[arg(long)]
+        no_compress: bool,
+        /// Enable Reed-Solomon forward error correction.
+        ///
+        /// Specify as DATA:PARITY (e.g. --fec 8:2 adds 25% bandwidth overhead).
+        /// NOTE: this does NOT improve throughput. mftp's chunks ride reliable QUIC
+        /// streams, which already retransmit lost packets, so the parity is pure
+        /// overhead competing for the link (benchmarked a wash-to-worse up to 30%
+        /// loss). Leave it off unless you specifically want the receiver to
+        /// reconstruct an occasional corrupt chunk without an in-band repair round.
+        /// Automatically disabled when the transport falls back to TCP (reliable delivery).
+        #[arg(long, value_name = "DATA:PARITY")]
+        fec: Option<String>,
+        /// Force a specific transport path.
+        ///
+        /// quic — QUIC only; fails immediately if UDP is blocked (no TCP or SFTP fallback).
+        ///
+        /// tcp  — TCP+TLS only; skip the QUIC probe (no SFTP fallback).
+        ///
+        /// sftp — parallel SFTP through SSH port 22 (SSH mode only; ~22 MiB/s cap).
+        ///        Skips the remote mftp server launch — port 22 is all that's needed.
+        ///
+        /// Omit to use auto mode: QUIC → TCP+TLS → SFTP (SSH mode only).
+        #[arg(long, value_name = "TRANSPORT")]
+        transport: Option<Transport>,
+        /// In auto mode, switch to TCP+TLS when measured RTT is at or below this value (ms).
+        /// Default 15 ms: QUIC+BBR is slower than TCP+CUBIC at low latency due to slow
+        /// congestion window ramp-up.  Set 0 to always use QUIC, or higher to widen the
+        /// TCP window.  Ignored when --transport is set.
+        ///
+        /// Left as `Option` (rather than a clap `default_value`) so the config file
+        /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
+        /// is applied in `main` after merging CLI > config.
+        #[arg(long, value_name = "MS", value_parser = parse_tcp_below_rtt_arg)]
+        tcp_below_rtt: Option<f64>,
+        /// Use multiple parallel file readers instead of a single sequential reader.
+        ///
+        /// Splits the file into one range per stream and reads them concurrently.
+        /// Only beneficial on local NVMe with queue depth ≥ 32; has no measurable
+        /// effect on network-bound transfers or spinning disks.
+        #[arg(long, hide = true)]
+        parallel_reads: bool,
     },
     /// Receive files (run as server)
     Receive {
@@ -218,6 +235,82 @@ enum Command {
         /// Port to listen on (default: random)
         #[arg(long)]
         port: Option<u16>,
+    },
+    /// Run the persistent receiver daemon (accept-many) with a local control
+    /// socket. Add authorized sender DeviceIds with `mftp daemon-trust` to
+    /// enforce mutual-TLS identity auth.
+    #[cfg(unix)]
+    Daemon {
+        /// Address to listen on
+        #[arg(default_value = "0.0.0.0:7777")]
+        bind: String,
+        /// Directory to write received files into
+        #[arg(short, long, default_value = ".")]
+        output_dir: std::path::PathBuf,
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+        /// LAN discovery name to announce as (default: this host's hostname).
+        /// Senders can then use `mftp send <file> <name>`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Also serve a read-only Web UI / JSON status API on this address.
+        #[arg(long, value_name = "HOST:PORT")]
+        http: Option<String>,
+        /// Encrypt every received file at rest (stored as `<name>.enc`) with
+        /// the master key in this file: 32 raw bytes or 64 hex digits, mode
+        /// 0600. Recover files with `mftp decrypt --key <KEY_FILE>`.
+        #[arg(long, value_name = "KEY_FILE")]
+        encrypt_at_rest: Option<std::path::PathBuf>,
+    },
+    /// Decrypt a file the daemon stored with --encrypt-at-rest.
+    Decrypt {
+        /// Master key file (as passed to `daemon --encrypt-at-rest`)
+        #[arg(long, value_name = "KEY_FILE")]
+        key: std::path::PathBuf,
+        /// Encrypted file (`<name>.enc`)
+        input: std::path::PathBuf,
+        /// Where to write the plaintext (default: input without `.enc`); never
+        /// overwritten
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+    /// Query a running daemon's status / identity over its control socket.
+    #[cfg(unix)]
+    DaemonStatus {
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+    /// Run a rendezvous broker so NATed peers can find each other by DeviceId.
+    /// Signaling only — the broker never sees file data.
+    Rendezvous {
+        /// Address to listen on
+        #[arg(default_value = "0.0.0.0:7779")]
+        bind: String,
+    },
+    /// Run a zero-knowledge UDP relay: blindly forward QUIC datagrams to a
+    /// receiver when hole punching fails. End-to-end TLS keeps the relay from
+    /// seeing file data. Senders aim `mftp send <file> <relay-addr>` at it,
+    /// with the printed session token in `MFTP_RELAY_TOKEN`.
+    Relay {
+        /// Address to listen on for sender datagrams
+        #[arg(default_value = "0.0.0.0:7780")]
+        bind: String,
+        /// Receiver address to forward to (host:port)
+        #[arg(long, value_name = "HOST:PORT")]
+        to: String,
+    },
+    /// Manage the daemon's authorized-sender DeviceId allowlist.
+    #[cfg(unix)]
+    DaemonTrust {
+        /// add <id> | remove <id> | list
+        action: String,
+        /// DeviceId (hex) for add/remove
+        device_id: Option<String>,
+        /// Control socket path (default: $XDG_RUNTIME_DIR/mftpd.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
     },
 }
 
@@ -256,6 +349,33 @@ fn parse_fec(s: &str) -> Result<FecParams> {
     })
 }
 
+/// clap parser for `-n/--streams`: a positive integer within the receiver's limit.
+fn parse_streams_arg(s: &str) -> std::result::Result<usize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a positive integer, got {s:?}"))?;
+    mftp::config::validate_streams(n).map_err(|e| e.to_string())
+}
+
+/// clap parser for `--chunk-size`: bytes within the receiver's accepted range.
+fn parse_chunk_size_arg(s: &str) -> std::result::Result<usize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a size in bytes, got {s:?}"))?;
+    mftp::config::validate_chunk_size(n).map_err(|e| e.to_string())
+}
+
+/// clap parser for `--tcp-below-rtt`: a finite, non-negative number of ms.
+fn parse_tcp_below_rtt_arg(s: &str) -> std::result::Result<f64, String> {
+    let ms: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number of milliseconds, got {s:?}"))?;
+    mftp::config::validate_tcp_below_rtt(ms).map_err(|e| e.to_string())
+}
+
 /// Map a transport name from the config file to a `ForcedTransport`.
 ///
 /// Accepts the same spellings as the `--transport` CLI flag (case-insensitive).
@@ -290,6 +410,8 @@ async fn main() -> Result<()> {
             file,
             destination,
             trust,
+            rendezvous,
+            trust_device,
             remote_mftp,
             port,
             download,
@@ -297,19 +419,26 @@ async fn main() -> Result<()> {
             recursive,
             preserve,
             remote_binary_sha256,
+            streams,
+            chunk_size,
+            paths,
+            no_compress,
+            fec,
+            transport,
+            tcp_below_rtt,
+            parallel_reads,
         } => {
             // Merge persistent tuning knobs: explicit CLI flag > config file >
-            // built-in default.  Each `cli.*` Option is `None` only when the
-            // flag was omitted, so `.or(...)` makes the CLI win cleanly.
-            let tcp_below_rtt = cli
-                .tcp_below_rtt
+            // built-in default.  Each flag Option is `None` only when it was
+            // omitted, so `.or(...)` makes the CLI win cleanly.
+            let tcp_below_rtt = tcp_below_rtt
                 .or(file_cfg.tcp_below_rtt)
                 .unwrap_or(DEFAULT_TCP_BELOW_RTT_MS);
             let tcp_rtt_threshold = std::time::Duration::from_secs_f64(tcp_below_rtt / 1000.0);
 
             // `--transport` (Option) wins; otherwise fall back to the config's
             // string form, which is parsed (and validated) here.
-            let forced_transport = match cli.transport {
+            let forced_transport = match transport {
                 Some(Transport::Quic) => Some(ForcedTransport::Quic),
                 Some(Transport::Tcp) => Some(ForcedTransport::Tcp),
                 Some(Transport::Sftp) => Some(ForcedTransport::Sftp),
@@ -319,7 +448,7 @@ async fn main() -> Result<()> {
                 },
             };
 
-            let fec = match cli.fec.as_deref().or(file_cfg.fec.as_deref()) {
+            let fec = match fec.as_deref().or(file_cfg.fec.as_deref()) {
                 Some(s) => Some(parse_fec(s)?),
                 None => None,
             };
@@ -327,10 +456,10 @@ async fn main() -> Result<()> {
             // `--no-compress` is a one-way flag: passing it on the CLI or
             // setting it in the config disables compression.  There is no CLI
             // way to force compression back on, so OR is the correct merge.
-            let compress = !(cli.no_compress || file_cfg.no_compress);
+            let compress = !(no_compress || file_cfg.no_compress);
 
-            let streams = cli.streams.or(file_cfg.streams);
-            let chunk_size = cli.chunk_size.or(file_cfg.chunk_size);
+            let streams = streams.or(file_cfg.streams);
+            let chunk_size = chunk_size.or(file_cfg.chunk_size);
             let port = port.or(file_cfg.port);
 
             // Validate -r / directory combination early to give a clear error.
@@ -340,16 +469,34 @@ async fn main() -> Result<()> {
                     file.display()
                 );
             }
-            let config = sender::SendConfig {
+            let mut config = sender::SendConfig {
                 streams,
                 chunk_size,
                 compress,
                 compress_level: 3,
                 trusted_fingerprint: trust,
+                trusted_device: trust_device,
+                // Present our persistent device identity as a client certificate
+                // so daemons enforcing DeviceId auth can verify this sender. A
+                // load failure is non-fatal (open receivers don't need it) but is
+                // surfaced, since against an auth-enforcing daemon it turns into
+                // an opaque TLS handshake rejection otherwise.
+                client_identity: match mftp::identity::load_or_create() {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        eprintln!(
+                            "[mftp] warning: could not load device identity ({e:#}); \
+                             sending without a client certificate — an auth-enforcing \
+                             daemon will reject this transfer"
+                        );
+                        None
+                    }
+                },
                 forced_transport,
                 tcp_rtt_threshold,
                 fec,
-                parallel_reads: cli.parallel_reads,
+                parallel_reads,
+                paths: paths.unwrap_or(1).max(1),
                 recursive,
                 preserve,
             };
@@ -358,7 +505,39 @@ async fn main() -> Result<()> {
                 (_, true) => mftp::ssh::DownloadPolicy::Never,
                 _ => mftp::ssh::DownloadPolicy::Ask,
             };
-            if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
+            if let Some(broker) = rendezvous {
+                // Reach the receiver by DeviceId through the broker (M6).
+                let broker_addr: std::net::SocketAddr = broker
+                    .parse()
+                    .with_context(|| format!("invalid --rendezvous address: {broker}"))?;
+                let candidates = match mftp::reach::lookup(broker_addr, &destination, vec![])
+                    .await
+                    .context("rendezvous lookup")?
+                {
+                    Some(c) => c,
+                    None => anyhow::bail!(
+                        "device {destination:?} is not registered at the rendezvous broker"
+                    ),
+                };
+                if config.trusted_fingerprint.is_none() && config.trusted_device.is_none() {
+                    config.trusted_device = Some(destination.clone());
+                }
+                // Try each candidate (hole-punched/direct path) until one connects.
+                let mut last_err = None;
+                for cand in &candidates {
+                    eprintln!("[mftp] rendezvous: trying candidate {cand}");
+                    match sender::send(file.clone(), *cand, config.clone()).await {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            eprintln!("[mftp] candidate {cand} failed: {e:#}");
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| {
+                    anyhow::anyhow!("no rendezvous candidates for {destination}")
+                }))
+            } else if let Some(dest) = mftp::ssh::parse_ssh_dest(&destination)? {
                 mftp::ssh::send_via_ssh(
                     file,
                     dest,
@@ -369,11 +548,50 @@ async fn main() -> Result<()> {
                     remote_binary_sha256,
                 )
                 .await
-            } else {
-                let addr = destination
-                    .parse()
-                    .with_context(|| format!("invalid address: {destination}"))?;
+            } else if let Ok(addr) = destination.parse::<std::net::SocketAddr>() {
                 sender::send(file, addr, config).await
+            } else {
+                // Not host:port and not an SSH dest — treat it as a LAN name and
+                // resolve it via mftp discovery (M5).
+                //
+                // Announcements are unauthenticated multicast, so discovery only
+                // yields an address: the announced DeviceId is never pinned on
+                // its own say-so. With --trust-device we pick the responder
+                // announcing that id (and TLS enforces it); otherwise the
+                // receiver is verified like any host:port — via --trust or the
+                // TOFU fingerprint prompt/known_hosts.
+                let found = mftp::discovery::resolve_all(
+                    &destination,
+                    mftp::discovery::multicast_target(),
+                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+                .with_context(|| format!("discovery for {destination:?}"))?;
+                if found.is_empty() {
+                    anyhow::bail!(
+                        "no mftp receiver named {destination:?} found on the LAN \
+                         (is `mftp daemon --name {destination}` running there?), and it is \
+                         not a valid host:port or SSH destination"
+                    );
+                }
+                let resolved = mftp::discovery::choose(
+                    &destination,
+                    &found,
+                    config.trusted_device.as_deref(),
+                )?;
+                eprintln!(
+                    "[mftp] resolved {destination:?} → {} (announced device {})",
+                    resolved.addr, resolved.device_id
+                );
+                if config.trusted_fingerprint.is_none() && config.trusted_device.is_none() {
+                    eprintln!(
+                        "[mftp] the announced device id is unauthenticated — verify the \
+                         receiver's fingerprint below (or pin it with --trust-device {})",
+                        resolved.device_id
+                    );
+                }
+                sender::send(file, resolved.addr, config).await
             }
         }
         Command::Receive { bind, output_dir } => {
@@ -382,13 +600,203 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("invalid bind address: {bind}"))?;
             receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
-        Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
+        Command::Server { output_dir, port } => {
+            // The SSH launcher passes the sender's DeviceId via the environment
+            // (`env VAR=… mftp server`), which older binaries simply ignore.
+            let require_peer = match std::env::var(mftp::ssh::REQUIRE_PEER_ENV) {
+                Ok(id) if !id.is_empty() => {
+                    let id = id.trim().to_ascii_lowercase();
+                    anyhow::ensure!(
+                        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "{} must be a 64-hex DeviceId",
+                        mftp::ssh::REQUIRE_PEER_ENV
+                    );
+                    Some(id)
+                }
+                _ => None,
+            };
+            receiver::serve_one_stdio(output_dir, port, require_peer).await
+        }
+        Command::Decrypt { key, input, output } => {
+            let key = mftp::service::encrypt::load_key_file(&key)?;
+            let output = match output {
+                Some(o) => o,
+                None => mftp::service::encrypt::decrypted_path(&input)?,
+            };
+            mftp::service::encrypt::decrypt_file(&key, &input, &output)?;
+            println!("decrypted {} -> {}", input.display(), output.display());
+            Ok(())
+        }
+        Command::Rendezvous { bind } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let server = mftp::reach::RendezvousServer::bind(addr).await?;
+            println!("rendezvous broker listening on {}", server.local_addr()?);
+            server.serve().await
+        }
+        Command::Relay { bind, to } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let to_addr = to
+                .parse()
+                .with_context(|| format!("invalid --to address: {to}"))?;
+            let relay = mftp::reach::relay::RelayServer::bind(addr, to_addr).await?;
+            println!(
+                "relay listening on {} → forwarding to {to_addr}",
+                relay.local_addr()
+            );
+            println!(
+                "session token: {} (sender: export {}=<token>)",
+                relay.token_hex(),
+                mftp::reach::relay::TOKEN_ENV
+            );
+            relay.run().await
+        }
+        #[cfg(unix)]
+        Command::Daemon {
+            bind,
+            output_dir,
+            socket,
+            name,
+            http,
+            encrypt_at_rest,
+        } => {
+            let addr = bind
+                .parse()
+                .with_context(|| format!("invalid bind address: {bind}"))?;
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            let name = name.unwrap_or_else(mftp::discovery::hostname);
+            let http = match http {
+                Some(s) => Some(
+                    s.parse()
+                        .with_context(|| format!("invalid --http address: {s}"))?,
+                ),
+                None => None,
+            };
+            let encrypt_key = encrypt_at_rest
+                .as_deref()
+                .map(mftp::service::encrypt::load_key_file)
+                .transpose()?;
+            mftp::daemon::run(addr, output_dir, socket, name, http, encrypt_key).await
+        }
+        #[cfg(unix)]
+        Command::DaemonStatus { socket } => {
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            run_daemon_ctl(&socket, mftp::daemon::DaemonRequest::Status).await?;
+            run_daemon_ctl(&socket, mftp::daemon::DaemonRequest::Identity).await
+        }
+        #[cfg(unix)]
+        Command::DaemonTrust {
+            action,
+            device_id,
+            socket,
+        } => {
+            let socket = socket
+                .or_else(mftp::daemon::default_socket_path)
+                .context("cannot determine control socket path")?;
+            let req = match action.as_str() {
+                "list" => mftp::daemon::DaemonRequest::ListTrust,
+                "add" => mftp::daemon::DaemonRequest::AddTrust {
+                    device_id: device_id.context("`add` requires a device id")?,
+                },
+                "remove" => mftp::daemon::DaemonRequest::RemoveTrust {
+                    device_id: device_id.context("`remove` requires a device id")?,
+                },
+                other => anyhow::bail!("unknown trust action {other:?} (use add|remove|list)"),
+            };
+            run_daemon_ctl(&socket, req).await
+        }
     }
+}
+
+/// Send one control request to the daemon and print the reply.
+#[cfg(unix)]
+async fn run_daemon_ctl(socket: &std::path::Path, req: mftp::daemon::DaemonRequest) -> Result<()> {
+    use mftp::daemon::DaemonResponse;
+    match mftp::daemon::client_request(socket, req).await? {
+        DaemonResponse::Pong => println!("pong"),
+        DaemonResponse::Identity {
+            device_id,
+            fingerprint,
+        } => {
+            println!("Device ID:   {device_id}");
+            println!("Fingerprint: {fingerprint}");
+        }
+        DaemonResponse::Trust {
+            devices,
+            enforced,
+            source,
+        } => {
+            use mftp::daemon::AuthSource;
+            match source {
+                AuthSource::Acl => println!("# authorization governed by acl.toml"),
+                AuthSource::Allowlist => println!("# authorization governed by authorized_devices"),
+                AuthSource::Open => {}
+            }
+            if !enforced {
+                println!("(no authorized devices — receiver is open)");
+            } else if devices.is_empty() {
+                println!("(no authorized devices — all senders are denied)");
+            } else {
+                for d in devices {
+                    println!("{d}");
+                }
+            }
+        }
+        DaemonResponse::TrustChanged { changed } => {
+            println!(
+                "{}",
+                if changed {
+                    "ok (changed)"
+                } else {
+                    "ok (no change)"
+                }
+            );
+        }
+        DaemonResponse::Status {
+            listening_on,
+            auth_enforced,
+            authorized_count,
+            transfers_completed,
+        } => {
+            println!("listening_on:        {listening_on}");
+            println!("auth_enforced:       {auth_enforced}");
+            println!("authorized_devices:  {authorized_count}");
+            println!("transfers_completed: {transfers_completed}");
+        }
+        DaemonResponse::Error { message } => anyhow::bail!("daemon error: {message}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_fec;
+    use super::{parse_chunk_size_arg, parse_fec, parse_streams_arg, parse_tcp_below_rtt_arg};
+
+    #[test]
+    fn tuning_args_reject_out_of_range() {
+        assert!(parse_streams_arg("0").is_err());
+        assert!(parse_streams_arg("-1").is_err());
+        assert!(parse_streams_arg("100000").is_err());
+        assert_eq!(parse_streams_arg("8"), Ok(8));
+
+        assert!(parse_chunk_size_arg("0").is_err());
+        assert!(parse_chunk_size_arg("1").is_err());
+        assert!(parse_chunk_size_arg("1099511627776").is_err());
+        assert_eq!(parse_chunk_size_arg("1048576"), Ok(1_048_576));
+
+        for bad in ["-1", "NaN", "inf", "-inf", "1e300", "abc"] {
+            assert!(parse_tcp_below_rtt_arg(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_tcp_below_rtt_arg("0"), Ok(0.0));
+        assert_eq!(parse_tcp_below_rtt_arg("15.5"), Ok(15.5));
+    }
 
     #[test]
     fn fec_valid() {

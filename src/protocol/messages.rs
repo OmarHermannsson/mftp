@@ -27,7 +27,18 @@ use serde::{Deserialize, Serialize};
 ///       same order regardless of sender await timing), so it requires no
 ///       receiver change; the bump is a marker and documents that the QUIC fast
 ///       path assumes a peer ≥ v3 (directory transfers already require it).
-pub const PROTOCOL_VERSION: u32 = 6;
+///   7 — each data stream begins with a `StreamHello { transfer_id, stream_seq }`
+///       frame before any `ChunkData`. The receiver reads it first and rejects a
+///       stream whose `transfer_id` doesn't match the negotiated manifest. This
+///       lets data streams be attributed to a transfer regardless of which
+///       connection or path they arrive on — the prerequisite for multipath
+///       (M3) and relayed (M7) transfers, where streams no longer all share one
+///       connection. Only sent/expected when BOTH peers are ≥ v7; against an
+///       older peer the preamble is omitted and behaviour is identical to v6.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// First version that sends/expects the [`StreamHello`] data-stream preamble.
+pub const STREAM_HELLO_MIN_VERSION: u32 = 7;
 
 /// Maximum number of completion→repair round-trips before the sender/receiver
 /// give up and fall back to abort + resume.  A deterministic sender-side fault
@@ -38,6 +49,69 @@ pub const MAX_REPAIR_ROUNDS: u32 = 5;
 /// message within the control-frame limit and bounds repair effort — a larger
 /// gap is cheaper to recover with a fresh resumed transfer).
 pub const MAX_REPAIR_CHUNKS_PER_ROUND: usize = 100_000;
+
+/// First version that sends the `DirEntries` message (recursive directory
+/// transfer). A sender to an older peer must refuse a directory transfer.
+pub const MIN_DIRECTORY_VERSION: u32 = 3;
+
+/// First version that supports in-band incremental repair
+/// (`ReceiverMessage::Retransmit`). Against an older peer the receiver falls
+/// back to abort + resume instead.
+pub const MIN_REPAIR_VERSION: u32 = 5;
+
+// ── Version-gated feature decisions ───────────────────────────────────────────
+//
+// Every protocol feature that is only safe when *both* peers understand it is
+// gated through one of these helpers, so the cross-version rules live in one
+// place (and are unit-testable without a live handshake).
+
+/// Whether the `StreamHello` data-stream preamble (v7) is active on this
+/// transfer. It is sent/expected only when **both** peers are ≥ v7 — otherwise
+/// the wire stays byte-identical to v6 (see [`PROTOCOL_VERSION`] history).
+pub fn stream_hello_active(local_version: u32, peer_version: u32) -> bool {
+    local_version >= STREAM_HELLO_MIN_VERSION && peer_version >= STREAM_HELLO_MIN_VERSION
+}
+
+/// Whether `peer_version` understands the `DirEntries` message (directory transfers).
+pub fn directory_supported(peer_version: u32) -> bool {
+    peer_version >= MIN_DIRECTORY_VERSION
+}
+
+/// Whether `peer_version` supports in-band incremental repair.
+pub fn repair_supported(peer_version: u32) -> bool {
+    peer_version >= MIN_REPAIR_VERSION
+}
+
+/// Test-only override of the locally-advertised protocol version, letting an
+/// in-process test negotiate down to an older version to exercise cross-version
+/// interop. Hidden from docs; production never sets it (the only cost is one
+/// relaxed atomic load per negotiation).
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 0 = no override (use [`super::PROTOCOL_VERSION`]).
+    static FORCED_VERSION: AtomicU32 = AtomicU32::new(0);
+
+    /// Force the version advertised in NegotiateRequest/Response, or clear it.
+    pub fn force_local_version(version: Option<u32>) {
+        FORCED_VERSION.store(version.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(crate) fn forced() -> u32 {
+        FORCED_VERSION.load(Ordering::Relaxed)
+    }
+}
+
+/// The protocol version this peer advertises during negotiation. Normally
+/// [`PROTOCOL_VERSION`]; a test may cap it via
+/// [`test_hooks::force_local_version`] to drive older-peer interop.
+pub fn advertised_version() -> u32 {
+    match test_hooks::forced() {
+        0 => PROTOCOL_VERSION,
+        v => v,
+    }
+}
 
 /// Sent by the sender immediately after opening the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +209,24 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntries {
     pub entries: Option<Vec<FileEntry>>,
+}
+
+/// Preamble frame sent by the sender at the very start of each data stream
+/// (protocol version ≥ [`STREAM_HELLO_MIN_VERSION`]), before any `ChunkData`.
+///
+/// Lets the receiver attribute a data stream to a transfer independently of the
+/// connection it arrived on — the foundation for multipath (M3) and relayed
+/// (M7) transfers. For single-connection transfers it is a cheap correctness
+/// check: the receiver rejects any stream whose `transfer_id` doesn't match the
+/// manifest it negotiated on the control stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamHello {
+    /// Must equal the `transfer_id` from the `TransferManifest`.
+    pub transfer_id: [u8; 16],
+    /// 0-based index of this stream within the transfer. Informational
+    /// (logging / future per-path scheduling); not required for correctness
+    /// because each `ChunkData` already carries its own `chunk_index`.
+    pub stream_seq: u32,
 }
 
 /// One chunk of file data, sent on a data stream.
@@ -262,4 +354,43 @@ pub enum ReceiverMessage {
     /// finalizes.  Bounded by `MAX_REPAIR_ROUNDS` / `MAX_REPAIR_CHUNKS_PER_ROUND`
     /// on both ends.  Single-file transfers only.
     Retransmit { chunks: Vec<u64> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_hello_active_only_when_both_v7() {
+        // Active only if both peers are ≥ v7.
+        assert!(stream_hello_active(7, 7));
+        assert!(stream_hello_active(7, 8));
+        assert!(stream_hello_active(8, 7));
+        // Any older peer (either side) disables it → wire stays v6-identical.
+        assert!(!stream_hello_active(7, 6));
+        assert!(!stream_hello_active(6, 7));
+        assert!(!stream_hello_active(6, 6));
+    }
+
+    #[test]
+    fn directory_and_repair_version_floors() {
+        assert!(!directory_supported(2));
+        assert!(directory_supported(MIN_DIRECTORY_VERSION));
+        assert!(directory_supported(7));
+
+        assert!(!repair_supported(4));
+        assert!(repair_supported(MIN_REPAIR_VERSION));
+        assert!(repair_supported(7));
+    }
+
+    #[test]
+    fn advertised_version_respects_override() {
+        // Default: the compiled-in version.
+        assert_eq!(advertised_version(), PROTOCOL_VERSION);
+        // Override caps it; clearing restores the default.
+        test_hooks::force_local_version(Some(6));
+        assert_eq!(advertised_version(), 6);
+        test_hooks::force_local_version(None);
+        assert_eq!(advertised_version(), PROTOCOL_VERSION);
+    }
 }
