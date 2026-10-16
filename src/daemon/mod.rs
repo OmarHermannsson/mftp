@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -508,6 +509,7 @@ impl Daemon {
             crate::service::http::warn_if_exposed(bound);
             http_addr = Some(bound);
             let auth_state = Arc::clone(&state);
+            let queue_jobs = Arc::clone(&jobs);
             let http_state = Arc::new(crate::service::http::HttpState {
                 config_dir: opts.config_dir.clone(),
                 listening_on: listening_on.clone(),
@@ -515,6 +517,7 @@ impl Daemon {
                     enforced: auth_state.auth_enforced(),
                     authorized_count: auth_state.authorized_devices().len(),
                 }),
+                queue: Some(Arc::new(move || queue_jobs.snapshot())),
             });
             background.push(tokio::spawn(async move {
                 let _ = crate::service::http::serve(http_listener, http_state).await;
@@ -600,8 +603,13 @@ impl Daemon {
         // changes routing/quotas for subsequent transfers.
         let acl_for_router = state.acl.clone();
         let output_root = output_dir.clone();
-        let serve_fut = server.serve_with_router(move |peer| {
-            let observer = Some(jobs.observer_for(peer.unwrap_or("(anonymous)")));
+        // Bytes reserved by each peer's transfers that are admitted but not yet
+        // preallocated (see `PeerQuota`), shared across its connections.
+        let reservations: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>> =
+            Arc::default();
+        // The routing itself; the serve loop below wraps it to attach the job
+        // tracker and record refusals.
+        let route_peer = move |peer: Option<&str>| -> Result<Route> {
             // Snapshot what we need from the live ACL and drop the read lock
             // before touching the filesystem, so a slow directory walk never
             // blocks a SIGHUP reload (or other connections) on the lock.
@@ -615,30 +623,52 @@ impl Daemon {
                 Ok(Some((device.to_owned(), dir, quota)))
             })?;
             let Some((device, dir, quota)) = routed else {
-                return Ok(Route {
-                    observer,
-                    ..Route::from(output_root.clone())
-                });
+                return Ok(Route::from(output_root.clone()));
             };
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("create tenant dir {}", dir.display()))?;
             // Enforce the peer's byte quota: reject a peer already at/over it
-            // here, and hand the receiver the remaining budget so a transfer
-            // larger than that is refused once its manifest (size) is known.
-            // Concurrent transfers from one peer each see the same budget.
-            let mut max_new_bytes = None;
+            // here, and have the receiver reserve each transfer's size against
+            // it once the manifest is read (see `PeerQuota`).
+            let mut budget = None;
             if let Some(limit) = quota {
                 let used = run_blocking(|| dir_size_bytes(&dir));
                 if used >= limit {
                     anyhow::bail!("{device} is at/over its quota ({used} of {limit} bytes used)");
                 }
-                max_new_bytes = Some(limit - used);
+                let reserved = Arc::clone(
+                    reservations
+                        .lock()
+                        .expect("reservations mutex poisoned")
+                        .entry(device.clone())
+                        .or_default(),
+                );
+                budget = Some(Arc::new(PeerQuota {
+                    dir: dir.clone(),
+                    limit,
+                    reserved,
+                })
+                    as Arc<dyn crate::transfer::receiver::ByteBudget>);
             }
             Ok(Route {
                 output_dir: dir,
-                max_new_bytes,
-                observer,
+                budget,
+                observer: None,
             })
+        };
+        let shutdown_jobs = Arc::clone(&jobs);
+        let serve_fut = server.serve_with_router(move |peer| {
+            let peer_label = peer.unwrap_or("(anonymous)");
+            let route = route_peer(peer).map(|mut r: Route| {
+                r.observer = Some(jobs.observer_for(peer_label));
+                r
+            });
+            // Refused before any transfer started (no ACL entry, over quota, …):
+            // still record it so the queue shows why uploads aren't landing.
+            if let Err(e) = &route {
+                jobs.record_refused(peer_label, &format!("{e:#}"));
+            }
+            route
         });
 
         let control_fut = serve_control(control, Arc::clone(&state));
@@ -674,6 +704,7 @@ impl Daemon {
         for h in background {
             h.abort();
         }
+        shutdown_jobs.flush().await;
         let _ = std::fs::remove_file(&socket_path);
         result
     }
@@ -778,6 +809,52 @@ pub async fn run(
 /// without stalling an async worker: on a multi-threaded runtime the current
 /// worker is handed off via `block_in_place`; elsewhere (current-thread
 /// runtimes, no runtime) the closure simply runs inline.
+/// One peer's byte quota. An admission measures the peer's on-disk usage and
+/// reserves the transfer's size under one per-peer lock, and the reservation
+/// lasts until the receiver has preallocated the output (from then on the
+/// files themselves count as used) — so concurrent transfers from one peer
+/// can't each pass against the same remaining budget.
+struct PeerQuota {
+    dir: PathBuf,
+    limit: u64,
+    reserved: Arc<std::sync::Mutex<u64>>,
+}
+
+impl crate::transfer::receiver::ByteBudget for PeerQuota {
+    fn reserve(&self, bytes: u64) -> Result<Box<dyn Send>> {
+        let mut reserved = self.reserved.lock().expect("quota mutex poisoned");
+        let used = dir_size_bytes(&self.dir);
+        let committed = used.saturating_add(*reserved);
+        if committed.saturating_add(bytes) > self.limit {
+            anyhow::bail!(
+                "transfer needs {bytes} new bytes but only {} remain in this peer's quota \
+                 ({used} used, {} reserved by in-progress transfers, limit {})",
+                self.limit.saturating_sub(committed),
+                *reserved,
+                self.limit
+            );
+        }
+        *reserved += bytes;
+        Ok(Box::new(QuotaReservation {
+            reserved: Arc::clone(&self.reserved),
+            bytes,
+        }))
+    }
+}
+
+/// Returns its bytes to the peer's [`PeerQuota`] on drop.
+struct QuotaReservation {
+    reserved: Arc<std::sync::Mutex<u64>>,
+    bytes: u64,
+}
+
+impl Drop for QuotaReservation {
+    fn drop(&mut self) {
+        let mut r = self.reserved.lock().expect("quota mutex poisoned");
+        *r = r.saturating_sub(self.bytes);
+    }
+}
+
 fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {

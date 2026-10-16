@@ -361,8 +361,8 @@ pub fn make_server_endpoint_with_cert(
 
 /// Like [`make_server_endpoint_with_cert`], but when `authorized` is
 /// `Some(list)` the server requires mutual TLS and only accepts senders whose
-/// Ed25519 DeviceId is in `list` (M4 daemon identity auth). `None` keeps the
-/// open, server-auth-only behaviour.
+/// Ed25519 DeviceId is in `list` (M4 daemon identity auth). `None` is open:
+/// client certs are optional (but verified when presented).
 pub fn make_server_endpoint_with_cert_auth(
     bind_addr: SocketAddr,
     cert: CertificateDer<'static>,
@@ -377,8 +377,11 @@ pub fn make_server_endpoint_with_cert_auth(
             .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
             .with_single_cert(vec![cert], key)
             .context("failed to build rustls server config (client auth)")?,
+        // Open: client auth optional, but a presented identity is still
+        // verified (proof of key possession) so the receiver can tell a
+        // reconnecting sender from a stranger.
         None => builder
-            .with_no_client_auth()
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(Vec::new())))
             .with_single_cert(vec![cert], key)
             .context("failed to build rustls server config")?,
     };
@@ -677,8 +680,9 @@ pub fn make_server_tls_config_auth(
             .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
             .with_single_cert(vec![cert], key)
             .context("failed to build rustls server config (client auth)"),
+        // Open: client auth optional (see make_server_endpoint_with_cert_auth).
         None => builder
-            .with_no_client_auth()
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(Vec::new())))
             .with_single_cert(vec![cert], key)
             .context("failed to build rustls server config"),
     }

@@ -358,6 +358,12 @@ pub fn peer_device_id(conn: &quinn::Connection) -> Option<String> {
     crate::identity::device_id_from_cert(leaf)
 }
 
+/// The DeviceId of a TCP+TLS peer's client certificate, if it presented one.
+fn tls_peer_device_id(tls: &ServerTlsStream<tokio::net::TcpStream>) -> Option<String> {
+    let leaf = tls.get_ref().1.peer_certificates()?.first()?;
+    crate::identity::device_id_from_cert(leaf)
+}
+
 // ── TCP+TLS server ────────────────────────────────────────────────────────────
 
 /// A bound TCP+TLS server, ready to accept incoming transfers.
@@ -829,23 +835,15 @@ async fn handle_quic_connection(
     }
     drop(tx); // feeders hold their own clones; rx closes when they all exit
 
-    let closer = conn.clone();
-    let supersede: SupersedeFn =
-        Arc::new(move || closer.close(0u32.into(), b"superseded by reconnect"));
-    let result = run_receive(
-        ctrl_send,
-        ctrl_recv,
-        route,
-        Some(supersede),
-        move |_transfer_id| {
-            let rx = rx.clone();
-            async move {
-                rx.recv()
-                    .await
-                    .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
-            }
-        },
-    )
+    let peer = peer_device_id(&conn);
+    let result = run_receive(ctrl_send, ctrl_recv, route, peer, move |_transfer_id| {
+        let rx = rx.clone();
+        async move {
+            rx.recv()
+                .await
+                .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
+        }
+    })
     .await;
     feeders.abort_all();
     let mut ctrl_send = result?;
@@ -875,13 +873,14 @@ async fn handle_tcp_connection(
     acceptor: Arc<TlsAcceptor>,
     output_dir: PathBuf,
 ) -> Result<()> {
+    let peer = tls_peer_device_id(&ctrl_stream);
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
     run_receive(
         ctrl_send,
         ctrl_recv,
         output_dir.into(),
-        None,
+        peer,
         move |_transfer_id| {
             let listener = Arc::clone(&listener);
             let acceptor = Arc::clone(&acceptor);
@@ -908,6 +907,10 @@ type DataStream = Box<dyn AsyncRead + Unpin + Send + 'static>;
 /// accepting streams (the sender opens them right after `Ready`, a moment
 /// before the receiver registers).
 const TCP_ROUTE_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a connection may stay silent before it is taken to be an idle
+/// pre-v7 data stream (when a legacy transfer from its IP is accepting streams).
+const LEGACY_IDLE_PROBE: Duration = Duration::from_secs(2);
 
 /// Which transfer a TCP data connection belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -973,6 +976,15 @@ impl TcpStreamRouter {
                 key,
             },
         ))
+    }
+
+    /// Whether `key` is registered for connections from `peer_ip`.
+    fn has_route(&self, key: TcpRouteKey, peer_ip: std::net::IpAddr) -> bool {
+        self.routes
+            .lock()
+            .expect("tcp router mutex poisoned")
+            .get(&key)
+            .is_some_and(|(ip, _)| *ip == peer_ip)
     }
 
     /// Hand a data connection to its transfer, waiting up to [`TCP_ROUTE_WAIT`]
@@ -1044,13 +1056,48 @@ async fn serve_routed_tcp_connection(
         transfer_id: [0; 16],
         stream_seq: 0,
     })? as u32;
+    let peer_ip = peer_addr.ip();
     let mut prefix = vec![0u8; 4];
-    handshake_read("first frame", async {
-        tls.read_exact(&mut prefix)
-            .await
-            .context("read first frame")
-    })
-    .await?;
+    let mut filled = 0;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_READ_TIMEOUT;
+    while filled < 4 {
+        // A pre-v7 sender's data connection has no StreamHello and may have
+        // nothing to send yet (e.g. a resume with fewer missing chunks than
+        // streams) — or close straight away. If its legacy transfer from this
+        // IP is waiting for streams, hand the connection over as-is instead of
+        // dropping it. v7 senders always speak first, right after the handshake.
+        let read = tokio::time::timeout(LEGACY_IDLE_PROBE, tls.read(&mut prefix[filled..])).await;
+        // A peer that closes without a TLS close_notify reads as UnexpectedEof.
+        let eof = match &read {
+            Ok(Ok(0)) => true,
+            Ok(Err(e)) => e.kind() == std::io::ErrorKind::UnexpectedEof,
+            _ => false,
+        };
+        match read {
+            Ok(Ok(n)) if n > 0 => {
+                filled += n;
+                continue;
+            }
+            Ok(Err(e)) if !eof => return Err(e).context("read first frame"),
+            _ => {}
+        }
+        if router.has_route(TcpRouteKey::Legacy, peer_ip) {
+            prefix.truncate(filled);
+            let stream = std::io::Cursor::new(prefix).chain(tls);
+            return router
+                .deliver(TcpRouteKey::Legacy, peer_ip, Box::new(stream))
+                .await;
+        }
+        if eof {
+            bail!("connection closed before its first frame");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "timed out after {}s waiting for first frame",
+                HANDSHAKE_READ_TIMEOUT.as_secs()
+            );
+        }
+    }
     let len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
     let kind = if len == neg_len || len == hello_len {
         prefix.resize(4 + len as usize, 0);
@@ -1077,7 +1124,6 @@ async fn serve_routed_tcp_connection(
         TcpConnKind::Data(TcpRouteKey::Legacy)
     };
 
-    let peer_ip = peer_addr.ip();
     match kind {
         TcpConnKind::Data(key) => {
             // Re-prepend what we consumed: run_receive re-reads (and validates)
@@ -1087,6 +1133,7 @@ async fn serve_routed_tcp_connection(
         }
         TcpConnKind::Control { legacy } => {
             info!("TCP transfer from {peer_addr}");
+            let peer = tls_peer_device_id(&tls);
             let (ctrl_recv, ctrl_send) = tokio::io::split(tls);
             let ctrl_recv = std::io::Cursor::new(prefix).chain(ctrl_recv);
             let mut route: Option<(async_channel::Receiver<DataStream>, TcpRouteGuard)> = None;
@@ -1094,7 +1141,7 @@ async fn serve_routed_tcp_connection(
                 ctrl_send,
                 ctrl_recv,
                 output_dir.into(),
-                None,
+                peer,
                 move |transfer_id| {
                     let rx = match &route {
                         Some((rx, _)) => Ok(rx.clone()),
@@ -1473,7 +1520,7 @@ async fn run_receive<CW, CR, F, Fut>(
     mut ctrl_send: CW,
     mut ctrl_recv: CR,
     route: Route,
-    supersede: Option<SupersedeFn>,
+    peer: Option<String>,
     mut accept_stream: F,
 ) -> Result<CW>
 where
@@ -1484,7 +1531,7 @@ where
 {
     let Route {
         output_dir,
-        max_new_bytes,
+        budget,
         observer,
     } = route;
     // The opening flight (NegotiateRequest, manifest, DirEntries) is sent by the
@@ -1556,66 +1603,66 @@ where
         "transfer started"
     );
 
-    // Admission: refuse a transfer that would push the peer past its quota.
-    if let Some(limit) = max_new_bytes {
-        let incoming = new_bytes_needed(&output_dir, &manifest, dir_entries.as_deref());
-        if incoming > limit {
-            let e = anyhow!(
-                "transfer needs {incoming} new bytes but only {limit} remain in this peer's quota"
-            );
+    // Track the transfer from here on, so refusals below are recorded too.
+    let mut job = observer.as_deref().map(|o| JobGuard::start(o, &manifest));
+
+    // Tell the sender (and the job) why the transfer is refused, then fail.
+    macro_rules! refuse {
+        ($e:expr) => {{
+            let e: anyhow::Error = $e;
+            let message = format!("{e:#}");
             let _ = framing::send_message(
                 &mut ctrl_send,
                 &ReceiverMessage::Error {
-                    message: format!("{e:#}"),
+                    message: message.clone(),
                     fatal: true,
                 },
             )
             .await;
+            if let Some(j) = job.take() {
+                j.fail(&message);
+            }
             return Err(e);
-        }
+        }};
     }
+
+    // Admission: reserve the bytes this transfer adds against the peer's quota
+    // (atomically with concurrent transfers from the same peer). Held until the
+    // output is preallocated, after which the files count as used on disk.
+    let reservation = match budget {
+        Some(budget) => {
+            let incoming = new_bytes_needed(&output_dir, &manifest, dir_entries.as_deref());
+            match tokio::task::spawn_blocking(move || budget.reserve(incoming))
+                .await
+                .context("quota task panicked")
+                .and_then(|r| r)
+            {
+                Ok(r) => Some(r),
+                Err(e) => refuse!(e),
+            }
+        }
+        None => None,
+    };
 
     // Refuse a second concurrent transfer into the same destination: two
     // writers (each with its own resume state) would interleave chunks
     // undetected.  Held until this function returns.
-    let _dest_guard = match claim_destination(
-        &output_dir,
-        &manifest.file_name,
-        manifest.transfer_id,
-        supersede,
-    )
-    .await
-    {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = framing::send_message(
-                &mut ctrl_send,
-                &ReceiverMessage::Error {
-                    message: format!("{e:#}"),
-                    fatal: true,
-                },
-            )
-            .await;
-            return Err(e);
-        }
-    };
+    let dest_guard =
+        match claim_destination(&output_dir, &manifest.file_name, manifest.transfer_id, peer).await
+        {
+            Ok(g) => g,
+            Err(e) => refuse!(e),
+        };
 
+    // On failure, send the error to the sender before closing so the sender
+    // shows the actual filesystem error instead of "connection lost".
     let pt = match prepare_transfer(&manifest, dir_entries.as_deref(), &output_dir) {
         Ok(pt) => pt,
-        Err(e) => {
-            // Send the error to the sender before closing so the sender shows
-            // the actual filesystem error instead of "connection lost".
-            let _ = framing::send_message(
-                &mut ctrl_send,
-                &ReceiverMessage::Error {
-                    message: format!("{e:#}"),
-                    fatal: true,
-                },
-            )
-            .await;
-            return Err(e);
-        }
+        Err(e) => refuse!(e),
     };
+    drop(reservation);
+    dest_guard.track_writes(&pt);
+    let cancelled = dest_guard.cancelled();
     framing::send_message(
         &mut ctrl_send,
         &ReceiverMessage::Ready {
@@ -1625,378 +1672,391 @@ where
     )
     .await?;
     pt.pb.set_position(pt.bytes_already_received);
-    let job = observer
-        .as_deref()
-        .map(|o| JobGuard::start(o, &manifest, Arc::clone(&pt.pb)));
-
-    // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
-    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
-    // Keep one extra clone for scale-up workers added during transfer.
-    // Dropped after the main loop to let the reporter exit once all workers finish.
-    let scale_progress_tx = progress_tx.clone();
-
-    // Ack channel: main loop → reporter → ctrl_send (AdjustStreamsAck messages).
-    let (ack_req_tx, ack_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
-
-    // Ctrl-reader channels: ctrl_reader_task forwards SenderMessage variants
-    // received during the data phase to the main loop.  It returns the control
-    // recv half + Complete hash via its JoinHandle so the repair handshake can
-    // read further frames after the data phase.
-    let (scale_req_tx, mut scale_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
-
-    // Shared metrics: in-flight task count and peak disk latency.
-    let stats = ReceiverStats::new();
-
-    // Global semaphore that caps concurrent pwrite operations across all stream
-    // workers.  Without this, N streams × MAX_IN_FLIGHT tasks each writing an
-    // 8 MiB chunk can generate 256+ MiB of dirty pages simultaneously, causing
-    // the kernel to stall pwrite callers while it flushes.  Limiting to 8
-    // concurrent writers keeps peak dirty pages at ~64 MiB, well below the
-    // kernel's dirty_ratio threshold on typical systems.
-    let write_sem = Arc::new(tokio::sync::Semaphore::new(8));
-
-    // Deferred FADV_DONTNEED tracker: shared by all stream workers writing to
-    // the same output file.  Issuing DONTNEED immediately after sync_file_range
-    // can stall if the block layer hasn't dispatched the submitted I/O yet;
-    // the deferred tracker waits for a lookahead of later writes before evicting
-    // each range from the page cache.
-    let deferred_dontneed = match &pt.out_file {
-        Some(f) => crate::fs_ext::DeferredDontneed::new(f),
-        None => crate::fs_ext::DeferredDontneed::noop(), // directory mode: no single fd
-    };
-
-    // Accept all N data streams concurrently.
-    //
-    // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
-    // on an existing connection).  For TCP+TLS it is critical: each stream
-    // requires an independent TCP 3-way handshake + TLS 1.3 exchange, which
-    // takes roughly 1-2 RTTs.  Accepting them sequentially would serialize all
-    // N TLS handshakes; accepting them concurrently lets all N proceed in
-    // parallel, cutting setup time from N×RTT down to ~1×RTT regardless of N.
-    let mut accept_tasks: JoinSet<Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> =
-        JoinSet::new();
-    for _ in 0..manifest.num_streams {
-        let fut = accept_stream(manifest.transfer_id);
-        accept_tasks.spawn(async move {
-            tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut)
-                .await
-                .unwrap_or_else(|_| {
-                    Err(anyhow!(
-                        "timed out waiting for data stream — sender disconnected"
-                    ))
-                })
-        });
+    if let Some(j) = &mut job {
+        j.track_progress(Arc::clone(&pt.pb));
     }
 
-    // For FEC transfers, workers share a stripe accumulator map.
-    let fec_stripe_bufs: Option<Arc<Mutex<FecStripes>>> = if manifest.fec.is_some() {
-        Some(Arc::new(Mutex::new(FecStripes::default())))
-    } else {
-        None
-    };
+    // The rest of the transfer runs cancellably: a reconnect of the same
+    // sender (see `claim_destination`) drops it, closing its streams. Its
+    // blocking writes finish on their own; the next claim waits for them.
+    let body = async move {
+        // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
+        // Keep one extra clone for scale-up workers added during transfer.
+        // Dropped after the main loop to let the reporter exit once all workers finish.
+        let scale_progress_tx = progress_tx.clone();
 
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    while let Some(accept_res) = accept_tasks.join_next().await {
-        let stream = accept_res.context("accept task panicked")??;
-        let out_file = pt.out_file.clone();
-        let layout = pt.layout.clone();
-        let resume = pt.resume.clone();
-        let manifest_c = manifest.clone();
-        let pb = pt.pb.clone();
-        let hasher = pt.hasher.clone();
-        let ptx = progress_tx.clone();
-        let st = Arc::clone(&stats);
-        let wsem = Arc::clone(&write_sem);
-        let dd = deferred_dontneed.clone();
-        if let Some(ref bufs_arc) = fec_stripe_bufs {
-            // FEC path: always single-file (directory+FEC rejected at sender).
-            let fec_file = out_file.expect("FEC requires single-file output");
-            let stripe_bufs = Arc::clone(bufs_arc);
-            tasks.spawn(async move {
-                recv_fec_stream_worker(
-                    stream,
-                    fec_file,
-                    resume,
-                    manifest_c,
-                    pb,
-                    hasher,
-                    ptx,
-                    stripe_bufs,
-                    st,
-                    wsem,
-                    dd,
-                    expect_hello,
-                )
-                .await
+        // Ack channel: main loop → reporter → ctrl_send (AdjustStreamsAck messages).
+        let (ack_req_tx, ack_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
+
+        // Ctrl-reader channels: ctrl_reader_task forwards SenderMessage variants
+        // received during the data phase to the main loop.  It returns the control
+        // recv half + Complete hash via its JoinHandle so the repair handshake can
+        // read further frames after the data phase.
+        let (scale_req_tx, mut scale_req_rx) = tokio::sync::mpsc::channel::<u8>(8);
+
+        // Shared metrics: in-flight task count and peak disk latency.
+        let stats = ReceiverStats::new();
+
+        // Global semaphore that caps concurrent pwrite operations across all stream
+        // workers.  Without this, N streams × MAX_IN_FLIGHT tasks each writing an
+        // 8 MiB chunk can generate 256+ MiB of dirty pages simultaneously, causing
+        // the kernel to stall pwrite callers while it flushes.  Limiting to 8
+        // concurrent writers keeps peak dirty pages at ~64 MiB, well below the
+        // kernel's dirty_ratio threshold on typical systems.
+        let write_sem = Arc::new(tokio::sync::Semaphore::new(8));
+
+        // Deferred FADV_DONTNEED tracker: shared by all stream workers writing to
+        // the same output file.  Issuing DONTNEED immediately after sync_file_range
+        // can stall if the block layer hasn't dispatched the submitted I/O yet;
+        // the deferred tracker waits for a lookahead of later writes before evicting
+        // each range from the page cache.
+        let deferred_dontneed = match &pt.out_file {
+            Some(f) => crate::fs_ext::DeferredDontneed::new(f),
+            None => crate::fs_ext::DeferredDontneed::noop(), // directory mode: no single fd
+        };
+
+        // Accept all N data streams concurrently.
+        //
+        // For QUIC this is a no-op difference (QUIC stream opens are instantaneous
+        // on an existing connection).  For TCP+TLS it is critical: each stream
+        // requires an independent TCP 3-way handshake + TLS 1.3 exchange, which
+        // takes roughly 1-2 RTTs.  Accepting them sequentially would serialize all
+        // N TLS handshakes; accepting them concurrently lets all N proceed in
+        // parallel, cutting setup time from N×RTT down to ~1×RTT regardless of N.
+        let mut accept_tasks: JoinSet<Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> =
+            JoinSet::new();
+        for _ in 0..manifest.num_streams {
+            let fut = accept_stream(manifest.transfer_id);
+            accept_tasks.spawn(async move {
+                tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow!(
+                            "timed out waiting for data stream — sender disconnected"
+                        ))
+                    })
             });
+        }
+
+        // For FEC transfers, workers share a stripe accumulator map.
+        let fec_stripe_bufs: Option<Arc<Mutex<FecStripes>>> = if manifest.fec.is_some() {
+            Some(Arc::new(Mutex::new(FecStripes::default())))
         } else {
-            tasks.spawn(async move {
-                recv_stream_worker(
-                    stream,
-                    out_file,
-                    layout,
-                    resume,
-                    manifest_c,
-                    pb,
-                    hasher,
-                    ptx,
-                    st,
-                    wsem,
-                    dd,
-                    expect_hello,
-                )
-                .await
-            });
-        }
-    }
-    // Drop the original sender so the reporter exits once all workers (including
-    // any dynamically added ones) finish and drop their own senders.
-    // `scale_progress_tx` keeps the channel open for scale-up workers.
-    drop(progress_tx);
+            None
+        };
 
-    // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
-    // It also forwards AdjustStreamsAck messages from the main loop (ack_req_rx).
-    // It runs concurrently with the data workers and returns ctrl_send when done.
-    let reporter = tokio::spawn(progress_reporter(
-        ctrl_send,
-        progress_rx,
-        pt.bytes_already_received,
-        Arc::clone(&stats),
-        ack_req_rx,
-    ));
-
-    // Ctrl-reader task: reads SenderMessage from the control stream during the
-    // data phase, forwarding AdjustStreams requests and the final Complete.
-    // Owns ctrl_recv so framing reads are never cancelled mid-frame.
-    let ctrl_reader = tokio::spawn(ctrl_reader_task(ctrl_recv, scale_req_tx));
-
-    // Main transfer loop: drain worker tasks and handle dynamic stream scaling.
-    let mut task_err: Option<anyhow::Error> = None;
-    let mut active_workers = manifest.num_streams;
-    let mut current_workers = manifest.num_streams;
-
-    loop {
-        tokio::select! {
-            Some(join_res) = tasks.join_next() => {
-                let r = join_res.unwrap_or_else(|e| Err(anyhow!("stream worker panicked: {e}")));
-                if let Err(e) = r {
-                    // Log immediately so the operator sees which stream/chunk
-                    // failed even if the error is later superseded by the
-                    // cascade (e.g. "receiver closed without completing").
-                    error!(error = format!("{e:#}"), "receive worker failed");
-                    if task_err.is_none() { task_err = Some(e); }
-                }
-                active_workers = active_workers.saturating_sub(1);
-                if active_workers == 0 { break; }
+        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+        while let Some(accept_res) = accept_tasks.join_next().await {
+            let stream = accept_res.context("accept task panicked")??;
+            let out_file = pt.out_file.clone();
+            let layout = pt.layout.clone();
+            let resume = pt.resume.clone();
+            let manifest_c = manifest.clone();
+            let pb = pt.pb.clone();
+            let hasher = pt.hasher.clone();
+            let ptx = progress_tx.clone();
+            let st = Arc::clone(&stats);
+            let wsem = Arc::clone(&write_sem);
+            let dd = deferred_dontneed.clone();
+            if let Some(ref bufs_arc) = fec_stripe_bufs {
+                // FEC path: always single-file (directory+FEC rejected at sender).
+                let fec_file = out_file.expect("FEC requires single-file output");
+                let stripe_bufs = Arc::clone(bufs_arc);
+                tasks.spawn(async move {
+                    recv_fec_stream_worker(
+                        stream,
+                        fec_file,
+                        resume,
+                        manifest_c,
+                        pb,
+                        hasher,
+                        ptx,
+                        stripe_bufs,
+                        st,
+                        wsem,
+                        dd,
+                        expect_hello,
+                    )
+                    .await
+                });
+            } else {
+                tasks.spawn(async move {
+                    recv_stream_worker(
+                        stream,
+                        out_file,
+                        layout,
+                        resume,
+                        manifest_c,
+                        pb,
+                        hasher,
+                        ptx,
+                        st,
+                        wsem,
+                        dd,
+                        expect_hello,
+                    )
+                    .await
+                });
             }
-            Some(target_count) = scale_req_rx.recv(), if fec_stripe_bufs.is_none() => {
-                let target = target_count as usize;
-                if target > current_workers {
-                    // Scale-up: accept new streams and spawn workers.
-                    let new_count = target - current_workers;
-                    info!(current = current_workers, target, "scaling up: accepting {new_count} new streams");
-                    if let Some(ref h) = pt.hasher {
-                        h.update_stream_count(target);
+        }
+        // Drop the original sender so the reporter exits once all workers (including
+        // any dynamically added ones) finish and drop their own senders.
+        // `scale_progress_tx` keeps the channel open for scale-up workers.
+        drop(progress_tx);
+
+        // Reporter owns ctrl_send and sends throttled Progress messages to the sender.
+        // It also forwards AdjustStreamsAck messages from the main loop (ack_req_rx).
+        // It runs concurrently with the data workers and returns ctrl_send when done.
+        let reporter = tokio::spawn(progress_reporter(
+            ctrl_send,
+            progress_rx,
+            pt.bytes_already_received,
+            Arc::clone(&stats),
+            ack_req_rx,
+        ));
+
+        // Ctrl-reader task: reads SenderMessage from the control stream during the
+        // data phase, forwarding AdjustStreams requests and the final Complete.
+        // Owns ctrl_recv so framing reads are never cancelled mid-frame.
+        let ctrl_reader = tokio::spawn(ctrl_reader_task(ctrl_recv, scale_req_tx));
+
+        // Main transfer loop: drain worker tasks and handle dynamic stream scaling.
+        let mut task_err: Option<anyhow::Error> = None;
+        let mut active_workers = manifest.num_streams;
+        let mut current_workers = manifest.num_streams;
+
+        loop {
+            tokio::select! {
+                Some(join_res) = tasks.join_next() => {
+                    let r = join_res.unwrap_or_else(|e| Err(anyhow!("stream worker panicked: {e}")));
+                    if let Err(e) = r {
+                        // Log immediately so the operator sees which stream/chunk
+                        // failed even if the error is later superseded by the
+                        // cascade (e.g. "receiver closed without completing").
+                        error!(error = format!("{e:#}"), "receive worker failed");
+                        if task_err.is_none() { task_err = Some(e); }
                     }
-                    let mut accepted = current_workers;
-                    for _ in 0..new_count {
-                        let fut = accept_stream(manifest.transfer_id);
-                        match tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut).await {
-                            Ok(Ok(stream)) => {
-                                let out_file = pt.out_file.clone();
-                                let layout = pt.layout.clone();
-                                let resume = pt.resume.clone();
-                                let manifest_c = manifest.clone();
-                                let pb = pt.pb.clone();
-                                let hasher = pt.hasher.clone();
-                                let ptx = scale_progress_tx.clone();
-                                let st = Arc::clone(&stats);
-                                let wsem = Arc::clone(&write_sem);
-                                let dd = deferred_dontneed.clone();
-                                tasks.spawn(async move {
-                                    recv_stream_worker(
-                                        stream, out_file, layout, resume, manifest_c, pb, hasher,
-                                        ptx, st, wsem, dd, expect_hello,
-                                    )
-                                    .await
-                                });
-                                accepted += 1;
-                                active_workers += 1;
-                            }
-                            Ok(Err(e)) => warn!("failed to accept new data stream: {e:#}"),
-                            Err(_) => warn!("timed out accepting new data stream"),
+                    active_workers = active_workers.saturating_sub(1);
+                    if active_workers == 0 { break; }
+                }
+                Some(target_count) = scale_req_rx.recv(), if fec_stripe_bufs.is_none() => {
+                    let target = target_count as usize;
+                    if target > current_workers {
+                        // Scale-up: accept new streams and spawn workers.
+                        let new_count = target - current_workers;
+                        info!(current = current_workers, target, "scaling up: accepting {new_count} new streams");
+                        if let Some(ref h) = pt.hasher {
+                            h.update_stream_count(target);
                         }
+                        let mut accepted = current_workers;
+                        for _ in 0..new_count {
+                            let fut = accept_stream(manifest.transfer_id);
+                            match tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut).await {
+                                Ok(Ok(stream)) => {
+                                    let out_file = pt.out_file.clone();
+                                    let layout = pt.layout.clone();
+                                    let resume = pt.resume.clone();
+                                    let manifest_c = manifest.clone();
+                                    let pb = pt.pb.clone();
+                                    let hasher = pt.hasher.clone();
+                                    let ptx = scale_progress_tx.clone();
+                                    let st = Arc::clone(&stats);
+                                    let wsem = Arc::clone(&write_sem);
+                                    let dd = deferred_dontneed.clone();
+                                    tasks.spawn(async move {
+                                        recv_stream_worker(
+                                            stream, out_file, layout, resume, manifest_c, pb, hasher,
+                                            ptx, st, wsem, dd, expect_hello,
+                                        )
+                                        .await
+                                    });
+                                    accepted += 1;
+                                    active_workers += 1;
+                                }
+                                Ok(Err(e)) => warn!("failed to accept new data stream: {e:#}"),
+                                Err(_) => warn!("timed out accepting new data stream"),
+                            }
+                        }
+                        current_workers = accepted;
+                        let _ = ack_req_tx
+                            .send(crate::transfer::negotiate::stream_count_u8(accepted))
+                            .await;
+                    } else if target < current_workers {
+                        // Scale-down: no stream management needed on the receiver side.
+                        // The sender will close excess streams (QUIC FIN / TLS shutdown);
+                        // those workers exit when they see EOF, decrementing active_workers
+                        // via the tasks.join_next() arm above.
+                        info!(
+                            current = current_workers,
+                            target,
+                            "scaling down: sender will close {} streams",
+                            current_workers - target
+                        );
+                        current_workers = target;
+                        let _ = ack_req_tx
+                            .send(crate::transfer::negotiate::stream_count_u8(target))
+                            .await;
                     }
-                    current_workers = accepted;
-                    let _ = ack_req_tx
-                        .send(crate::transfer::negotiate::stream_count_u8(accepted))
-                        .await;
-                } else if target < current_workers {
-                    // Scale-down: no stream management needed on the receiver side.
-                    // The sender will close excess streams (QUIC FIN / TLS shutdown);
-                    // those workers exit when they see EOF, decrementing active_workers
-                    // via the tasks.join_next() arm above.
-                    info!(
-                        current = current_workers,
-                        target,
-                        "scaling down: sender will close {} streams",
-                        current_workers - target
-                    );
-                    current_workers = target;
-                    let _ = ack_req_tx
-                        .send(crate::transfer::negotiate::stream_count_u8(target))
-                        .await;
                 }
             }
         }
-    }
-    // Let the reporter know no more workers will be added (closes channel).
-    drop(scale_progress_tx);
-    pt.pb.finish();
+        // Let the reporter know no more workers will be added (closes channel).
+        drop(scale_progress_tx);
+        pt.pb.finish();
 
-    // Flush any ranges still in the deferred DONTNEED queue now that all
-    // writes have completed and the block device has had time to drain them.
-    deferred_dontneed.flush();
-    if let Some(ref cl) = pt.layout {
-        cl.close_files();
-    }
+        // Flush any ranges still in the deferred DONTNEED queue now that all
+        // writes have completed and the block device has had time to drain them.
+        deferred_dontneed.flush();
+        if let Some(ref cl) = pt.layout {
+            cl.close_files();
+        }
 
-    // Reporter closes when all workers finish (progress_tx fully dropped).
-    // Wait for it to return ctrl_send.
-    let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
+        // Reporter closes when all workers finish (progress_tx fully dropped).
+        // Wait for it to return ctrl_send.
+        let mut ctrl_send = reporter.await.context("progress reporter panicked")??;
 
-    // A hard worker failure (panic, disk error, malformed frame) is fatal and
-    // not repairable — surface it immediately.
-    if let Some(e) = task_err {
-        let _ = framing::send_message(
-            &mut ctrl_send,
-            &ReceiverMessage::Error {
-                message: e.to_string(),
-                fatal: true,
-            },
-        )
-        .await;
-        bail!("{e}");
-    }
+        // A hard worker failure (panic, disk error, malformed frame) is fatal and
+        // not repairable — surface it immediately.
+        if let Some(e) = task_err {
+            let _ = framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Error {
+                    message: e.to_string(),
+                    fatal: true,
+                },
+            )
+            .await;
+            bail!("{e}");
+        }
 
-    // Reclaim the control recv half + the sender's first Complete hash.
-    let (mut ctrl_recv, hash_opt) = ctrl_reader.await.context("ctrl reader task panicked")?;
-    let mut expected_hash =
-        hash_opt.ok_or_else(|| anyhow!("sender closed without sending Complete"))?;
+        // Reclaim the control recv half + the sender's first Complete hash.
+        let (mut ctrl_recv, hash_opt) = ctrl_reader.await.context("ctrl reader task panicked")?;
+        let mut expected_hash =
+            hash_opt.ok_or_else(|| anyhow!("sender closed without sending Complete"))?;
 
-    // ── Incremental repair (protocol v5) ──────────────────────────────────────
-    //
-    // Some chunks may be missing from disk: a dropped corrupt chunk, or an FEC
-    // stripe that could not be reconstructed.  Rather than fail outright, ask
-    // the sender (over the still-open control stream) to re-send exactly those
-    // chunks as plain ChunkData, keeping the connection and its warmed
-    // congestion window alive.  Works for single-file (pwrite to the output fd)
-    // and directory transfers (scatter-write across the concat layout); bounded
-    // by MAX_REPAIR_ROUNDS.
-    let repairable = crate::protocol::messages::repair_supported(neg_req.protocol_version)
-        && (pt.out_file.is_some() || pt.layout.is_some());
-    let mut repaired = false;
-    let mut round = 0u32;
-    // `repairable` is fixed, but each iteration either breaks or writes repaired
-    // chunks into resume state and is bounded by MAX_REPAIR_ROUNDS — not infinite.
-    #[allow(clippy::while_immutable_condition)]
-    while repairable {
-        let missing = pt
+        // ── Incremental repair (protocol v5) ──────────────────────────────────────
+        //
+        // Some chunks may be missing from disk: a dropped corrupt chunk, or an FEC
+        // stripe that could not be reconstructed.  Rather than fail outright, ask
+        // the sender (over the still-open control stream) to re-send exactly those
+        // chunks as plain ChunkData, keeping the connection and its warmed
+        // congestion window alive.  Works for single-file (pwrite to the output fd)
+        // and directory transfers (scatter-write across the concat layout); bounded
+        // by MAX_REPAIR_ROUNDS.
+        let repairable = crate::protocol::messages::repair_supported(neg_req.protocol_version)
+            && (pt.out_file.is_some() || pt.layout.is_some());
+        let mut repaired = false;
+        let mut round = 0u32;
+        // `repairable` is fixed, but each iteration either breaks or writes repaired
+        // chunks into resume state and is bounded by MAX_REPAIR_ROUNDS — not infinite.
+        #[allow(clippy::while_immutable_condition)]
+        while repairable {
+            let missing = pt
+                .resume
+                .lock()
+                .expect("resume-state mutex poisoned")
+                .missing_chunks();
+            if missing.is_empty() {
+                break;
+            }
+            round += 1;
+            if round > crate::protocol::messages::MAX_REPAIR_ROUNDS
+                || missing.len() > crate::protocol::messages::MAX_REPAIR_CHUNKS_PER_ROUND
+            {
+                // Too much missing or too many rounds — stop and let the explicit
+                // missing-chunk error below fire (resume recovers on rerun).
+                break;
+            }
+            info!(round, count = missing.len(), "requesting in-band repair");
+            pt.pb
+                .set_message(format!("repairing {} chunk(s)…", missing.len()));
+            let want = missing.len();
+            framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Retransmit { chunks: missing },
+            )
+            .await?;
+
+            // Read exactly that many ChunkData repair frames, then the sender's
+            // follow-up Complete (which re-syncs us for the next round).
+            for _ in 0..want {
+                let cd = framing::recv_chunk_data(&mut ctrl_recv)
+                    .await?
+                    .ok_or_else(|| anyhow!("sender closed control stream mid-repair"))?;
+                write_repair_chunk(
+                    &cd,
+                    pt.out_file.as_ref(),
+                    pt.layout.as_ref(),
+                    &pt.resume,
+                    &manifest,
+                    &pt.pb,
+                )
+                .await?;
+            }
+            repaired = true;
+            match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await? {
+                Some(SenderMessage::Complete { file_hash }) => expected_hash = file_hash,
+                _ => bail!("sender closed control stream without re-Complete after repair"),
+            }
+        }
+
+        // If chunks are still missing (repair unavailable, exhausted, or too large),
+        // report an attributable error before the generic whole-file hash check.
+        let still_missing = pt
             .resume
             .lock()
             .expect("resume-state mutex poisoned")
             .missing_chunks();
-        if missing.is_empty() {
-            break;
+        if !still_missing.is_empty() {
+            let e = missing_chunks_error(&still_missing, &manifest);
+            let _ = framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Error {
+                    message: e.to_string(),
+                    fatal: true,
+                },
+            )
+            .await;
+            bail!("{e}");
         }
-        round += 1;
-        if round > crate::protocol::messages::MAX_REPAIR_ROUNDS
-            || missing.len() > crate::protocol::messages::MAX_REPAIR_CHUNKS_PER_ROUND
-        {
-            // Too much missing or too many rounds — stop and let the explicit
-            // missing-chunk error below fire (resume recovers on rerun).
-            break;
+
+        // After any repair, per-chunk hashes fed to the ChunkHasher are incomplete
+        // (repaired chunks bypassed it), so force a from-disk rehash by passing None.
+        let hasher = if repaired { None } else { pt.hasher };
+
+        // Directory mode: close the cached output handles (flushing their deferred
+        // DONTNEED) before the from-disk hash and metadata pass.
+        if let Some(ref cl) = pt.layout {
+            cl.close_files();
         }
-        info!(round, count = missing.len(), "requesting in-band repair");
-        pt.pb
-            .set_message(format!("repairing {} chunk(s)…", missing.len()));
-        let want = missing.len();
-        framing::send_message(
+
+        finish_transfer(
             &mut ctrl_send,
-            &ReceiverMessage::Retransmit { chunks: missing },
+            pt.resume,
+            hasher,
+            pt.layout,
+            &output_dir,
+            &manifest,
+            expected_hash,
         )
         .await?;
 
-        // Read exactly that many ChunkData repair frames, then the sender's
-        // follow-up Complete (which re-syncs us for the next round).
-        for _ in 0..want {
-            let cd = framing::recv_chunk_data(&mut ctrl_recv)
-                .await?
-                .ok_or_else(|| anyhow!("sender closed control stream mid-repair"))?;
-            write_repair_chunk(
-                &cd,
-                pt.out_file.as_ref(),
-                pt.layout.as_ref(),
-                &pt.resume,
-                &manifest,
-                &pt.pb,
-            )
-            .await?;
+        if let Some(job) = job {
+            let files = transfer_files(&output_dir, &manifest, dir_entries.as_deref());
+            job.completed(manifest.file_size, files).await;
         }
-        repaired = true;
-        match framing::recv_message::<_, SenderMessage>(&mut ctrl_recv).await? {
-            Some(SenderMessage::Complete { file_hash }) => expected_hash = file_hash,
-            _ => bail!("sender closed control stream without re-Complete after repair"),
-        }
-    }
 
-    // If chunks are still missing (repair unavailable, exhausted, or too large),
-    // report an attributable error before the generic whole-file hash check.
-    let still_missing = pt
-        .resume
-        .lock()
-        .expect("resume-state mutex poisoned")
-        .missing_chunks();
-    if !still_missing.is_empty() {
-        let e = missing_chunks_error(&still_missing, &manifest);
-        let _ = framing::send_message(
-            &mut ctrl_send,
-            &ReceiverMessage::Error {
-                message: e.to_string(),
-                fatal: true,
-            },
-        )
-        .await;
-        bail!("{e}");
-    }
-
-    // After any repair, per-chunk hashes fed to the ChunkHasher are incomplete
-    // (repaired chunks bypassed it), so force a from-disk rehash by passing None.
-    let hasher = if repaired { None } else { pt.hasher };
-
-    // Directory mode: close the cached output handles (flushing their deferred
-    // DONTNEED) before the from-disk hash and metadata pass.
-    if let Some(ref cl) = pt.layout {
-        cl.close_files();
-    }
-
-    finish_transfer(
-        &mut ctrl_send,
-        pt.resume,
-        hasher,
-        pt.layout,
-        &output_dir,
-        &manifest,
-        expected_hash,
-    )
-    .await?;
-
-    if let Some(job) = job {
-        let files = transfer_files(&output_dir, &manifest, dir_entries.as_deref());
-        job.completed(manifest.file_size, files).await;
-    }
-
-    Ok(ctrl_send)
+        Ok(ctrl_send)
+    };
+    let result = tokio::select! {
+        r = body => r,
+        _ = cancelled.notified() => Err(anyhow!(
+            "transfer superseded: the same sender reconnected to resume it"
+        )),
+    };
+    drop(dest_guard);
+    result
 }
 
 /// Exact byte length of chunk `idx` (`< total_chunks`): `chunk_size`, except a
@@ -2317,10 +2377,9 @@ impl ConcatLayout {
 #[derive(Clone)]
 pub struct Route {
     pub output_dir: PathBuf,
-    /// Remaining byte budget (e.g. a tenant quota minus current usage); a
-    /// transfer needing more new bytes than this is refused after its manifest
-    /// is read. `None` = unlimited.
-    pub max_new_bytes: Option<u64>,
+    /// Byte quota the transfer's new on-disk bytes are reserved against once
+    /// its manifest is read (refused if they don't fit). `None` = unlimited.
+    pub budget: Option<Arc<dyn ByteBudget>>,
     /// Lifecycle hooks for the transfer on this connection (the daemon's queue
     /// and at-rest encryption).
     pub observer: Option<Arc<dyn TransferObserver>>,
@@ -2330,10 +2389,18 @@ impl From<PathBuf> for Route {
     fn from(output_dir: PathBuf) -> Self {
         Route {
             output_dir,
-            max_new_bytes: None,
+            budget: None,
             observer: None,
         }
     }
+}
+
+/// A byte quota transfers reserve against (see [`Route::budget`]).
+pub trait ByteBudget: Send + Sync {
+    /// Atomically check that `bytes` more fit — counting other reservations
+    /// still outstanding — and hold them until the returned guard is dropped.
+    /// May block (e.g. to measure current usage).
+    fn reserve(&self, bytes: u64) -> Result<Box<dyn Send>>;
 }
 
 /// Per-transfer lifecycle hooks a server's owner can attach through [`Route`].
@@ -2360,34 +2427,41 @@ pub trait TransferJob: Send + Sync {
 /// or error out of `run_receive`), and stops its progress ticker.
 struct JobGuard {
     job: Arc<dyn TransferJob>,
-    ticker: tokio::task::JoinHandle<()>,
+    ticker: Option<tokio::task::JoinHandle<()>>,
     done: bool,
 }
 
 impl JobGuard {
-    fn start(
-        observer: &dyn TransferObserver,
-        manifest: &TransferManifest,
-        pb: Arc<ProgressBar>,
-    ) -> Self {
-        let job = observer.started(&manifest.file_name, manifest.file_size);
-        let ticking = Arc::clone(&job);
-        let ticker = tokio::spawn(async move {
-            let mut every = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                every.tick().await;
-                ticking.progress(pb.position());
-            }
-        });
+    fn start(observer: &dyn TransferObserver, manifest: &TransferManifest) -> Self {
         JobGuard {
-            job,
-            ticker,
+            job: observer.started(&manifest.file_name, manifest.file_size),
+            ticker: None,
             done: false,
         }
     }
 
+    /// Report `pb`'s position about once a second until the job ends.
+    fn track_progress(&mut self, pb: Arc<ProgressBar>) {
+        let job = Arc::clone(&self.job);
+        self.ticker = Some(tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                job.progress(pb.position());
+            }
+        }));
+    }
+
+    /// The transfer was refused or failed for a known reason.
+    fn fail(mut self, error: &str) {
+        self.done = true;
+        self.job.failed(error);
+    }
+
     async fn completed(mut self, bytes: u64, files: Vec<PathBuf>) {
-        self.ticker.abort();
+        if let Some(t) = self.ticker.take() {
+            t.abort();
+        }
         self.job.progress(bytes);
         self.done = true;
         self.job.completed(files).await;
@@ -2396,7 +2470,9 @@ impl JobGuard {
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        self.ticker.abort();
+        if let Some(t) = self.ticker.take() {
+            t.abort();
+        }
         if !self.done {
             self.job
                 .failed("transfer failed or was aborted (see receiver log)");
@@ -2445,40 +2521,97 @@ fn new_bytes_needed(
     }
 }
 
-/// Closes the connection behind an in-progress transfer so a reconnecting
-/// sender can take over its destination.
-type SupersedeFn = Arc<dyn Fn() + Send + Sync>;
+/// Keeps alive the shared state an in-flight transfer's blocking write tasks
+/// hold (output file, layout, resume state); all dead once every such task has
+/// finished.
+type WriteLife = std::sync::Weak<dyn std::any::Any + Send + Sync>;
 
-/// An in-progress transfer's hold on its destination.
+/// A transfer's hold on its destination.
 struct DestinationClaim {
     /// Distinguishes this claim from a later one for the same path.
     id: u64,
     transfer_id: [u8; 16],
-    supersede: Option<SupersedeFn>,
+    /// The sender's authenticated DeviceId (client certificate), if any.
+    peer: Option<String>,
+    /// Fired to cancel this transfer when its sender reconnects.
+    cancel: Arc<tokio::sync::Notify>,
+    /// Shared state of this transfer's write tasks (see [`WriteLife`]).
+    writes: Vec<WriteLife>,
+    /// The transfer has ended but some of its blocking writes may still be
+    /// running; the next claim waits for them to drain.
+    released: bool,
 }
 
-/// Destinations (`output_dir/file_name`) with a transfer in progress in this
-/// process.
+impl DestinationClaim {
+    fn writes_drained(&self) -> bool {
+        self.writes.iter().all(|w| w.strong_count() == 0)
+    }
+}
+
+/// Destinations (`output_dir/file_name`) with a transfer in progress (or still
+/// draining its writes) in this process.
 static ACTIVE_DESTINATIONS: std::sync::OnceLock<Mutex<HashMap<PathBuf, DestinationClaim>>> =
     std::sync::OnceLock::new();
 static NEXT_CLAIM_ID: AtomicU64 = AtomicU64::new(0);
 
-/// How long a reconnecting sender waits for its stale predecessor to release
-/// the destination after the old connection is closed.
+/// How long a claim waits for a superseded or just-ended transfer on the same
+/// destination to stop (including its in-flight blocking writes).
 const SUPERSEDE_WAIT: Duration = Duration::from_secs(15);
+
+fn destinations() -> &'static Mutex<HashMap<PathBuf, DestinationClaim>> {
+    ACTIVE_DESTINATIONS.get_or_init(Default::default)
+}
 
 /// Releases a [`claim_destination`] registration on drop.
 struct DestinationGuard {
     key: PathBuf,
     id: u64,
+    cancel: Arc<tokio::sync::Notify>,
+}
+
+impl DestinationGuard {
+    /// Resolves when a reconnect of the same sender supersedes this transfer.
+    fn cancelled(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// Record the shared state this transfer's blocking writes hold, so a later
+    /// claim on the destination waits until they have all finished.
+    fn track_writes(&self, pt: &PreparedTransfer) {
+        let mut lives: Vec<WriteLife> = Vec::new();
+        let resume: Arc<dyn std::any::Any + Send + Sync> = pt.resume.clone();
+        lives.push(Arc::downgrade(&resume));
+        if let Some(f) = &pt.out_file {
+            let f: Arc<dyn std::any::Any + Send + Sync> = f.clone();
+            lives.push(Arc::downgrade(&f));
+        }
+        if let Some(l) = &pt.layout {
+            let l: Arc<dyn std::any::Any + Send + Sync> = l.clone();
+            lives.push(Arc::downgrade(&l));
+        }
+        self.track_lives(lives);
+    }
+
+    fn track_lives(&self, lives: Vec<WriteLife>) {
+        let mut g = destinations()
+            .lock()
+            .expect("destination registry mutex poisoned");
+        if let Some(c) = g.get_mut(&self.key).filter(|c| c.id == self.id) {
+            c.writes = lives;
+        }
+    }
 }
 
 impl Drop for DestinationGuard {
     fn drop(&mut self) {
-        if let Some(map) = ACTIVE_DESTINATIONS.get() {
-            let mut g = map.lock().expect("destination registry mutex poisoned");
-            if g.get(&self.key).is_some_and(|c| c.id == self.id) {
+        let mut g = destinations()
+            .lock()
+            .expect("destination registry mutex poisoned");
+        if let Some(c) = g.get_mut(&self.key).filter(|c| c.id == self.id) {
+            if c.writes_drained() {
                 g.remove(&self.key);
+            } else {
+                c.released = true;
             }
         }
     }
@@ -2487,10 +2620,13 @@ impl Drop for DestinationGuard {
 /// Register `output_dir/file_name` as the target of an in-progress transfer.
 ///
 /// A different transfer already writing there is refused. The *same* transfer
-/// (matching `transfer_id`) is a sender that reconnected — e.g. after a crash,
-/// while the old connection lingers until its idle timeout — so the stale
-/// connection is closed via its `supersede` hook and this claim waits for it to
-/// release, letting the new connection resume instead of being locked out.
+/// (matching `transfer_id`) from the *same authenticated sender* (matching
+/// client-certificate DeviceId — the transfer_id alone is predictable, so an
+/// anonymous or different peer can never take over) is a sender that
+/// reconnected, e.g. after a crash while the old connection lingers: the stale
+/// transfer is cancelled and this claim waits for it to stop. Either way a new
+/// claim also waits for the previous transfer's in-flight blocking writes to
+/// drain, so they can't land on top of the new transfer's file or resume state.
 ///
 /// The key uses the canonicalised output directory so different spellings of
 /// the same directory (relative path, trailing `.`, symlinked parent) collide.
@@ -2498,49 +2634,54 @@ async fn claim_destination(
     output_dir: &std::path::Path,
     file_name: &str,
     transfer_id: [u8; 16],
-    supersede: Option<SupersedeFn>,
+    peer: Option<String>,
 ) -> Result<DestinationGuard> {
     let dir = std::fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
     let key = dir.join(file_name);
-    let map = ACTIVE_DESTINATIONS.get_or_init(Default::default);
     let id = NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed);
     let deadline = tokio::time::Instant::now() + SUPERSEDE_WAIT;
     let mut signalled = false;
     loop {
-        let stale = {
-            let mut g = map.lock().expect("destination registry mutex poisoned");
-            match g.get(&key) {
-                None => {
-                    g.insert(
-                        key.clone(),
-                        DestinationClaim {
-                            id,
-                            transfer_id,
-                            supersede,
-                        },
-                    );
-                    return Ok(DestinationGuard { key, id });
-                }
-                Some(c) if c.transfer_id == transfer_id && c.supersede.is_some() => {
-                    c.supersede.clone()
+        {
+            let mut g = destinations()
+                .lock()
+                .expect("destination registry mutex poisoned");
+            let free = match g.get(&key) {
+                None => true,
+                Some(c) if c.released => c.writes_drained(),
+                Some(c) if c.transfer_id == transfer_id && peer.is_some() && c.peer == peer => {
+                    if !signalled {
+                        warn!(dest = %key.display(), "sender reconnected; cancelling its stale transfer");
+                        c.cancel.notify_one();
+                        signalled = true;
+                    }
+                    false
                 }
                 Some(_) => bail!(
                     "another transfer to {} is already in progress on this receiver; \
                      retry once it finishes",
                     key.display()
                 ),
+            };
+            if free {
+                let cancel = Arc::new(tokio::sync::Notify::new());
+                g.insert(
+                    key.clone(),
+                    DestinationClaim {
+                        id,
+                        transfer_id,
+                        peer,
+                        cancel: Arc::clone(&cancel),
+                        writes: Vec::new(),
+                        released: false,
+                    },
+                );
+                return Ok(DestinationGuard { key, id, cancel });
             }
-        };
-        if !signalled {
-            if let Some(close) = stale {
-                warn!(dest = %key.display(), "sender reconnected; closing stale connection");
-                close();
-            }
-            signalled = true;
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
-                "a previous connection for this transfer to {} did not shut down; retry shortly",
+                "a previous transfer to {} has not finished shutting down; retry shortly",
                 key.display()
             );
         }
@@ -4013,18 +4154,27 @@ mod tests {
     #[tokio::test]
     async fn concurrent_claims_on_same_destination_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let g = claim_destination(dir.path(), "same.bin", [1; 16], None)
+        let alice = Some("a".repeat(64));
+        let g = claim_destination(dir.path(), "same.bin", [1; 16], alice.clone())
             .await
             .unwrap();
-        // Same target, different spelling of the directory.
+        // Same target, different spelling of the directory, other transfer.
         let alias = dir.path().join(".");
-        assert!(claim_destination(&alias, "same.bin", [2; 16], None)
-            .await
-            .is_err());
-        // Same transfer but no way to close the holder (TCP): still refused.
+        assert!(
+            claim_destination(&alias, "same.bin", [2; 16], alice.clone())
+                .await
+                .is_err()
+        );
+        // Same (predictable) transfer_id but anonymous or a different peer:
+        // never allowed to take over.
         assert!(claim_destination(dir.path(), "same.bin", [1; 16], None)
             .await
             .is_err());
+        assert!(
+            claim_destination(dir.path(), "same.bin", [1; 16], Some("b".repeat(64)))
+                .await
+                .is_err()
+        );
         // A different file in the same directory is fine.
         let other = claim_destination(dir.path(), "other.bin", [3; 16], None)
             .await
@@ -4038,33 +4188,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_for_same_transfer_supersedes_stale_claim() {
+    async fn reconnect_of_same_sender_supersedes_stale_claim() {
         let dir = tempfile::tempdir().unwrap();
-        let slot: Arc<Mutex<Option<DestinationGuard>>> = Arc::default();
-        let closer_slot = Arc::clone(&slot);
-        // Closing the stale connection makes its task exit and drop the guard.
-        let supersede: SupersedeFn = Arc::new(move || {
-            closer_slot.lock().unwrap().take();
+        let alice = Some("a".repeat(64));
+        let old = claim_destination(dir.path(), "r.bin", [9; 16], alice.clone())
+            .await
+            .unwrap();
+        // The stale transfer exits (dropping its guard) once cancelled.
+        let cancelled = old.cancelled();
+        let stale = tokio::spawn(async move {
+            cancelled.notified().await;
+            drop(old);
         });
-        let old = claim_destination(dir.path(), "r.bin", [9; 16], Some(supersede))
+        let new = claim_destination(dir.path(), "r.bin", [9; 16], alice.clone())
             .await
             .unwrap();
-        *slot.lock().unwrap() = Some(old);
-        // A different transfer is still refused without closing the holder.
-        assert!(claim_destination(dir.path(), "r.bin", [8; 16], None)
-            .await
-            .is_err());
-        assert!(slot.lock().unwrap().is_some());
-        // The same transfer reconnecting takes over.
-        let new = claim_destination(dir.path(), "r.bin", [9; 16], None)
-            .await
-            .unwrap();
-        assert!(slot.lock().unwrap().is_none());
-        // The superseded guard's late drop must not release the new claim.
+        stale.await.unwrap();
+        // The new claim is in force (a third claimant without the same
+        // identity is refused).
         assert!(claim_destination(dir.path(), "r.bin", [9; 16], None)
             .await
             .is_err());
         drop(new);
+    }
+
+    /// A pre-v7 sender's data connection that sends nothing (or closes right
+    /// away) is still handed to its legacy transfer instead of being dropped.
+    #[tokio::test]
+    async fn idle_legacy_tcp_data_connection_is_delivered() {
+        use crate::net::connection::{cert_fingerprint, generate_self_signed_cert};
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        let fp = cert_fingerprint(&cert);
+        let acceptor =
+            Arc::new(make_tls_acceptor(cert, make_private_key(key).unwrap(), None).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Arc::new(TcpStreamRouter::default());
+        let (rx, _route) = router
+            .register(TcpRouteKey::Legacy, "127.0.0.1".parse().unwrap())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().to_owned();
+        let srv_router = Arc::clone(&router);
+        tokio::spawn(async move {
+            loop {
+                let (raw, peer) = listener.accept().await.unwrap();
+                let (a, r, o) = (Arc::clone(&acceptor), Arc::clone(&srv_router), out.clone());
+                tokio::spawn(async move {
+                    let _ = serve_routed_tcp_connection(raw, peer, a, r, o).await;
+                });
+            }
+        });
+
+        // Idle: stays open, sends nothing.
+        let _idle = crate::net::tcp::connect_tls(addr, Some(&fp), None, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("idle legacy connection delivered")
+            .unwrap();
+        // Closes right after the handshake.
+        let mut closing = crate::net::tcp::connect_tls(addr, Some(&fp), None, None)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut closing)
+            .await
+            .unwrap();
+        drop(closing);
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("closed legacy connection delivered")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn next_claim_waits_for_previous_writes_to_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = claim_destination(dir.path(), "w.bin", [5; 16], None)
+            .await
+            .unwrap();
+        // A blocking write task still holds the transfer's shared state.
+        let held: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        g.track_lives(vec![Arc::downgrade(&held)]);
+        drop(g);
+        let start = std::time::Instant::now();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(held);
+        });
+        let _next = claim_destination(dir.path(), "w.bin", [6; 16], None)
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "claim granted while the previous transfer's writes were in flight"
+        );
+        release.await.unwrap();
     }
 
     #[test]

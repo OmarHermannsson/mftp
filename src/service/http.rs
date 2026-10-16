@@ -40,6 +40,15 @@ pub struct HttpState {
     /// actually enforcing), rather than a fresh — possibly unparseable — read of
     /// the files on disk.
     pub auth: Arc<dyn Fn() -> AuthView + Send + Sync>,
+    /// The live transfer queue; `None` reads `config_dir/queue.json` instead.
+    pub queue: Option<Arc<dyn Fn() -> Queue + Send + Sync>>,
+}
+
+fn current_queue(state: &HttpState) -> Queue {
+    match &state.queue {
+        Some(q) => q(),
+        None => Queue::load(&state.config_dir).unwrap_or_default(),
+    }
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -238,7 +247,7 @@ fn route(path: &str, state: &HttpState) -> (&'static str, &'static str, String) 
 
 fn status_json(state: &HttpState) -> String {
     let auth = (state.auth)();
-    let q = Queue::load(&state.config_dir).unwrap_or_default();
+    let q = current_queue(state);
     let queued = q
         .jobs()
         .iter()
@@ -260,7 +269,7 @@ fn status_json(state: &HttpState) -> String {
 }
 
 fn queue_json(state: &HttpState) -> String {
-    let q = Queue::load(&state.config_dir).unwrap_or_default();
+    let q = current_queue(state);
     serde_json::json!({ "jobs": q.jobs() }).to_string()
 }
 
@@ -302,6 +311,7 @@ mod tests {
                 enforced: true,
                 authorized_count: 3,
             }),
+            queue: None,
         });
         tokio::spawn(async move {
             let _ = serve(listener, state).await;
@@ -372,6 +382,7 @@ mod tests {
             config_dir: tempfile::tempdir().unwrap().path().to_owned(),
             listening_on: String::new(),
             auth: Arc::new(AuthView::default),
+            queue: None,
         });
         tokio::spawn(async move {
             let _ = serve(listener, state).await;

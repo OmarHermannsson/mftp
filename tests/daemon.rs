@@ -681,3 +681,99 @@ async fn daemon_records_jobs_and_encrypts_at_rest() -> anyhow::Result<()> {
         .expect("serve returns Ok");
     Ok(())
 }
+
+/// Concurrent transfers from one peer reserve against the same quota: two
+/// parallel 700 KiB sends under a 1 MiB quota can't both land, and every
+/// refusal (after the manifest, or at connect) is recorded in the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_quota_holds_across_parallel_transfers() -> anyhow::Result<()> {
+    use mftp::service::acl::{Acl, PeerPolicy};
+    use mftp::service::queue::{JobState, Queue};
+
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let mut acl = Acl::default();
+    acl.set_peer(
+        &sender_id.device_id,
+        PeerPolicy {
+            output_subdir: "tenant".into(),
+            quota_bytes: Some(1024 * 1024),
+        },
+    );
+    acl.save(dcfg.path())?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    let a = make_file(send_dir.path(), "par_a.bin", 700 * 1024);
+    let b = make_file(send_dir.path(), "par_b.bin", 700 * 1024);
+    let (ra, rb) = tokio::join!(
+        sender::send(
+            a,
+            addr,
+            auth_send_config(fingerprint.clone(), sender_id.clone())
+        ),
+        sender::send(
+            b,
+            addr,
+            auth_send_config(fingerprint.clone(), sender_id.clone())
+        ),
+    );
+    assert!(
+        ra.is_ok() != rb.is_ok(),
+        "exactly one of two parallel over-quota transfers may succeed: {ra:?} / {rb:?}"
+    );
+    let landed = ["par_a.bin", "par_b.bin"]
+        .iter()
+        .filter(|n| out.path().join("tenant").join(n).exists())
+        .count();
+    assert_eq!(landed, 1);
+
+    // Now over quota at connect time → refused by the router, still recorded.
+    std::fs::write(out.path().join("tenant/filler.bin"), vec![0u8; 1024 * 1024])?;
+    let c = make_file(send_dir.path(), "par_c.bin", 1024);
+    assert!(
+        sender::send(c, addr, auth_send_config(fingerprint, sender_id))
+            .await
+            .is_err()
+    );
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+
+    // Saved on shutdown: one completed, one refused after its manifest, one
+    // refused at connect.
+    let q = Queue::load(dcfg.path())?;
+    let failed: Vec<_> = q
+        .jobs()
+        .iter()
+        .filter(|j| j.state == JobState::Failed)
+        .collect();
+    assert_eq!(
+        q.jobs()
+            .iter()
+            .filter(|j| j.state == JobState::Completed)
+            .count(),
+        1
+    );
+    assert!(
+        failed.iter().any(|j| j.what.starts_with("par_")
+            && j.error.as_deref().is_some_and(|e| e.contains("quota"))),
+        "{failed:?}"
+    );
+    assert!(
+        failed.iter().any(|j| j.what == "(connection refused)"
+            && j.error.as_deref().is_some_and(|e| e.contains("quota"))),
+        "{failed:?}"
+    );
+    Ok(())
+}
