@@ -1805,7 +1805,7 @@ fn prepare_transfer(
     } else {
         // Single-file mode: open and pre-allocate the output file.
         let out_path = output_dir.join(&manifest.file_name);
-        let f = open_and_preallocate(&out_path, manifest.file_size)?;
+        let f = open_and_preallocate(&out_path, manifest.file_size, false)?;
         (Some(Arc::new(f)), None)
     };
 
@@ -1844,30 +1844,60 @@ fn prepare_transfer(
     })
 }
 
-/// Open `path` for write, pre-allocate it to `size` bytes, and disable the
-/// page cache on macOS.
-fn open_and_preallocate(path: &std::path::Path, size: u64) -> Result<std::fs::File> {
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false) // sized explicitly via fallocate/set_len below
+/// Open `path` for write, pre-allocate it to exactly `size` bytes, and disable
+/// the page cache on macOS.
+///
+/// `nofollow` refuses to open `path` if it is a symlink (directory transfers:
+/// a file entry must never be written through a link left in the destination).
+///
+/// An existing file keeps its contents up to `size` (resume) but never keeps a
+/// stale tail beyond it.
+fn open_and_preallocate(
+    path: &std::path::Path,
+    size: u64,
+    nofollow: bool,
+) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(false); // sized explicitly below
+    #[cfg(unix)]
+    if nofollow {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = nofollow;
+    let f = opts
         .open(path)
         .with_context(|| format!("open output {}", path.display()))?;
+    let existing_len = f
+        .metadata()
+        .with_context(|| format!("stat output {}", path.display()))?
+        .len();
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let isize = i64::try_from(size).context("file too large for this platform")?;
         let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, isize) };
         if rc != 0 {
-            // fallocate can leave a partial reservation behind on ENOSPC; release
-            // it (truncate to 0) before falling back to a sparse file so a failed
-            // allocation doesn't strand blocks and fill the disk.
-            let _ = f.set_len(0);
+            // fallocate can leave a partial reservation behind on ENOSPC.  For a
+            // file we just created (or that was empty) release it by truncating
+            // to 0 before falling back to a sparse file, so a failed allocation
+            // doesn't strand blocks and fill the disk.  Never truncate an
+            // existing file to 0: it may hold resumed chunks.
+            if existing_len == 0 {
+                let _ = f.set_len(0);
+            }
+            f.set_len(size)?;
+        } else if existing_len > size {
+            // fallocate never shrinks; drop any stale tail from a larger file.
             f.set_len(size)?;
         }
     }
     #[cfg(not(target_os = "linux"))]
-    f.set_len(size)?;
+    {
+        let _ = existing_len;
+        f.set_len(size)?;
+    }
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
@@ -1883,6 +1913,9 @@ fn prepare_directory(entries: &[FileEntry], base_dir: &std::path::Path) -> Resul
     std::fs::create_dir_all(base_dir).with_context(|| format!("create {}", base_dir.display()))?;
 
     for entry in entries {
+        // Never create anything through a symlink already on disk (validation
+        // has already rejected paths through symlinks from this transfer).
+        ensure_no_symlink_prefix(base_dir, &entry.path)?;
         let dest = base_dir.join(&entry.path);
         match &entry.kind {
             FileKind::Directory => {
@@ -1895,6 +1928,21 @@ fn prepare_directory(entries: &[FileEntry], base_dir: &std::path::Path) -> Resul
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)
                         .with_context(|| format!("create parent {}", parent.display()))?;
+                }
+                // The target must not pass through a symlink on disk either: the
+                // lexical escape check assumes real directories.
+                let parent = entry.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                let walk = resolve_relative_path(parent, target)
+                    .with_context(|| format!("symlink {} escapes transfer root", dest.display()))?;
+                for p in &walk.traversed {
+                    let full = base_dir.join(p);
+                    if std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+                        bail!(
+                            "symlink {} target {target:?} traverses existing symlink {}",
+                            dest.display(),
+                            full.display()
+                        );
+                    }
                 }
                 // Remove existing symlink if present (resume-safe idempotency).
                 let _ = std::fs::remove_file(&dest);
@@ -1913,7 +1961,7 @@ fn prepare_directory(entries: &[FileEntry], base_dir: &std::path::Path) -> Resul
                         .with_context(|| format!("create parent {}", parent.display()))?;
                 }
                 // Pre-allocate the file (0-byte files just create the file).
-                open_and_preallocate(&dest, entry.size)
+                open_and_preallocate(&dest, entry.size, true)
                     .with_context(|| format!("preallocate {}", dest.display()))?;
             }
         }
@@ -2753,11 +2801,10 @@ fn validate_dir_entries(manifest: &TransferManifest, de: &DirEntries) -> Result<
                     target
                 );
             }
-            // Resolve the target lexically relative to the symlink's parent directory
-            // and ensure it doesn't escape via "..".
+            // Resolve the target lexically relative to the symlink's parent
+            // directory; a ".." that would climb above the root is an escape.
             let parent = entry.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-            let resolved = resolve_relative_path(parent, target);
-            if resolved.starts_with("../") || resolved == ".." {
+            if resolve_relative_path(parent, target).is_none() {
                 bail!(
                     "DirEntries[{i}]: symlink {:?} target {:?} escapes transfer root",
                     entry.path,
@@ -2778,6 +2825,42 @@ fn validate_dir_entries(manifest: &TransferManifest, de: &DirEntries) -> Result<
         }
     }
 
+    // Second pass, once every symlink is known: nothing may be created *through*
+    // a symlink from this transfer, and no symlink target may traverse one.
+    // Lexical resolution assumes every intermediate component is a real
+    // directory; a symlink in the middle (e.g. `q/s -> ../x`, then `t ->
+    // q/s/../..`) physically lands somewhere else and can escape the root.
+    let symlinks: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, FileKind::Symlink { .. }))
+        .map(|e| e.path.as_str())
+        .collect();
+    if !symlinks.is_empty() {
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some(p) = path_prefixes(&entry.path).find(|p| symlinks.contains(p)) {
+                bail!(
+                    "DirEntries[{i}]: path {:?} traverses symlink {p:?} from this transfer",
+                    entry.path
+                );
+            }
+            if let FileKind::Symlink { target } = &entry.kind {
+                let parent = entry.path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                let walk = resolve_relative_path(parent, target).unwrap_or_default();
+                if let Some(p) = walk
+                    .traversed
+                    .iter()
+                    .find(|p| symlinks.contains(p.as_str()))
+                {
+                    bail!(
+                        "DirEntries[{i}]: symlink {:?} target {:?} traverses symlink {p:?}",
+                        entry.path,
+                        target
+                    );
+                }
+            }
+        }
+    }
+
     // Verify that the sum of File sizes matches the manifest's file_size.
     if total_file_bytes != manifest.file_size {
         bail!(
@@ -2790,32 +2873,73 @@ fn validate_dir_entries(manifest: &TransferManifest, de: &DirEntries) -> Result<
     Ok(())
 }
 
+/// Every proper prefix of a `/`-separated relative path, shortest first
+/// (`"a/b/c"` -> `"a"`, `"a/b"`).
+fn path_prefixes(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/').map(move |(i, _)| &path[..i])
+}
+
+/// Result of [`resolve_relative_path`].
+#[derive(Debug, Default)]
+struct ResolvedTarget {
+    /// Root-relative paths the walk passes *through* (descends into and then
+    /// applies a further component to).  These must be real directories: a
+    /// symlink here makes the lexical result differ from the physical one.
+    traversed: Vec<String>,
+}
+
 /// Lexically resolve `target` relative to `base_dir` (e.g. a symlink's parent
-/// directory within the transfer root).  Returns a normalised relative path
-/// that can be checked for `..` escape.
-fn resolve_relative_path(base_dir: &str, target: &str) -> String {
+/// directory within the transfer root).
+///
+/// Returns `None` if the target escapes the root, i.e. a `..` would pop past
+/// the root.  (Silently ignoring such a `..` would let `x -> ../../etc`
+/// resolve to the harmless-looking `etc`.)
+fn resolve_relative_path(base_dir: &str, target: &str) -> Option<ResolvedTarget> {
     // Start with the base directory components.
     let mut parts: Vec<&str> = if base_dir.is_empty() {
         vec![]
     } else {
         base_dir.split('/').collect()
     };
+    let mut traversed = Vec::new();
+    // True when `parts` was last extended by a target component, so applying
+    // another component passes through it.
+    let mut descended = false;
 
     for component in target.split('/') {
         match component {
             "" | "." => {}
             ".." => {
-                parts.pop();
+                if descended {
+                    traversed.push(parts.join("/"));
+                }
+                parts.pop()?;
+                descended = false;
             }
-            c => parts.push(c),
+            c => {
+                if descended {
+                    traversed.push(parts.join("/"));
+                }
+                parts.push(c);
+                descended = true;
+            }
         }
     }
 
-    if parts.is_empty() {
-        ".".to_string()
-    } else {
-        parts.join("/")
+    Some(ResolvedTarget { traversed })
+}
+
+/// Fail if any proper prefix of the relative path `rel` under `base_dir` is a
+/// symlink on disk.  Guards writes against symlinks that already exist in the
+/// destination (e.g. left by an earlier transfer into the same directory).
+fn ensure_no_symlink_prefix(base_dir: &std::path::Path, rel: &str) -> Result<()> {
+    for p in path_prefixes(rel) {
+        let full = base_dir.join(p);
+        if std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!("refusing to write {rel:?}: {} is a symlink", full.display());
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2947,5 +3071,132 @@ mod tests {
             parity_shards: 100,
         });
         assert!(validate_manifest(&m).is_err());
+    }
+
+    #[test]
+    fn preallocate_truncates_stale_tail_but_keeps_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("out.bin");
+        std::fs::write(&p, vec![0xAB; 10_000]).unwrap();
+        let f = open_and_preallocate(&p, 4096, false).unwrap();
+        drop(f);
+        let got = std::fs::read(&p).unwrap();
+        assert_eq!(got.len(), 4096, "stale tail beyond size must be dropped");
+        assert!(got.iter().all(|&b| b == 0xAB), "existing prefix preserved");
+
+        // Growing keeps existing data too.
+        let f = open_and_preallocate(&p, 8192, false).unwrap();
+        drop(f);
+        let got = std::fs::read(&p).unwrap();
+        assert_eq!(got.len(), 8192);
+        assert!(got[..4096].iter().all(|&b| b == 0xAB));
+    }
+
+    // ── Symlink escape (adversarial DirEntries) ───────────────────────────────
+
+    fn entry(path: &str, kind: FileKind, size: u64) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size,
+            kind,
+            mode: 0,
+            mtime: 0,
+        }
+    }
+
+    fn link(path: &str, target: &str) -> FileEntry {
+        entry(
+            path,
+            FileKind::Symlink {
+                target: target.to_string(),
+            },
+            0,
+        )
+    }
+
+    fn dir_manifest(entries: &[FileEntry]) -> TransferManifest {
+        let mut m = base_manifest();
+        m.file_size = entries.iter().map(|e| e.size).sum();
+        m.total_chunks = m.file_size.div_ceil(m.chunk_size as u64);
+        m
+    }
+
+    fn check(entries: Vec<FileEntry>) -> Result<()> {
+        let m = dir_manifest(&entries);
+        validate_dir_entries(
+            &m,
+            &DirEntries {
+                entries: Some(entries),
+            },
+        )
+    }
+
+    #[test]
+    fn symlink_leading_dotdot_escape_rejected() {
+        // `..` past an empty stack used to be silently dropped, so this resolved
+        // to "etc" and passed.
+        assert!(check(vec![link("x", "../../../../etc")]).is_err());
+        assert!(check(vec![link("x", "..")]).is_err());
+        assert!(check(vec![
+            entry("d", FileKind::Directory, 0),
+            link("d/x", "../../etc")
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn symlink_within_root_accepted() {
+        assert!(check(vec![
+            entry("d", FileKind::Directory, 0),
+            entry("d/f", FileKind::File, 3),
+            link("d/x", "../d/f"),
+            link("y", "d"),
+            link("z", "."),
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn entry_through_transfer_symlink_rejected() {
+        // `a -> d` is in-root, but writing `a/f` would go through the link.
+        assert!(check(vec![
+            entry("d", FileKind::Directory, 0),
+            link("a", "d"),
+            entry("a/f", FileKind::File, 3),
+        ])
+        .is_err());
+        // Order-independent: the entry under the link is listed first.
+        assert!(check(vec![entry("a/f", FileKind::File, 3), link("a", ".")]).is_err());
+    }
+
+    #[test]
+    fn symlink_target_through_symlink_rejected() {
+        // `q/s` physically points at `x` (depth 1) but is lexically depth 2, so
+        // `q/s/../..` passes the lexical check yet lands outside the root.
+        assert!(check(vec![
+            entry("q", FileKind::Directory, 0),
+            link("q/s", "../x"),
+            link("t", "q/s/../.."),
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_directory_refuses_existing_symlink_in_path() {
+        let outside = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // A symlink already present in the destination (e.g. from an earlier
+        // transfer, or planted locally) pointing outside the root.
+        std::os::unix::fs::symlink(outside.path(), root.path().join("a")).unwrap();
+        let entries = vec![entry("a/f", FileKind::File, 3)];
+        assert!(prepare_directory(&entries, root.path()).is_err());
+        assert!(!outside.path().join("f").exists(), "wrote through symlink");
+
+        // A file entry whose own path is an existing symlink must not follow it.
+        std::os::unix::fs::symlink(outside.path().join("g"), root.path().join("g")).unwrap();
+        let entries = vec![entry("g", FileKind::File, 3)];
+        assert!(prepare_directory(&entries, root.path()).is_err());
+        assert!(!outside.path().join("g").exists(), "followed final symlink");
     }
 }
