@@ -659,11 +659,29 @@ pub fn make_server_tls_config(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
 ) -> Result<rustls::ServerConfig> {
+    make_server_tls_config_auth(cert, key, None)
+}
+
+/// Like [`make_server_tls_config`], but when `authorized` is `Some(list)` the
+/// client must present a certificate whose DeviceId is in `list` (the TCP
+/// counterpart of [`make_server_endpoint_with_cert_auth`]).
+pub fn make_server_tls_config_auth(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    authorized: Option<Vec<String>>,
+) -> Result<rustls::ServerConfig> {
     install_crypto_provider();
-    rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .context("failed to build rustls server config")
+    let builder = rustls::ServerConfig::builder();
+    match authorized {
+        Some(list) => builder
+            .with_client_cert_verifier(Arc::new(DeviceAllowlistVerifier::new(list)))
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config (client auth)"),
+        None => builder
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .context("failed to build rustls server config"),
+    }
 }
 
 /// Build a rustls `ClientConfig` for the TCP+TLS path (no QUIC-specific settings).
@@ -672,12 +690,31 @@ pub fn make_client_tls_config(
     trusted_device: Option<&str>,
     server_addr: SocketAddr,
 ) -> Result<rustls::ClientConfig> {
+    make_client_tls_config_with_identity(trusted_fingerprint, trusted_device, server_addr, None)
+}
+
+/// Like [`make_client_tls_config`], presenting `client_identity` (if any) as a
+/// client certificate for receivers that enforce DeviceId auth.
+pub fn make_client_tls_config_with_identity(
+    trusted_fingerprint: Option<&str>,
+    trusted_device: Option<&str>,
+    server_addr: SocketAddr,
+    client_identity: Option<&crate::identity::Identity>,
+) -> Result<rustls::ClientConfig> {
     install_crypto_provider();
     let verifier = build_client_verifier(trusted_fingerprint, trusted_device, server_addr)?;
-    Ok(rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth())
+        .with_custom_certificate_verifier(verifier);
+    Ok(match client_identity {
+        Some(id) => builder
+            .with_client_auth_cert(
+                vec![id.cert.clone()],
+                make_private_key(id.key_bytes.clone())?,
+            )
+            .context("attach client identity certificate")?,
+        None => builder.with_no_client_auth(),
+    })
 }
 
 // ── Certificate verifiers ─────────────────────────────────────────────────────

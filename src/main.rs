@@ -583,7 +583,23 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("invalid bind address: {bind}"))?;
             receiver::listen(addr, receiver::ReceiveConfig { output_dir }).await
         }
-        Command::Server { output_dir, port } => receiver::serve_one_stdio(output_dir, port).await,
+        Command::Server { output_dir, port } => {
+            // The SSH launcher passes the sender's DeviceId via the environment
+            // (`env VAR=… mftp server`), which older binaries simply ignore.
+            let require_peer = match std::env::var(mftp::ssh::REQUIRE_PEER_ENV) {
+                Ok(id) if !id.is_empty() => {
+                    let id = id.trim().to_ascii_lowercase();
+                    anyhow::ensure!(
+                        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "{} must be a 64-hex DeviceId",
+                        mftp::ssh::REQUIRE_PEER_ENV
+                    );
+                    Some(id)
+                }
+                _ => None,
+            };
+            receiver::serve_one_stdio(output_dir, port, require_peer).await
+        }
         Command::Rendezvous { bind } => {
             let addr = bind
                 .parse()

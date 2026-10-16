@@ -108,12 +108,15 @@ pub async fn bind_tcp(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)> {
 }
 
 /// Build a [`TlsAcceptor`] from a pre-generated certificate and private key.
+/// When `authorized` is `Some(list)`, clients must present a certificate whose
+/// DeviceId is in `list`.
 pub fn make_tls_acceptor(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+    authorized: Option<Vec<String>>,
 ) -> Result<TlsAcceptor> {
-    use crate::net::connection::make_server_tls_config;
-    let config = make_server_tls_config(cert, key)?;
+    use crate::net::connection::make_server_tls_config_auth;
+    let config = make_server_tls_config_auth(cert, key, authorized)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -124,13 +127,24 @@ pub fn make_tls_acceptor(
 /// `trusted_fingerprint`: if `Some`, the peer certificate must match this
 /// hex SHA-256 fingerprint.  If `None`, TOFU: accept any cert and print the
 /// fingerprint (same behaviour as the QUIC path).
+///
+/// `client_identity`: presented as a client certificate for receivers that
+/// enforce DeviceId auth (invisible to receivers that don't request one).
 pub async fn connect_tls(
     addr: SocketAddr,
     trusted_fingerprint: Option<&str>,
     trusted_device: Option<&str>,
+    client_identity: Option<&crate::identity::Identity>,
 ) -> Result<ClientTlsStream<TcpStream>> {
     let limit = handshake_timeout(trusted_fingerprint, trusted_device);
-    connect_tls_within(addr, trusted_fingerprint, trusted_device, limit).await
+    connect_tls_within(
+        addr,
+        trusted_fingerprint,
+        trusted_device,
+        client_identity,
+        limit,
+    )
+    .await
 }
 
 /// [`connect_tls`] with an explicit TLS-handshake bound.
@@ -138,12 +152,18 @@ async fn connect_tls_within(
     addr: SocketAddr,
     trusted_fingerprint: Option<&str>,
     trusted_device: Option<&str>,
+    client_identity: Option<&crate::identity::Identity>,
     limit: Duration,
 ) -> Result<ClientTlsStream<TcpStream>> {
-    use crate::net::connection::make_client_tls_config;
+    use crate::net::connection::make_client_tls_config_with_identity;
 
     let tcp = connect_raw(addr).await?;
-    let config = make_client_tls_config(trusted_fingerprint, trusted_device, addr)?;
+    let config = make_client_tls_config_with_identity(
+        trusted_fingerprint,
+        trusted_device,
+        addr,
+        client_identity,
+    )?;
     let connector = TlsConnector::from(Arc::new(config));
     // Use the server's IP address as the TLS SNI — our custom verifiers don't
     // validate the name, but TLS requires one.
@@ -215,7 +235,7 @@ mod tests {
 
         let fp = "a".repeat(64);
         let start = std::time::Instant::now();
-        let err = connect_tls_within(addr, Some(&fp), None, Duration::from_millis(300))
+        let err = connect_tls_within(addr, Some(&fp), None, None, Duration::from_millis(300))
             .await
             .expect_err("handshake must time out");
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");

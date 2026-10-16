@@ -1204,3 +1204,57 @@ async fn test_concurrent_transfers_isolated() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// TCP+TLS honours DeviceId client auth too (the SSH one-shot server locks
+/// itself to the launching sender): the authorized sender's control and data
+/// connections all get through, any other identity is refused.
+#[tokio::test]
+async fn test_tcp_client_auth_admits_only_required_peer() -> anyhow::Result<()> {
+    use mftp::net::connection::make_private_key;
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let ocfg = TempDir::new()?;
+    let rcfg = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "tcpauth.bin", 1024 * 1024);
+
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    let other_id = mftp::identity::load_or_create_in(ocfg.path())?;
+    let server_id = mftp::identity::load_or_create_in(rcfg.path())?;
+
+    let bind = || {
+        TcpServer::bind_with_cert_auth(
+            "127.0.0.1:0".parse().unwrap(),
+            recv_dir.path().to_owned(),
+            server_id.cert.clone(),
+            make_private_key(server_id.key_bytes.clone()).unwrap(),
+            server_id.fingerprint.clone(),
+            Some(vec![sender_id.device_id.clone()]),
+        )
+    };
+    let tcp_config = |id: mftp::identity::Identity| SendConfig {
+        forced_transport: Some(ForcedTransport::Tcp),
+        ..auth_send_config(server_id.fingerprint.clone(), id)
+    };
+
+    // Wrong identity: refused at the handshake.
+    let server = bind().await?;
+    let addr = server.local_addr;
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+    let denied = sender::send(src.clone(), addr, tcp_config(other_id)).await;
+    assert!(denied.is_err(), "unauthorized TCP sender must be rejected");
+    recv_task.abort();
+    assert!(!recv_dir.path().join("tcpauth.bin").exists());
+
+    // Required identity: full transfer (control + all data streams) succeeds.
+    let server = bind().await?;
+    let addr = server.local_addr;
+    let recv_task = tokio::spawn(async move { server.accept_one().await });
+    sender::send(src.clone(), addr, tcp_config(sender_id)).await?;
+    recv_task.await??;
+    assert_eq!(
+        std::fs::read(&src)?,
+        std::fs::read(recv_dir.path().join("tcpauth.bin"))?
+    );
+    Ok(())
+}

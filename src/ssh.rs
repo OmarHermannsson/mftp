@@ -313,6 +313,7 @@ async fn pipe_binary_to_remote(
     binary: &[u8],
     platform: &RemotePlatform,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let digest: [u8; 32] = Sha256::digest(binary).into();
     let script = remote_bootstrap_script(
@@ -322,6 +323,7 @@ async fn pipe_binary_to_remote(
         binary.len() as u64,
         &dest.remote_path,
         remote_port,
+        require_peer,
     );
 
     let mut child = ssh_command(dest)
@@ -371,8 +373,10 @@ fn remote_bootstrap_script(
     size: u64,
     remote_path: &str,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> String {
     let short = &sha256_hex[..16.min(sha256_hex.len())];
+    let env_prefix = require_peer_env(require_peer);
     let quoted_dir = shell_quote(remote_path);
     let port_arg = match remote_port {
         Some(p) => format!(" --port {p}"),
@@ -400,9 +404,26 @@ fn remote_bootstrap_script(
         // scp-like destination semantics: a non-directory path is a file
         // destination whose parent is the output dir.
         format!(r#"d={quoted_dir}; if [ -d "$d" ]; then :; else d=$(dirname "$d"); fi;"#),
-        format!(r#"exec "$f" server --output-dir "$d"{port_arg}"#),
+        format!(r#"exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
     ]
     .join(" ")
+}
+
+/// Environment variable through which the SSH launcher hands the remote
+/// one-shot `mftp server` the sender's DeviceId to require.
+pub const REQUIRE_PEER_ENV: &str = "MFTP_REQUIRE_PEER";
+
+/// `env MFTP_REQUIRE_PEER=<id> ` prefix for the remote server command (empty
+/// when no id). `env` works from any login shell, and a binary predating the
+/// variable just ignores it. Ids that aren't plain hex are dropped rather than
+/// interpolated into the remote command.
+fn require_peer_env(require_peer: Option<&str>) -> String {
+    match require_peer {
+        Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("env {REQUIRE_PEER_ENV}={id} ")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Wrap `script` as a single remote command string `sh -c '<script>'`.
@@ -681,8 +702,14 @@ pub async fn send_via_ssh(
     // When no pre-installed binary is specified we pipe the local binary to the
     // remote.  That only works if the remote runs the same OS and architecture;
     // probe first so we fail clearly instead of hanging on a bad exec.
+    // Lock the one-shot remote server to our own DeviceId so another host that
+    // reaches its port first can't take the transfer slot.
+    let require_peer = config
+        .client_identity
+        .as_ref()
+        .map(|id| id.device_id.as_str());
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port)?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port, require_peer)?,
         None => {
             let local = local_platform();
             let remote_platform = probe_remote_platform(&dest).await?;
@@ -721,7 +748,15 @@ pub async fn send_via_ssh(
                     match download_remote_binary(rp, binary_sha256.as_deref()).await {
                         Ok(binary) => {
                             eprintln!("[mftp] piping downloaded binary to remote ({remote_desc})…");
-                            match pipe_binary_to_remote(&dest, &binary, rp, remote_port).await {
+                            match pipe_binary_to_remote(
+                                &dest,
+                                &binary,
+                                rp,
+                                remote_port,
+                                require_peer,
+                            )
+                            .await
+                            {
                                 Ok(child) => child,
                                 Err(e) => {
                                     eprintln!(
@@ -748,7 +783,7 @@ pub async fn send_via_ssh(
                     return crate::sftp::send_via_sftp(file, dest, n).await;
                 }
             } else {
-                pipe_self_to_remote(&dest, remote_port).await?
+                pipe_self_to_remote(&dest, remote_port, require_peer).await?
             }
         }
     };
@@ -893,6 +928,7 @@ fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let port_arg = match remote_port {
         Some(p) => format!(" --port {p}"),
@@ -903,7 +939,8 @@ fn spawn_remote_binary(
     // E.g. host:/data/file writes to /data/file (parent = /data, filename from manifest).
     let quoted_dir = shell_quote(&dest.remote_path);
     let remote_cmd = format!(
-        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {} server --output-dir \"$d\"{}",
+        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {}{} server --output-dir \"$d\"{}",
+        require_peer_env(require_peer),
         shell_quote(bin),
         port_arg,
     );
@@ -927,6 +964,7 @@ fn spawn_remote_binary(
 async fn pipe_self_to_remote(
     dest: &SshDest,
     remote_port: Option<u16>,
+    require_peer: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
@@ -934,7 +972,7 @@ async fn pipe_self_to_remote(
         .with_context(|| format!("cannot read {}", exe.display()))?;
     // OS + arch are part of the cache name so a shared remote receiving from
     // clients of different platforms stores binaries separately.
-    pipe_binary_to_remote(dest, &binary, &local_platform(), remote_port).await
+    pipe_binary_to_remote(dest, &binary, &local_platform(), remote_port, require_peer).await
 }
 
 /// Single-quote a string for safe embedding in a POSIX shell command.
@@ -965,8 +1003,8 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use super::{
         download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
-        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command, shell_quote,
-        RemotePlatform,
+        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command,
+        require_peer_env, shell_quote, RemotePlatform, REQUIRE_PEER_ENV,
     };
 
     /// The remote command must be ONE shell word after `sh -c`, on one line,
@@ -980,6 +1018,7 @@ mod tests {
             1234,
             "/data/it's here",
             Some(9000),
+            Some(&"cd".repeat(32)),
         );
         assert!(!script.contains('\n'), "script must be a single line");
         assert!(!script.contains('!'), "no history-expansion characters");
@@ -989,6 +1028,9 @@ mod tests {
         assert!(cmd.starts_with("sh -c '"));
         assert!(cmd.ends_with('\''));
         assert!(script.contains("--port 9000"));
+        assert!(script.contains(&format!("env {REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        // Anything but plain hex is never interpolated into the command.
+        assert_eq!(require_peer_env(Some("x; rm -rf ~")), "");
     }
 
     /// Run the bootstrap exactly as the remote login shell would (`sh -c` of
@@ -1012,6 +1054,7 @@ mod tests {
             &hash,
             binary.len() as u64,
             out.path().to_str().unwrap(),
+            None,
             None,
         );
         let cmd = remote_sh_command(&script);
@@ -1091,6 +1134,7 @@ mod tests {
             &hash,
             binary.len() as u64,
             out.path().to_str().unwrap(),
+            None,
             None,
         ));
         // Plant a symlink where the per-uid dir would go, pointing elsewhere.

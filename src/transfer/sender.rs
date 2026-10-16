@@ -634,6 +634,7 @@ async fn send_tcp(
         destination,
         config.trusted_fingerprint.as_deref(),
         config.trusted_device.as_deref(),
+        config.client_identity.as_ref(),
     )
     .await?;
     let (mut ctrl_recv, mut ctrl_send) = tokio::io::split(ctrl);
@@ -655,6 +656,7 @@ async fn send_tcp(
 
     let trusted_fp = config.trusted_fingerprint.clone();
     let trusted_dev = config.trusted_device.clone();
+    let client_identity = config.client_identity.clone();
     let peer_version = neg_resp.protocol_version;
     let send_hello = crate::protocol::messages::stream_hello_active(
         crate::protocol::messages::advertised_version(),
@@ -680,8 +682,9 @@ async fn send_tcp(
         move |rx, transfer_id, compression, file_hasher, excess_stop, stats, stream_seq| {
             let fp = trusted_fp.clone();
             let dev = trusted_dev.clone();
+            let id = client_identity.clone();
             async move {
-                let stream = connect_tls(destination, fp.as_deref(), dev.as_deref())
+                let stream = connect_tls(destination, fp.as_deref(), dev.as_deref(), id.as_ref())
                     .await
                     .context("open TCP data stream")?;
                 tcp_stream_worker(

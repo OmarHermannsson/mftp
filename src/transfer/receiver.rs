@@ -396,8 +396,22 @@ impl TcpServer {
         key: PrivateKeyDer<'static>,
         fingerprint: String,
     ) -> Result<Self> {
+        Self::bind_with_cert_auth(addr, output_dir, cert, key, fingerprint, None).await
+    }
+
+    /// Like [`TcpServer::bind_with_cert`], but when `authorized` is `Some(list)`
+    /// every TLS connection (control and data) must present a client
+    /// certificate whose DeviceId is in `list`.
+    pub async fn bind_with_cert_auth(
+        addr: SocketAddr,
+        output_dir: PathBuf,
+        cert: CertificateDer<'static>,
+        key: PrivateKeyDer<'static>,
+        fingerprint: String,
+        authorized: Option<Vec<String>>,
+    ) -> Result<Self> {
         let (listener, local_addr) = crate::net::tcp::bind_tcp(addr).await?;
-        let acceptor = Arc::new(make_tls_acceptor(cert, key)?);
+        let acceptor = Arc::new(make_tls_acceptor(cert, key, authorized)?);
         Ok(Self {
             listener: Arc::new(listener),
             acceptor,
@@ -540,7 +554,16 @@ pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 ///
 /// Both transports are offered on the same port number so the sender's
 /// auto-fallback (QUIC → TCP+TLS) works without any extra configuration.
-pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<()> {
+///
+/// `require_peer`: the launching sender's DeviceId. When set, both listeners
+/// demand a matching client certificate, so another host that reaches the
+/// printed port first can't claim the one-shot slot and write into the
+/// remote directory.
+pub async fn serve_one_stdio(
+    output_dir: PathBuf,
+    port: Option<u16>,
+    require_peer: Option<String>,
+) -> Result<()> {
     use std::net::SocketAddr;
 
     // Persistent device identity (stable across SSH-launched runs too).
@@ -555,20 +578,23 @@ pub async fn serve_one_stdio(output_dir: PathBuf, port: Option<u16>) -> Result<(
 
     // Bind QUIC on the requested port (0 = random), then reuse that port for TCP.
     // UDP and TCP port spaces are independent, so this always works.
-    let quic_server = Server::bind_with_cert(
+    let authorized = require_peer.map(|id| vec![id]);
+    let quic_server = Server::bind_with_cert_auth(
         format!("0.0.0.0:{bind_port}").parse::<SocketAddr>()?,
         output_dir.clone(),
         cert.clone(),
         quic_key,
         fingerprint.clone(),
+        authorized.clone(),
     )?;
     let port = quic_server.local_addr.port();
-    let tcp_server = TcpServer::bind_with_cert(
+    let tcp_server = TcpServer::bind_with_cert_auth(
         format!("0.0.0.0:{port}").parse::<SocketAddr>()?,
         output_dir,
         cert,
         tcp_key,
         fingerprint.clone(),
+        authorized,
     )
     .await?;
 
