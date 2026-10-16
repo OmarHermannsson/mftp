@@ -1109,7 +1109,15 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
-    let neg_req: NegotiateRequest = framing::recv_message_required(&mut ctrl_recv).await?;
+    // The opening flight (NegotiateRequest, manifest, DirEntries) is sent by the
+    // sender immediately after connecting; bound each read so a peer that
+    // connects and goes silent (or stalls mid-frame after claiming a large
+    // length) cannot pin this task and its buffer forever.
+    let neg_req: NegotiateRequest = handshake_read(
+        "NegotiateRequest",
+        framing::recv_message_required(&mut ctrl_recv),
+    )
+    .await?;
     // v7+ senders prefix each data stream with a StreamHello frame; only read it
     // when both peers negotiated ≥ v7 (older senders never send it).
     let expect_hello = crate::protocol::messages::stream_hello_active(
@@ -1132,20 +1140,24 @@ where
         receiver_cores, "negotiation complete"
     );
 
-    // Use the data-frame limit (128 MiB) for the manifest so that large
-    // directories (many entries serialized) don't hit the 1 MiB control cap.
-    let manifest: TransferManifest = framing::recv_data_message(&mut ctrl_recv)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("stream closed before TransferManifest"))?;
+    // The manifest is small and fixed-shape (directory entries travel
+    // separately in DirEntries), so the 1 MiB control cap is ample.
+    let manifest: TransferManifest =
+        handshake_read("TransferManifest", framing::recv_message(&mut ctrl_recv))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stream closed before TransferManifest"))?;
     validate_manifest(&manifest)?;
 
     // Protocol version 3+: read DirEntries immediately after the manifest.
     // v2 senders don't send this message; skip the read for them.
     let dir_entries: Option<Vec<FileEntry>> =
         if crate::protocol::messages::directory_supported(neg_req.protocol_version) {
-            let de: DirEntries = framing::recv_data_message(&mut ctrl_recv)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("stream closed before DirEntries"))?;
+            let de: DirEntries = handshake_read(
+                "DirEntries",
+                framing::recv_message_limited(&mut ctrl_recv, MAX_DIR_ENTRIES_FRAME),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stream closed before DirEntries"))?;
             validate_dir_entries(&manifest, &de)?;
             de.entries
         } else {
@@ -2662,6 +2674,24 @@ where
 
 // ── Timeouts ──────────────────────────────────────────────────────────────────
 
+/// Per-message bound on reading the sender's opening flight (NegotiateRequest,
+/// TransferManifest, DirEntries).  The sender writes these right after
+/// connecting (at most one RTT apart on TCP), so this only fires for a stalled
+/// or idle peer.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Apply [`HANDSHAKE_READ_TIMEOUT`] to one opening-flight read.
+async fn handshake_read<T>(what: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, fut)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "timed out after {}s waiting for {what} from sender",
+                HANDSHAKE_READ_TIMEOUT.as_secs()
+            )
+        })?
+}
+
 /// How long `run_receive` waits for each individual data stream to be
 /// accepted.  The sender opens all data streams right after the receiver
 /// replies with `ReceiverMessage::Ready`, so 30 s is very generous; it
@@ -2690,6 +2720,12 @@ const MAX_STREAMS: usize = 1024;
 /// Maximum number of file entries in a `DirEntries` message.
 /// Limits memory usage and prevents degenerate manifests.
 const MAX_DIR_ENTRIES: usize = 500_000;
+
+/// Frame-size cap for the `DirEntries` message, derived from
+/// [`MAX_DIR_ENTRIES`]: ~32 bytes of fixed bincode fields per entry plus a
+/// generous average path (and symlink target) budget, 192 bytes in total.
+/// ≈ 92 MiB — under the 128 MiB data cap that was used before.
+const MAX_DIR_ENTRIES_FRAME: u32 = (MAX_DIR_ENTRIES * 192) as u32;
 
 /// Maximum total Reed-Solomon shards (data + parity) in a stripe.  The galois_8
 /// field caps this at 256; the manifest validator rejects anything larger.
@@ -3191,6 +3227,7 @@ mod tests {
             ReceiverStats::new(),
             Arc::new(tokio::sync::Semaphore::new(8)),
             crate::fs_ext::DeferredDontneed::noop(),
+            false,
         )
         .await;
         (res, pb.position())

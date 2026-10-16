@@ -337,6 +337,19 @@ where
     recv_message_inner(stream, MAX_CTRL_FRAME_SIZE).await
 }
 
+/// Read one frame with a caller-chosen size cap (clamped to the 128 MiB data
+/// cap).  For messages whose plausible size lies between the control and data
+/// caps (e.g. `DirEntries`, bounded by an entry-count limit).
+///
+/// Returns `Ok(None)` on clean EOF at a frame boundary.
+pub async fn recv_message_limited<R, T>(stream: &mut R, max_size: u32) -> Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    recv_message_inner(stream, max_size.min(MAX_DATA_FRAME_SIZE)).await
+}
+
 /// Like [`recv_message`] but treats EOF as an error.
 /// Use on the control stream where unexpected close is always a peer error.
 pub async fn recv_message_required<R, T>(stream: &mut R) -> Result<T>
