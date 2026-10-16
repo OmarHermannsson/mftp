@@ -98,7 +98,7 @@ QUIC connection accepted
       → decompress if flagged
       → pwrite chunk to output file at correct offset
       → ResumeState::mark_received (state flushed in batches; see below)
-  → all chunks received → verify whole-file SHA-256
+  → all chunks received → verify whole-file hash: BLAKE3 over the concatenated per-chunk BLAKE3 hashes (src/transfer/hash.rs)
   → send ReceiverMessage::Complete
   → ResumeState::delete()
 ```
@@ -113,6 +113,7 @@ QUIC connection accepted
 - **Per-chunk hashing**: BLAKE3 is computed over the decompressed chunk bytes and verified on the receiver before the chunk is written. A hash mismatch drops the chunk (leaving it unmarked) rather than aborting; at the completion checkpoint the receiver requests still-missing chunks via in-band incremental repair (protocol v5, `ReceiverMessage::Retransmit`) over the control stream, falling back to abort + resume only if repair is unavailable or exhausted. Repair covers both single-file transfers (pwrite at the chunk's global offset) and directory transfers (the sender reverse-maps each global chunk index to its byte range across the concatenated file set, mirroring `feed_chunks_concat`; the receiver scatter-writes it via `ConcatLayout`).
 - **Socket buffers**: both endpoints set `SO_SNDBUF`/`SO_RCVBUF` to at least 32 MiB (covers ~250 ms RTT at 1 Gbps BDP) via socket2 before binding.
 - **Resume granularity**: the bit-vector in `ResumeState` is flushed to disk every `RESUME_SAVE_BATCH` (64) chunks, not per chunk, to keep fsync off the hot path; a crash therefore loses at most ~64 in-flight chunks. The fsync runs outside the state mutex (snapshot-then-write). Correctness does not depend on the resume file being current: the end-of-transfer whole-file hash catches any gap and deletes the resume file, forcing a clean re-transfer.
+- **Daemon auth fails closed** (`src/daemon/mod.rs` `AuthPolicy`): a malformed/unreadable `acl.toml` or `authorized_devices` is a startup error, and a SIGHUP reload that fails keeps the previous policy. An authorization file that *exists* keeps the daemon enforcing even when empty (deny-all, via a sentinel id because `ReloadableAllowlist` treats empty as open); open mode requires neither file to exist. `daemon-trust` edits apply live and are refused when `acl.toml` governs. LAN discovery announcements are unauthenticated and never pinned as trust.
 
 ### TLS / Authentication
 

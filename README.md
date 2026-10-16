@@ -266,7 +266,12 @@ Options:
 
 The dashboard's transfer table reads the queue file (`~/.config/mftp/queue.json`), which the daemon does not populate yet, so it is empty in practice. Received files are stored as plaintext; at-rest encryption is not wired into the daemon.
 
-When the authorized-device allowlist is non-empty (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
+When an authorization file exists (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
+
+Authorization **fails closed**:
+- A malformed or unreadable `acl.toml` / `authorized_devices` stops the daemon from starting; a SIGHUP reload that hits one logs an error and keeps the policy already in force.
+- Removing the last device (`daemon-trust remove`) leaves an empty allowlist, which **denies everyone** rather than re-opening the receiver. Open mode requires that neither `acl.toml` nor `authorized_devices` exists — delete the file explicitly and restart (or SIGHUP) to go back to open.
+- `acl.toml` peers must each have a distinct, non-nested `output_subdir` (not empty or `.`); quotas are checked against the peer's existing usage when it connects.
 
 ### `mftp daemon-status` / `mftp daemon-trust` (Unix)
 
@@ -275,7 +280,7 @@ mftp daemon-status [--socket <PATH>]
 mftp daemon-trust  [--socket <PATH>] <add <id> | remove <id> | list>
 ```
 
-`daemon-status` prints the running daemon's listen address, identity, and counters over its control socket. `daemon-trust` manages the authorized-sender Device ID allowlist (`add`/`remove`/`list`).
+`daemon-status` prints the running daemon's listen address, identity, and counters over its control socket. `daemon-trust` manages the authorized-sender Device ID allowlist (`add`/`remove`/`list`); changes take effect immediately. When `acl.toml` governs authorization, `add`/`remove` are refused — edit `acl.toml` and send SIGHUP instead. `list` and `daemon-status` always show the effective set the daemon is enforcing. The control socket is created 0600 and the daemon refuses to start if another daemon is already listening on it.
 
 ### `mftp rendezvous` / `mftp relay`
 
