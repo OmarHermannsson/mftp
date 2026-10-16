@@ -358,7 +358,12 @@ pub fn peer_device_id(conn: &quinn::Connection) -> Option<String> {
 /// Uses the same self-signed-certificate / TOFU model as QUIC so the
 /// fingerprint can be shared across both transports.  Transfers are served
 /// sequentially (one at a time) — connection ordering is used to assign data
-/// streams without an extra protocol header.
+/// streams without an extra protocol header, so a transfer owns the listener
+/// for its whole lifetime (data streams are also accepted mid-transfer for
+/// dynamic scaling) and two transfers cannot safely run concurrently without a
+/// protocol change.  To keep one idle or slow peer from wedging the server, the
+/// control-connection TLS handshake is bounded by [`TLS_HANDSHAKE_TIMEOUT`] and
+/// a failed or timed-out handshake is skipped.
 pub struct TcpServer {
     listener: Arc<TcpListener>,
     acceptor: Arc<TlsAcceptor>,
@@ -395,16 +400,40 @@ impl TcpServer {
         })
     }
 
+    /// Accept the next control connection whose TLS handshake completes within
+    /// [`TLS_HANDSHAKE_TIMEOUT`], skipping (and logging) any that fail or stall.
+    async fn accept_control(&self) -> Result<ServerTlsStream<tokio::net::TcpStream>> {
+        loop {
+            let (raw, peer_addr) = match self.listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    // Transient (e.g. EMFILE, ECONNABORTED): don't kill the server.
+                    warn!("TCP accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if let Err(e) = raw.set_nodelay(true) {
+                warn!("set_nodelay failed for {peer_addr}: {e}");
+                continue;
+            }
+            info!("TCP connection from {peer_addr}");
+            let handshake = Arc::clone(&self.acceptor).accept(raw);
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(Ok(tls)) => return Ok(tls),
+                Ok(Err(e)) => warn!("TLS handshake failed from {peer_addr}: {e}"),
+                Err(_) => warn!(
+                    "TLS handshake from {peer_addr} timed out after {}s; dropping",
+                    TLS_HANDSHAKE_TIMEOUT.as_secs()
+                ),
+            }
+        }
+    }
+
     /// Accept and handle exactly one complete transfer (control + data streams), then return.
     /// Intended for integration tests.
     pub async fn accept_one(&self) -> Result<()> {
-        let (raw, peer_addr) = self.listener.accept().await?;
-        raw.set_nodelay(true)?;
-        info!("TCP connection from {peer_addr}");
-        let tls = Arc::clone(&self.acceptor)
-            .accept(raw)
-            .await
-            .context("TLS handshake on control stream")?;
+        let tls = self.accept_control().await?;
         handle_tcp_connection(
             tls,
             Arc::clone(&self.listener),
@@ -417,16 +446,7 @@ impl TcpServer {
     /// Accept and handle transfers sequentially, indefinitely.
     pub async fn serve(self) -> Result<()> {
         loop {
-            let (raw, peer_addr) = self.listener.accept().await?;
-            raw.set_nodelay(true)?;
-            info!("TCP connection from {peer_addr}");
-            let tls = match Arc::clone(&self.acceptor).accept(raw).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TLS handshake failed from {peer_addr}: {e}");
-                    continue;
-                }
-            };
+            let tls = self.accept_control().await?;
             if let Err(e) = handle_tcp_connection(
                 tls,
                 Arc::clone(&self.listener),
@@ -752,9 +772,9 @@ async fn handle_tcp_connection(
         async move {
             let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
             raw.set_nodelay(true)?;
-            let tls = acceptor
-                .accept(raw)
+            let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
                 .await
+                .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
                 .context("TLS handshake on data stream")?;
             Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
         }
@@ -2723,6 +2743,11 @@ where
 }
 
 // ── Timeouts ──────────────────────────────────────────────────────────────────
+
+/// Bound on a TCP+TLS handshake (control or data connection).  A real sender
+/// completes it in a couple of RTTs; this only fires for idle/stalled peers,
+/// which would otherwise block the sequential TCP server indefinitely.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-message bound on reading the sender's opening flight (NegotiateRequest,
 /// TransferManifest, DirEntries).  The sender writes these right after
