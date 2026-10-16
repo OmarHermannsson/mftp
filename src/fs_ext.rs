@@ -166,9 +166,9 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 /// `FADV_DONTNEED` only after a lookahead number of later writes, by which time
 /// the earlier writeback is reliably in flight.
 ///
-/// This function is kept for call sites that open a fresh fd per write (e.g.
-/// scatter-writes in directory mode), where a shared deferred tracker is not
-/// practical.
+/// This function is kept for call sites that open a fresh fd per write, where
+/// a deferred tracker bound to the fd is not practical.  (Directory-mode
+/// scatter-writes now keep handles open and use the deferred variant.)
 ///
 /// On macOS: identical to `write_all_at`; callers should set `F_NOCACHE` on
 /// the fd at open time to achieve an equivalent effect for the whole file.

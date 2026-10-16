@@ -1481,6 +1481,9 @@ where
     // Flush any ranges still in the deferred DONTNEED queue now that all
     // writes have completed and the block device has had time to drain them.
     deferred_dontneed.flush();
+    if let Some(ref cl) = pt.layout {
+        cl.close_files();
+    }
 
     // Reporter closes when all workers finish (progress_tx fully dropped).
     // Wait for it to return ctrl_send.
@@ -1594,6 +1597,12 @@ where
     // After any repair, per-chunk hashes fed to the ChunkHasher are incomplete
     // (repaired chunks bypassed it), so force a from-disk rehash by passing None.
     let hasher = if repaired { None } else { pt.hasher };
+
+    // Directory mode: close the cached output handles (flushing their deferred
+    // DONTNEED) before the from-disk hash and metadata pass.
+    if let Some(ref cl) = pt.layout {
+        cl.close_files();
+    }
 
     finish_transfer(
         &mut ctrl_send,
@@ -1760,6 +1769,36 @@ pub(crate) struct ConcatLayout {
     prefix_sums: Vec<u64>,
     /// Base directory for resolving relative paths.
     base_dir: PathBuf,
+    /// Small MRU cache of open output files, keyed by `file_entries` index.
+    /// Consecutive chunks usually land in the same file (or neighbouring small
+    /// ones), so this avoids an open/close per file segment per chunk.
+    open_files: Mutex<std::collections::VecDeque<(usize, Arc<CachedFile>)>>,
+}
+
+/// How many directory-mode output files [`ConcatLayout`] keeps open at once.
+const OPEN_FILE_CACHE: usize = 16;
+
+/// An open output file plus its own deferred-DONTNEED tracker (the same
+/// lookahead mechanism the single-file path uses, instead of an immediate
+/// DONTNEED per write).  The tracker holds the raw fd, so it is flushed in
+/// `Drop` *before* the `File` field closes it — and is never cloned out.
+struct CachedFile {
+    deferred: crate::fs_ext::DeferredDontneed,
+    file: std::fs::File,
+}
+
+impl Drop for CachedFile {
+    fn drop(&mut self) {
+        self.deferred.flush();
+    }
+}
+
+impl std::fmt::Debug for CachedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedFile")
+            .field("file", &self.file)
+            .finish()
+    }
 }
 
 impl ConcatLayout {
@@ -1782,7 +1821,68 @@ impl ConcatLayout {
             file_entries,
             prefix_sums,
             base_dir,
+            open_files: Mutex::new(std::collections::VecDeque::with_capacity(OPEN_FILE_CACHE)),
         }
+    }
+
+    /// Return an open handle for `file_entries[fi]`, from the cache or freshly
+    /// opened (evicting the least recently used entry when full).
+    fn open_file(&self, fi: usize) -> Result<Arc<CachedFile>> {
+        {
+            let mut cache = self.open_files.lock().expect("open-file cache poisoned");
+            if let Some(pos) = cache.iter().position(|(i, _)| *i == fi) {
+                let entry = cache.remove(pos).expect("position is in range");
+                let f = Arc::clone(&entry.1);
+                cache.push_front(entry);
+                return Ok(f);
+            }
+        }
+        // Open outside the lock so a slow open doesn't serialise other writers.
+        let path = self.base_dir.join(&self.file_entries[fi].path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let cached = Arc::new(CachedFile {
+            deferred: crate::fs_ext::DeferredDontneed::new(&file),
+            file,
+        });
+        let evicted = {
+            let mut cache = self.open_files.lock().expect("open-file cache poisoned");
+            // Another writer may have opened the same file meanwhile; either
+            // handle works, keep the one already cached.
+            if let Some((_, f)) = cache.iter().find(|(i, _)| *i == fi) {
+                return Ok(Arc::clone(f));
+            }
+            cache.push_front((fi, Arc::clone(&cached)));
+            if cache.len() > OPEN_FILE_CACHE {
+                cache.pop_back()
+            } else {
+                None
+            }
+        };
+        // Dropped (flushing its DONTNEED queue and closing) outside the lock,
+        // or later by whichever writer still holds it.
+        drop(evicted);
+        Ok(cached)
+    }
+
+    /// Close all cached handles (flushing their deferred DONTNEED ranges).
+    /// Called once writes are done, before metadata is applied.
+    fn close_files(&self) {
+        let drained: Vec<_> = self
+            .open_files
+            .lock()
+            .expect("open-file cache poisoned")
+            .drain(..)
+            .collect();
+        drop(drained);
     }
 
     /// Write `data` for `chunk_index` into the correct file(s).
@@ -1807,29 +1907,19 @@ impl ConcatLayout {
             let available_in_file = (file_end - pos_in_stream) as usize;
             let take = available_in_file.min(data.len() - written);
 
-            let path = self.base_dir.join(&self.file_entries[fi].path);
-
-            #[cfg(unix)]
-            let file = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)
-                    .with_context(|| format!("open {}", path.display()))?
-            };
-            #[cfg(not(unix))]
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .with_context(|| format!("open {}", path.display()))?;
-
-            crate::fs_ext::write_all_at_advise(
-                &file,
+            let cf = self.open_file(fi)?;
+            crate::fs_ext::write_all_at_deferred(
+                &cf.file,
                 &data[written..written + take],
                 offset_in_file,
+                &cf.deferred,
             )
-            .with_context(|| format!("pwrite {} at offset {offset_in_file}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "pwrite {} at offset {offset_in_file}",
+                    self.file_entries[fi].path
+                )
+            })?;
 
             written += take;
             fi += 1;
@@ -3315,6 +3405,33 @@ mod tests {
         // Released on drop.
         let _again = claim_destination(dir.path(), "same.bin").unwrap();
         drop(other);
+    }
+
+    #[test]
+    fn scatter_write_with_handle_cache_eviction() {
+        // More files than OPEN_FILE_CACHE, several per chunk, written out of
+        // order so cached handles are evicted and reopened.
+        let root = tempfile::tempdir().unwrap();
+        let entries: Vec<FileEntry> = (0..40)
+            .map(|i| entry(&format!("f{i:02}"), FileKind::File, 1000 + i))
+            .collect();
+        prepare_directory(&entries, root.path()).unwrap();
+        let layout = ConcatLayout::new(&entries, root.path().to_owned());
+        let total: u64 = entries.iter().map(|e| e.size).sum();
+        let stream: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let cs = MIN_CHUNK_SIZE;
+        let n = total.div_ceil(cs as u64);
+        for idx in (0..n).rev() {
+            let start = idx as usize * cs;
+            let end = (start + cs).min(stream.len());
+            layout.scatter_write(idx, cs, &stream[start..end]).unwrap();
+        }
+        layout.close_files();
+        let mut got = Vec::new();
+        for e in &entries {
+            got.extend(std::fs::read(root.path().join(&e.path)).unwrap());
+        }
+        assert_eq!(got, stream);
     }
 
     // ── Peer-supplied repair chunks ───────────────────────────────────────────
