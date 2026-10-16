@@ -27,6 +27,10 @@ const MAX_FEC_SHARDS: usize = 256;
 /// large heap allocation before deserialization even begins.
 const MAX_CTRL_FRAME_SIZE: u32 = 1024 * 1024; // 1 MiB
 
+/// Up-front allocation for a framed message body; larger frames grow as their
+/// bytes arrive (see `recv_message_inner`).
+const INITIAL_FRAME_ALLOC: usize = 1024 * 1024;
+
 /// Byte count of the fixed-size fields in a `ChunkData` frame body, matching
 /// bincode's default (little-endian fixint) layout exactly:
 ///   [u8;16] transfer_id  +  u64 chunk_index  +  [u8;32] chunk_hash
@@ -387,11 +391,17 @@ where
     if len > max_size {
         bail!("frame too large: {len} bytes (limit {max_size})");
     }
-    let mut buf = vec![0u8; len as usize];
-    stream
-        .read_exact(&mut buf)
+    // Grow the buffer as bytes actually arrive rather than trusting the length
+    // prefix up front: a peer can't make us allocate a large frame it never sends.
+    let mut buf = Vec::with_capacity((len as usize).min(INITIAL_FRAME_ALLOC));
+    let n = (&mut *stream)
+        .take(len as u64)
+        .read_to_end(&mut buf)
         .await
         .with_context(|| format!("read frame body ({len} bytes)"))?;
+    if n != len as usize {
+        bail!("frame body truncated: got {n} of {len} bytes");
+    }
     Ok(Some(bincode::deserialize(&buf)?))
 }
 

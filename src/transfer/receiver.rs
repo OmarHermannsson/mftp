@@ -727,14 +727,23 @@ async fn handle_quic_connection(
     }
     drop(tx); // feeders hold their own clones; rx closes when they all exit
 
-    let result = run_receive(ctrl_send, ctrl_recv, output_dir, move || {
-        let rx = rx.clone();
-        async move {
-            rx.recv()
-                .await
-                .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
-        }
-    })
+    let closer = conn.clone();
+    let supersede: SupersedeFn =
+        Arc::new(move || closer.close(0u32.into(), b"superseded by reconnect"));
+    let result = run_receive(
+        ctrl_send,
+        ctrl_recv,
+        output_dir,
+        Some(supersede),
+        move || {
+            let rx = rx.clone();
+            async move {
+                rx.recv()
+                    .await
+                    .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
+            }
+        },
+    )
     .await;
     feeders.abort_all();
     let mut ctrl_send = result?;
@@ -766,7 +775,7 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
-    run_receive(ctrl_send, ctrl_recv, output_dir, move || {
+    run_receive(ctrl_send, ctrl_recv, output_dir, None, move || {
         let listener = Arc::clone(&listener);
         let acceptor = Arc::clone(&acceptor);
         async move {
@@ -1132,6 +1141,7 @@ async fn run_receive<CW, CR, F, Fut>(
     mut ctrl_send: CW,
     mut ctrl_recv: CR,
     output_dir: PathBuf,
+    supersede: Option<SupersedeFn>,
     mut accept_stream: F,
 ) -> Result<CW>
 where
@@ -1212,7 +1222,14 @@ where
     // Refuse a second concurrent transfer into the same destination: two
     // writers (each with its own resume state) would interleave chunks
     // undetected.  Held until this function returns.
-    let _dest_guard = match claim_destination(&output_dir, &manifest.file_name) {
+    let _dest_guard = match claim_destination(
+        &output_dir,
+        &manifest.file_name,
+        manifest.transfer_id,
+        supersede,
+    )
+    .await
+    {
         Ok(g) => g,
         Err(e) => {
             let _ = framing::send_message(
@@ -1931,42 +1948,107 @@ impl ConcatLayout {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
+/// Closes the connection behind an in-progress transfer so a reconnecting
+/// sender can take over its destination.
+type SupersedeFn = Arc<dyn Fn() + Send + Sync>;
+
+/// An in-progress transfer's hold on its destination.
+struct DestinationClaim {
+    /// Distinguishes this claim from a later one for the same path.
+    id: u64,
+    transfer_id: [u8; 16],
+    supersede: Option<SupersedeFn>,
+}
+
 /// Destinations (`output_dir/file_name`) with a transfer in progress in this
 /// process.
-static ACTIVE_DESTINATIONS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+static ACTIVE_DESTINATIONS: std::sync::OnceLock<Mutex<HashMap<PathBuf, DestinationClaim>>> =
     std::sync::OnceLock::new();
+static NEXT_CLAIM_ID: AtomicU64 = AtomicU64::new(0);
+
+/// How long a reconnecting sender waits for its stale predecessor to release
+/// the destination after the old connection is closed.
+const SUPERSEDE_WAIT: Duration = Duration::from_secs(15);
 
 /// Releases a [`claim_destination`] registration on drop.
-struct DestinationGuard(PathBuf);
+struct DestinationGuard {
+    key: PathBuf,
+    id: u64,
+}
 
 impl Drop for DestinationGuard {
     fn drop(&mut self) {
-        if let Some(set) = ACTIVE_DESTINATIONS.get() {
-            set.lock()
-                .expect("destination registry mutex poisoned")
-                .remove(&self.0);
+        if let Some(map) = ACTIVE_DESTINATIONS.get() {
+            let mut g = map.lock().expect("destination registry mutex poisoned");
+            if g.get(&self.key).is_some_and(|c| c.id == self.id) {
+                g.remove(&self.key);
+            }
         }
     }
 }
 
-/// Register `output_dir/file_name` as the target of an in-progress transfer,
-/// failing if another transfer in this process already writes there.
+/// Register `output_dir/file_name` as the target of an in-progress transfer.
+///
+/// A different transfer already writing there is refused. The *same* transfer
+/// (matching `transfer_id`) is a sender that reconnected — e.g. after a crash,
+/// while the old connection lingers until its idle timeout — so the stale
+/// connection is closed via its `supersede` hook and this claim waits for it to
+/// release, letting the new connection resume instead of being locked out.
 ///
 /// The key uses the canonicalised output directory so different spellings of
 /// the same directory (relative path, trailing `.`, symlinked parent) collide.
-fn claim_destination(output_dir: &std::path::Path, file_name: &str) -> Result<DestinationGuard> {
+async fn claim_destination(
+    output_dir: &std::path::Path,
+    file_name: &str,
+    transfer_id: [u8; 16],
+    supersede: Option<SupersedeFn>,
+) -> Result<DestinationGuard> {
     let dir = std::fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
     let key = dir.join(file_name);
-    let set = ACTIVE_DESTINATIONS.get_or_init(Default::default);
-    let mut g = set.lock().expect("destination registry mutex poisoned");
-    if !g.insert(key.clone()) {
-        bail!(
-            "another transfer to {} is already in progress on this receiver; \
-             retry once it finishes",
-            key.display()
-        );
+    let map = ACTIVE_DESTINATIONS.get_or_init(Default::default);
+    let id = NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed);
+    let deadline = tokio::time::Instant::now() + SUPERSEDE_WAIT;
+    let mut signalled = false;
+    loop {
+        let stale = {
+            let mut g = map.lock().expect("destination registry mutex poisoned");
+            match g.get(&key) {
+                None => {
+                    g.insert(
+                        key.clone(),
+                        DestinationClaim {
+                            id,
+                            transfer_id,
+                            supersede,
+                        },
+                    );
+                    return Ok(DestinationGuard { key, id });
+                }
+                Some(c) if c.transfer_id == transfer_id && c.supersede.is_some() => {
+                    c.supersede.clone()
+                }
+                Some(_) => bail!(
+                    "another transfer to {} is already in progress on this receiver; \
+                     retry once it finishes",
+                    key.display()
+                ),
+            }
+        };
+        if !signalled {
+            if let Some(close) = stale {
+                warn!(dest = %key.display(), "sender reconnected; closing stale connection");
+                close();
+            }
+            signalled = true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "a previous connection for this transfer to {} did not shut down; retry shortly",
+                key.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Ok(DestinationGuard(key))
 }
 
 /// Prepared state for a transfer: output target, resume state, progress bar,
@@ -2942,11 +3024,10 @@ const MAX_STREAMS: usize = 1024;
 /// Limits memory usage and prevents degenerate manifests.
 const MAX_DIR_ENTRIES: usize = 500_000;
 
-/// Frame-size cap for the `DirEntries` message, derived from
-/// [`MAX_DIR_ENTRIES`]: ~32 bytes of fixed bincode fields per entry plus a
-/// generous average path (and symlink target) budget, 192 bytes in total.
-/// ≈ 92 MiB — under the 128 MiB data cap that was used before.
-const MAX_DIR_ENTRIES_FRAME: u32 = (MAX_DIR_ENTRIES * 192) as u32;
+/// Frame-size cap for the `DirEntries` message. Kept at the 128 MiB data cap
+/// so large real trees (long paths) still fit; the frame body is allocated as
+/// it arrives, so the cap doesn't let a peer reserve memory it never sends.
+const MAX_DIR_ENTRIES_FRAME: u32 = 128 * 1024 * 1024;
 
 /// Maximum total Reed-Solomon shards (data + parity) in a stripe.  The galois_8
 /// field caps this at 256; the manifest validator rejects anything larger.
@@ -3392,19 +3473,61 @@ mod tests {
         assert!(got[..4096].iter().all(|&b| b == 0xAB));
     }
 
-    #[test]
-    fn concurrent_claims_on_same_destination_rejected() {
+    #[tokio::test]
+    async fn concurrent_claims_on_same_destination_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let g = claim_destination(dir.path(), "same.bin").unwrap();
+        let g = claim_destination(dir.path(), "same.bin", [1; 16], None)
+            .await
+            .unwrap();
         // Same target, different spelling of the directory.
         let alias = dir.path().join(".");
-        assert!(claim_destination(&alias, "same.bin").is_err());
+        assert!(claim_destination(&alias, "same.bin", [2; 16], None)
+            .await
+            .is_err());
+        // Same transfer but no way to close the holder (TCP): still refused.
+        assert!(claim_destination(dir.path(), "same.bin", [1; 16], None)
+            .await
+            .is_err());
         // A different file in the same directory is fine.
-        let other = claim_destination(dir.path(), "other.bin").unwrap();
+        let other = claim_destination(dir.path(), "other.bin", [3; 16], None)
+            .await
+            .unwrap();
         drop(g);
         // Released on drop.
-        let _again = claim_destination(dir.path(), "same.bin").unwrap();
+        let _again = claim_destination(dir.path(), "same.bin", [4; 16], None)
+            .await
+            .unwrap();
         drop(other);
+    }
+
+    #[tokio::test]
+    async fn reconnect_for_same_transfer_supersedes_stale_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot: Arc<Mutex<Option<DestinationGuard>>> = Arc::default();
+        let closer_slot = Arc::clone(&slot);
+        // Closing the stale connection makes its task exit and drop the guard.
+        let supersede: SupersedeFn = Arc::new(move || {
+            closer_slot.lock().unwrap().take();
+        });
+        let old = claim_destination(dir.path(), "r.bin", [9; 16], Some(supersede))
+            .await
+            .unwrap();
+        *slot.lock().unwrap() = Some(old);
+        // A different transfer is still refused without closing the holder.
+        assert!(claim_destination(dir.path(), "r.bin", [8; 16], None)
+            .await
+            .is_err());
+        assert!(slot.lock().unwrap().is_some());
+        // The same transfer reconnecting takes over.
+        let new = claim_destination(dir.path(), "r.bin", [9; 16], None)
+            .await
+            .unwrap();
+        assert!(slot.lock().unwrap().is_none());
+        // The superseded guard's late drop must not release the new claim.
+        assert!(claim_destination(dir.path(), "r.bin", [9; 16], None)
+            .await
+            .is_err());
+        drop(new);
     }
 
     #[test]
