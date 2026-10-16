@@ -1433,6 +1433,7 @@ where
     let Route {
         output_dir,
         max_new_bytes,
+        observer,
     } = route;
     // The opening flight (NegotiateRequest, manifest, DirEntries) is sent by the
     // sender immediately after connecting; bound each read so a peer that
@@ -1572,6 +1573,9 @@ where
     )
     .await?;
     pt.pb.set_position(pt.bytes_already_received);
+    let job = observer
+        .as_deref()
+        .map(|o| JobGuard::start(o, &manifest, Arc::clone(&pt.pb)));
 
     // Progress channel: data workers → reporter → ctrl_send (throttled to 100 ms).
     let (progress_tx, progress_rx) = tokio::sync::mpsc::channel::<u64>(256);
@@ -1935,6 +1939,11 @@ where
     )
     .await?;
 
+    if let Some(job) = job {
+        let files = transfer_files(&output_dir, &manifest, dir_entries.as_deref());
+        job.completed(manifest.file_size, files).await;
+    }
+
     Ok(ctrl_send)
 }
 
@@ -2251,14 +2260,18 @@ impl ConcatLayout {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Where a routed connection's files land, and how many new bytes it may add.
-#[derive(Debug, Clone)]
+/// Where a routed connection's files land, how many new bytes it may add, and
+/// who to tell about its progress.
+#[derive(Clone)]
 pub struct Route {
     pub output_dir: PathBuf,
     /// Remaining byte budget (e.g. a tenant quota minus current usage); a
     /// transfer needing more new bytes than this is refused after its manifest
     /// is read. `None` = unlimited.
     pub max_new_bytes: Option<u64>,
+    /// Lifecycle hooks for the transfer on this connection (the daemon's queue
+    /// and at-rest encryption).
+    pub observer: Option<Arc<dyn TransferObserver>>,
 }
 
 impl From<PathBuf> for Route {
@@ -2266,7 +2279,93 @@ impl From<PathBuf> for Route {
         Route {
             output_dir,
             max_new_bytes: None,
+            observer: None,
         }
+    }
+}
+
+/// Per-transfer lifecycle hooks a server's owner can attach through [`Route`].
+pub trait TransferObserver: Send + Sync {
+    /// A transfer was admitted and is about to receive data. `total_bytes` is
+    /// the payload size (all files, for a directory).
+    fn started(&self, file_name: &str, total_bytes: u64) -> Arc<dyn TransferJob>;
+}
+
+/// One observed transfer (see [`TransferObserver`]).
+pub trait TransferJob: Send + Sync {
+    /// Bytes received so far (called about once a second).
+    fn progress(&self, bytes_done: u64);
+    /// The transfer verified and was acknowledged; `files` are the regular
+    /// files it wrote. Awaited while the destination is still claimed, so
+    /// post-processing (e.g. encrypting them) can't race a new transfer to the
+    /// same target.
+    fn completed(&self, files: Vec<PathBuf>) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+    /// The transfer failed or was aborted.
+    fn failed(&self, error: &str);
+}
+
+/// Reports `failed` for a job that never reached `completed` (any early return
+/// or error out of `run_receive`), and stops its progress ticker.
+struct JobGuard {
+    job: Arc<dyn TransferJob>,
+    ticker: tokio::task::JoinHandle<()>,
+    done: bool,
+}
+
+impl JobGuard {
+    fn start(
+        observer: &dyn TransferObserver,
+        manifest: &TransferManifest,
+        pb: Arc<ProgressBar>,
+    ) -> Self {
+        let job = observer.started(&manifest.file_name, manifest.file_size);
+        let ticking = Arc::clone(&job);
+        let ticker = tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                every.tick().await;
+                ticking.progress(pb.position());
+            }
+        });
+        JobGuard {
+            job,
+            ticker,
+            done: false,
+        }
+    }
+
+    async fn completed(mut self, bytes: u64, files: Vec<PathBuf>) {
+        self.ticker.abort();
+        self.job.progress(bytes);
+        self.done = true;
+        self.job.completed(files).await;
+    }
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        self.ticker.abort();
+        if !self.done {
+            self.job
+                .failed("transfer failed or was aborted (see receiver log)");
+        }
+    }
+}
+
+/// The regular files a transfer writes, for [`TransferJob::completed`].
+fn transfer_files(
+    output_dir: &std::path::Path,
+    manifest: &TransferManifest,
+    dir_entries: Option<&[FileEntry]>,
+) -> Vec<PathBuf> {
+    let root = output_dir.join(&manifest.file_name);
+    match dir_entries {
+        Some(entries) => entries
+            .iter()
+            .filter(|e| matches!(e.kind, FileKind::File))
+            .map(|e| root.join(&e.path))
+            .collect(),
+        None => vec![root],
     }
 }
 

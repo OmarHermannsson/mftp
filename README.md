@@ -33,7 +33,7 @@ In SSH mode, mftp launches the receiver automatically over your existing SSH ses
 | **LAN discovery** | The daemon announces itself by name over an admin-scoped multicast group; `mftp send <file> <name>` resolves a receiver on the local network with no IP (the receiver is still verified via TOFU or `--trust-device`; announcements are unauthenticated) |
 | **Rendezvous (NAT traversal)** | `mftp rendezvous` runs a signaling-only broker; receivers register by Device ID and senders reach them with `mftp send <file> <device-id> --rendezvous <broker>`. Candidates are exchanged for UDP hole punching; the broker never sees file data |
 | **Zero-knowledge relay** | When hole punching fails (symmetric NAT), `mftp relay --to <receiver>` blindly forwards the QUIC datagrams. End-to-end TLS means the relay only ever sees ciphertext — it cannot read or alter the transfer |
-| **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota) and optionally serves a read-only Web UI / JSON status API (`mftp daemon --http`). A persistent transfer queue and streaming at-rest encryption (AES-256-GCM, per-file keys) exist as **library building blocks only** — the daemon does not yet record transfers in the queue or encrypt received files, which are written in plaintext |
+| **Multi-tenant service** | The daemon enforces per-peer ACLs (`acl.toml`: each Device ID gets its own output subdir + byte quota) and optionally serves a read-only Web UI / JSON status API (`mftp daemon --http`). Every received transfer is recorded in a persistent queue (`~/.config/mftp/queue.json`, shown in the Web UI), and `--encrypt-at-rest <KEY_FILE>` stores received files encrypted (streaming AES-256-GCM, per-file keys; recover with `mftp decrypt`) |
 
 ---
 
@@ -262,9 +262,22 @@ Options:
                            Unauthenticated: bind it to 127.0.0.1 (a non-loopback
                            address prints a warning). Requests must carry an
                            IP-literal or localhost Host header (DNS-rebinding guard).
+      --encrypt-at-rest <KEY_FILE>
+                           Store every received file encrypted as <name>.enc, under
+                           the master key in KEY_FILE (32 raw bytes or 64 hex
+                           digits; must be mode 0600).
 ```
 
-The dashboard's transfer table reads the queue file (`~/.config/mftp/queue.json`), which the daemon does not populate yet, so it is empty in practice. Received files are stored as plaintext; at-rest encryption is not wired into the daemon.
+Every transfer the daemon receives is recorded in `~/.config/mftp/queue.json` (active → completed/failed, with progress and the failure reason), which the dashboard's transfer table and `/queue` report; jobs a crashed daemon left active are marked failed on restart, and old finished jobs are pruned.
+
+With `--encrypt-at-rest`, each file is encrypted right after its transfer verifies (the plaintext exists only while it is being received) and the job is marked completed once that succeeds. Recover a file with:
+
+```bash
+mftp decrypt --key ~/.config/mftp/at-rest.key data.bin.enc        # → data.bin
+mftp decrypt --key ~/.config/mftp/at-rest.key data.bin.enc -o out.bin
+```
+
+Generate a key with e.g. `(umask 077; openssl rand -hex 32 > ~/.config/mftp/at-rest.key)` and keep a copy somewhere safe: files can't be recovered without it.
 
 When an authorization file exists (managed with `mftp daemon-trust`, or via an `acl.toml` for per-peer output subdirs + quotas), the daemon requires **mutual-TLS identity auth** and accepts only allowlisted Device IDs.
 

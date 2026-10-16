@@ -4,9 +4,10 @@
 //! payloads. This is independent of the in-transit TLS: it protects data once
 //! it has landed on disk.
 //!
-//! **Status: library-level only.** Nothing in the daemon calls this yet —
-//! received files are currently written in plaintext. It is a building block
-//! for a future `--encrypt-at-rest` option.
+//! The daemon applies it to every received file when started with
+//! `--encrypt-at-rest <KEY_FILE>` (see [`load_key_file`]); `mftp decrypt`
+//! reverses it ([`decrypt_file`]). A file is encrypted right after its transfer
+//! verifies, so its plaintext exists on disk only while it is being received.
 //!
 //! Format (v2, magic `MFE2`):
 //!
@@ -239,6 +240,104 @@ pub fn encrypt_file(key: &[u8; 32], path: &Path) -> Result<PathBuf> {
     Ok(enc)
 }
 
+/// Decrypt `input` (an [`encrypt_file`] output) to `output`, which must not
+/// exist. Written to a private temp file and renamed into place only once the
+/// whole stream has authenticated, so a wrong key or tampered file never leaves
+/// partial plaintext behind.
+pub fn decrypt_file(key: &[u8; 32], input: &Path, output: &Path) -> Result<()> {
+    if output.symlink_metadata().is_ok() {
+        bail!("{} already exists; refusing to overwrite", output.display());
+    }
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(output.file_name().context("output path has no file name")?);
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = output.with_file_name(tmp_name);
+    let result = (|| -> Result<()> {
+        let r = std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut w = opts
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        decrypt_stream(
+            key,
+            std::io::BufReader::new(r),
+            std::io::BufWriter::new(&mut w),
+        )?;
+        w.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+        std::fs::rename(&tmp, output)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), output.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Default [`decrypt_file`] output for `input`: `data.bin.enc` → `data.bin`.
+pub fn decrypted_path(input: &Path) -> Result<PathBuf> {
+    let name = input
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("{} has no UTF-8 file name", input.display()))?;
+    let stem = name
+        .strip_suffix(".enc")
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "{} doesn't end in .enc; pass an output path",
+                input.display()
+            )
+        })?;
+    Ok(input.with_file_name(stem))
+}
+
+/// Load a 32-byte master key from `path`: either 32 raw bytes or 64 hex digits
+/// (surrounding whitespace ignored). On Unix the file must not be accessible to
+/// group/others — like ssh with private keys, a key others can read is refused.
+pub fn load_key_file(path: &Path) -> Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("stat key file {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "key file {} is accessible by other users (mode {:o}); chmod 600 it",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    let raw = std::fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
+    if raw.len() == 32 {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&raw);
+        return Ok(key);
+    }
+    let text = std::str::from_utf8(&raw).unwrap_or("").trim();
+    let bytes = hex::decode(text)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .with_context(|| {
+            format!(
+                "key file {} must hold 32 raw bytes or 64 hex digits",
+                path.display()
+            )
+        })?;
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
 /// Read up to `buf.len()` bytes, returning the count (short only at EOF).
 fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
@@ -256,6 +355,40 @@ fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_roundtrip_and_key_file_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [7u8; 32];
+        let p = dir.path().join("data.bin");
+        std::fs::write(&p, b"hello at rest").unwrap();
+        let enc = encrypt_file(&key, &p).unwrap();
+        let out = decrypted_path(&enc).unwrap();
+        assert_eq!(out, p);
+        decrypt_file(&key, &enc, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello at rest");
+        // Never overwrites, and a wrong key leaves nothing behind.
+        assert!(decrypt_file(&key, &enc, &out).is_err());
+        let other = dir.path().join("other.bin");
+        assert!(decrypt_file(&[8u8; 32], &enc, &other).is_err());
+        assert!(!other.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+
+        let kf = dir.path().join("key");
+        std::fs::write(&kf, format!("{}\n", hex::encode(key))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&kf, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(load_key_file(&kf).is_err(), "world-readable key refused");
+            std::fs::set_permissions(&kf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(load_key_file(&kf).unwrap(), key);
+        std::fs::write(&kf, key).unwrap();
+        assert_eq!(load_key_file(&kf).unwrap(), key);
+        std::fs::write(&kf, b"short").unwrap();
+        assert!(load_key_file(&kf).is_err());
+    }
 
     fn encrypt(key: &[u8; 32], data: &[u8]) -> Vec<u8> {
         let mut ct = Vec::new();

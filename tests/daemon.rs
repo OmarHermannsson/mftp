@@ -64,6 +64,7 @@ async fn bind_test_daemon(config_dir: &TempDir, output_dir: &TempDir) -> Daemon 
         config_dir: config_dir.path().to_owned(),
         announce_name: None,
         http: None,
+        encrypt_key: None,
     })
     .await
     .expect("daemon binds")
@@ -488,6 +489,7 @@ async fn daemon_bind_fails_on_malformed_acl() -> anyhow::Result<()> {
         config_dir: dcfg.path().to_owned(),
         announce_name: None,
         http: None,
+        encrypt_key: None,
     })
     .await;
     assert!(
@@ -592,6 +594,7 @@ async fn daemon_bind_fails_on_busy_address() -> anyhow::Result<()> {
         config_dir: cfg.path().to_owned(),
         announce_name: None,
         http: None,
+        encrypt_key: None,
     })
     .await;
     assert!(
@@ -599,5 +602,82 @@ async fn daemon_bind_fails_on_busy_address() -> anyhow::Result<()> {
         "binding to an occupied address should fail"
     );
     drop(occupier);
+    Ok(())
+}
+
+/// Every received transfer is recorded in the persistent queue, and with
+/// `encrypt_key` each received file is stored encrypted (`<name>.enc`, no
+/// plaintext left) and decrypts back to the original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_records_jobs_and_encrypts_at_rest() -> anyhow::Result<()> {
+    use mftp::service::queue::{JobState, Queue};
+
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let scfg = TempDir::new()?;
+    let send_dir = TempDir::new()?;
+    let sender_id = mftp::identity::load_or_create_in(scfg.path())?;
+    mftp::identity::add_authorized_in(dcfg.path(), &sender_id.device_id)?;
+
+    let key = [0x5au8; 32];
+    let daemon = Daemon::bind(DaemonOptions {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        output_dir: out.path().to_owned(),
+        socket_path: dcfg.path().join("mftpd.sock"),
+        config_dir: dcfg.path().to_owned(),
+        announce_name: None,
+        http: None,
+        encrypt_key: Some(key),
+    })
+    .await?;
+    assert!(daemon.encrypts_at_rest());
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    let src = make_file(send_dir.path(), "secret.bin", 700 * 1024);
+    sender::send(
+        src.clone(),
+        addr,
+        auth_send_config(fingerprint, sender_id.clone()),
+    )
+    .await?;
+
+    // Encryption finishes just after the sender's Complete ack; wait for the job.
+    let job = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(j) = Queue::load(dcfg.path())
+                .ok()
+                .and_then(|q| q.jobs().first().cloned())
+                .filter(|j| j.state != JobState::Active)
+            {
+                return j;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("job finishes");
+    assert_eq!(job.state, JobState::Completed, "{job:?}");
+    assert_eq!(job.peer, sender_id.device_id);
+    assert_eq!(job.what, "secret.bin");
+    assert_eq!(job.total_bytes, 700 * 1024);
+    assert_eq!(job.bytes_done, 700 * 1024);
+
+    assert!(
+        !out.path().join("secret.bin").exists(),
+        "no plaintext at rest"
+    );
+    let enc = out.path().join("secret.bin.enc");
+    let plain = send_dir.path().join("roundtrip.bin");
+    mftp::service::encrypt::decrypt_file(&key, &enc, &plain)?;
+    assert_eq!(std::fs::read(&plain)?, std::fs::read(&src)?);
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
     Ok(())
 }

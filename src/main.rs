@@ -257,6 +257,23 @@ enum Command {
         /// Also serve a read-only Web UI / JSON status API on this address.
         #[arg(long, value_name = "HOST:PORT")]
         http: Option<String>,
+        /// Encrypt every received file at rest (stored as `<name>.enc`) with
+        /// the master key in this file: 32 raw bytes or 64 hex digits, mode
+        /// 0600. Recover files with `mftp decrypt --key <KEY_FILE>`.
+        #[arg(long, value_name = "KEY_FILE")]
+        encrypt_at_rest: Option<std::path::PathBuf>,
+    },
+    /// Decrypt a file the daemon stored with --encrypt-at-rest.
+    Decrypt {
+        /// Master key file (as passed to `daemon --encrypt-at-rest`)
+        #[arg(long, value_name = "KEY_FILE")]
+        key: std::path::PathBuf,
+        /// Encrypted file (`<name>.enc`)
+        input: std::path::PathBuf,
+        /// Where to write the plaintext (default: input without `.enc`); never
+        /// overwritten
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
     /// Query a running daemon's status / identity over its control socket.
     #[cfg(unix)]
@@ -600,6 +617,16 @@ async fn main() -> Result<()> {
             };
             receiver::serve_one_stdio(output_dir, port, require_peer).await
         }
+        Command::Decrypt { key, input, output } => {
+            let key = mftp::service::encrypt::load_key_file(&key)?;
+            let output = match output {
+                Some(o) => o,
+                None => mftp::service::encrypt::decrypted_path(&input)?,
+            };
+            mftp::service::encrypt::decrypt_file(&key, &input, &output)?;
+            println!("decrypted {} -> {}", input.display(), output.display());
+            Ok(())
+        }
         Command::Rendezvous { bind } => {
             let addr = bind
                 .parse()
@@ -634,6 +661,7 @@ async fn main() -> Result<()> {
             socket,
             name,
             http,
+            encrypt_at_rest,
         } => {
             let addr = bind
                 .parse()
@@ -649,7 +677,11 @@ async fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            mftp::daemon::run(addr, output_dir, socket, name, http).await
+            let encrypt_key = encrypt_at_rest
+                .as_deref()
+                .map(mftp::service::encrypt::load_key_file)
+                .transpose()?;
+            mftp::daemon::run(addr, output_dir, socket, name, http, encrypt_key).await
         }
         #[cfg(unix)]
         Command::DaemonStatus { socket } => {

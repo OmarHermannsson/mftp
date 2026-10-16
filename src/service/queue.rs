@@ -5,8 +5,8 @@
 //! `~/.config/mftp/queue.json`. This is the scheduling/bookkeeping layer; the
 //! actual transfer is still performed by the existing engine.
 //!
-//! **Status: library-level only.** The daemon does not enqueue or update jobs
-//! yet; only the HTTP `/queue` endpoint reads this file.
+//! The daemon records every received transfer here (see
+//! [`crate::service::tracker`]) and the HTTP `/queue` endpoint reports it.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,9 @@ pub struct Job {
     pub state: JobState,
     /// How many times this job has been (re)attempted.
     pub attempts: u32,
+    /// Why the job failed, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A persistent FIFO-ish queue of jobs (ordering by ascending id).
@@ -78,8 +81,43 @@ impl Queue {
             bytes_done: 0,
             state: JobState::Queued,
             attempts: 0,
+            error: None,
         });
         id
+    }
+
+    /// Record why a job failed (and mark it failed).
+    pub fn fail(&mut self, id: u64, error: &str) -> Result<()> {
+        let j = self.job_mut(id)?;
+        j.state = JobState::Failed;
+        j.error = Some(error.to_string());
+        Ok(())
+    }
+
+    /// Mark jobs left `Active` by a previous process (crash/restart) as failed.
+    pub fn fail_interrupted(&mut self) {
+        for j in &mut self.jobs {
+            if j.state == JobState::Active {
+                j.state = JobState::Failed;
+                j.error = Some("interrupted (daemon restarted)".to_string());
+            }
+        }
+    }
+
+    /// Drop the oldest finished (completed/failed) jobs beyond `keep`, so the
+    /// file doesn't grow without bound on a long-running daemon.
+    pub fn prune_finished(&mut self, keep: usize) {
+        let finished = |j: &Job| matches!(j.state, JobState::Completed | JobState::Failed);
+        let n = self.jobs.iter().filter(|j| finished(j)).count();
+        let mut excess = n.saturating_sub(keep);
+        self.jobs.retain(|j| {
+            if excess > 0 && finished(j) {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn jobs(&self) -> &[Job] {
@@ -175,6 +213,30 @@ mod tests {
         let mut loaded = loaded;
         let c = loaded.enqueue("carol", "c.bin", 1);
         assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn interrupted_and_pruned_jobs() {
+        let mut q = Queue::default();
+        let ids: Vec<u64> = (0..5)
+            .map(|i| q.enqueue("p", &format!("f{i}"), 1))
+            .collect();
+        for &id in &ids {
+            q.start(id).unwrap();
+        }
+        q.finish(ids[0], true).unwrap();
+        q.fail(ids[1], "boom").unwrap();
+        q.finish(ids[2], true).unwrap();
+        q.fail_interrupted(); // ids[3], ids[4] were still active
+        assert_eq!(q.get(ids[4]).unwrap().state, JobState::Failed);
+        assert_eq!(q.get(ids[1]).unwrap().error.as_deref(), Some("boom"));
+        q.prune_finished(2);
+        let left: Vec<u64> = q.jobs().iter().map(|j| j.id).collect();
+        assert_eq!(
+            left,
+            vec![ids[3], ids[4]],
+            "oldest finished jobs dropped first"
+        );
     }
 
     #[test]

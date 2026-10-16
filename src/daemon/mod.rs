@@ -398,6 +398,9 @@ pub struct DaemonOptions {
     /// `None` disables it (the default for tests, which want no multicast).
     pub announce_name: Option<String>,
     pub http: Option<std::net::SocketAddr>,
+    /// Master key for at-rest encryption of received files (`None` = store
+    /// plaintext). See [`crate::service::encrypt`].
+    pub encrypt_key: Option<[u8; 32]>,
 }
 
 /// A fully-bound daemon: the network receiver and control socket (plus optional
@@ -420,6 +423,8 @@ pub struct Daemon {
     announced: bool,
     /// Background tasks (discovery, HTTP) aborted on shutdown.
     background: Vec<tokio::task::JoinHandle<()>>,
+    /// Records every transfer in the persistent queue (and encrypts at rest).
+    jobs: Arc<crate::service::tracker::JobTracker>,
 }
 
 impl Daemon {
@@ -491,6 +496,7 @@ impl Daemon {
 
         let control = bind_control_socket(&opts.socket_path)?;
         let state = Arc::new(state);
+        let jobs = crate::service::tracker::JobTracker::load(&opts.config_dir, opts.encrypt_key);
 
         // M8: optional HTTP status API + Web UI dashboard.
         let mut http_addr = None;
@@ -527,7 +533,13 @@ impl Daemon {
             http_addr,
             announced,
             background,
+            jobs,
         })
+    }
+
+    /// Whether received files are encrypted at rest.
+    pub fn encrypts_at_rest(&self) -> bool {
+        self.jobs.encrypts()
     }
 
     /// Address the QUIC network receiver is bound to.
@@ -578,6 +590,7 @@ impl Daemon {
             output_dir,
             socket_path,
             background,
+            jobs,
             ..
         } = self;
 
@@ -588,6 +601,7 @@ impl Daemon {
         let acl_for_router = state.acl.clone();
         let output_root = output_dir.clone();
         let serve_fut = server.serve_with_router(move |peer| {
+            let observer = Some(jobs.observer_for(peer.unwrap_or("(anonymous)")));
             // Snapshot what we need from the live ACL and drop the read lock
             // before touching the filesystem, so a slow directory walk never
             // blocks a SIGHUP reload (or other connections) on the lock.
@@ -601,7 +615,10 @@ impl Daemon {
                 Ok(Some((device.to_owned(), dir, quota)))
             })?;
             let Some((device, dir, quota)) = routed else {
-                return Ok(Route::from(output_root.clone()));
+                return Ok(Route {
+                    observer,
+                    ..Route::from(output_root.clone())
+                });
             };
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("create tenant dir {}", dir.display()))?;
@@ -620,6 +637,7 @@ impl Daemon {
             Ok(Route {
                 output_dir: dir,
                 max_new_bytes,
+                observer,
             })
         });
 
@@ -706,6 +724,7 @@ pub async fn run(
     socket_path: PathBuf,
     announce_name: String,
     http: Option<std::net::SocketAddr>,
+    encrypt_key: Option<[u8; 32]>,
 ) -> Result<()> {
     let config_dir =
         crate::identity::config_dir().context("cannot locate config dir ($HOME unset)")?;
@@ -717,6 +736,7 @@ pub async fn run(
         config_dir,
         announce_name: Some(announce_name),
         http,
+        encrypt_key,
     })
     .await?;
 
@@ -742,6 +762,9 @@ pub async fn run(
     }
     if daemon.announced {
         println!("Discovery: announcing on the LAN");
+    }
+    if daemon.encrypts_at_rest() {
+        println!("At-rest encryption: ON (received files are stored as <name>.enc)");
     }
     println!("Control socket: {}", socket_path.display());
     if let Some(real) = daemon.http_addr {
