@@ -27,8 +27,12 @@ EXAMPLES:
   # Recursive directory transfer, preserving mode + mtime
   mftp send -r ./dataset user@host:/data/ --preserve
 
-  # Lossy/satellite link: add Reed-Solomon FEC (8 data : 2 parity shards)
-  mftp send bigfile.tar user@host:/data/ --fec 8:2
+  # Lossy/satellite link: no extra flags needed — QUIC retransmits lost packets.
+  # (Don't add --fec for throughput: parity is pure overhead on reliable streams.)
+  mftp send bigfile.tar user@host:/data/
+
+  # Fast link where zstd is the bottleneck: skip compression
+  mftp send bigfile.tar user@host:/data/ --no-compress
 
   # Pin a fingerprint for unattended/scripted runs (no TOFU prompt)
   mftp send bigfile.tar 203.0.113.7:7777 --trust <hex-sha256>
@@ -541,7 +545,7 @@ async fn main() -> Result<()> {
                 .with_context(|| {
                     format!(
                         "no mftp receiver named {destination:?} found on the LAN \
-                         (is `mftp daemon`/`receive --name` running there?), and it is \
+                         (is `mftp daemon --name {destination}` running there?), and it is \
                          not a valid host:port or SSH destination"
                     )
                 })?;
