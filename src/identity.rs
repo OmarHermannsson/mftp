@@ -142,32 +142,114 @@ pub fn load_or_create() -> Result<Identity> {
 pub fn load_or_create_in(dir: &std::path::Path) -> Result<Identity> {
     let cert_p = cert_path(dir);
     let key_p = key_path(dir);
-    if let (Ok(cert_der), Ok(key_bytes)) = (std::fs::read(&cert_p), std::fs::read(&key_p)) {
-        let cert = CertificateDer::from(cert_der);
-        let fingerprint = crate::net::connection::cert_fingerprint(&cert);
-        // device_id is cached on disk; if the cache is missing/corrupt, recompute
-        // it from the certificate's actual Ed25519 SPKI (NOT the cert fingerprint
-        // — they are different hashes and a wrong value silently breaks
-        // --trust-device pins and the daemon allowlist).
-        let device_id = std::fs::read_to_string(device_id_path(dir))
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| s.len() == 64)
-            .or_else(|| device_id_from_cert(&cert))
-            .unwrap_or_else(|| fingerprint.clone());
-        return Ok(Identity {
-            cert,
-            key_bytes,
-            fingerprint,
-            device_id,
-        });
+    let cert_r = read_opt(&cert_p)?;
+    let key_r = read_opt(&key_p)?;
+    match (cert_r, key_r) {
+        (Some(cert_der), Some(key_bytes)) => load_existing(dir, cert_der, key_bytes),
+        (None, None) => {
+            // Nothing stored yet — generate and persist. A persist failure is an
+            // error: silently running on a fresh identity every start would
+            // change the fingerprint/DeviceId each run and break every pin.
+            let id = generate()?;
+            persist(dir, &id).with_context(|| {
+                format!("could not persist the device identity in {}", dir.display())
+            })?;
+            Ok(id)
+        }
+        _ => anyhow::bail!(
+            "incomplete device identity in {}: exactly one of {} / {} exists. Restore the \
+             missing file, or delete both to generate a new identity (peers that pinned \
+             the old one will need to re-trust it)",
+            dir.display(),
+            cert_p.display(),
+            key_p.display()
+        ),
     }
-
-    // Nothing stored yet (or unreadable) — generate and persist.
-    let id = generate()?;
-    persist(dir, &id);
-    Ok(id)
 }
+
+/// Read a file, mapping only "not found" to `None`; other errors propagate
+/// (an unreadable identity must not be mistaken for an absent one and
+/// regenerated over).
+fn read_opt(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Build an [`Identity`] from stored cert + key, verifying they belong together.
+fn load_existing(dir: &std::path::Path, cert_der: Vec<u8>, key_bytes: Vec<u8>) -> Result<Identity> {
+    check_key_permissions(&key_path(dir));
+    let cert = CertificateDer::from(cert_der);
+    let fingerprint = crate::net::connection::cert_fingerprint(&cert);
+    // Always derive the DeviceId from the certificate's actual Ed25519 SPKI —
+    // the on-disk `device_id` file is only a cache for humans/scripts and is
+    // never trusted (a stale or edited value would silently break
+    // --trust-device pins and daemon allowlists).
+    let device_id = device_id_from_cert(&cert).with_context(|| {
+        format!(
+            "{} is not a valid Ed25519 device certificate",
+            cert_path(dir).display()
+        )
+    })?;
+    // The private key must be the one the certificate is bound to.
+    let key_pair = rcgen::KeyPair::try_from(key_bytes.as_slice())
+        .with_context(|| format!("parse device key {}", key_path(dir).display()))?;
+    if hex::encode(Sha256::digest(key_pair.public_key_der())) != device_id {
+        anyhow::bail!(
+            "device key {} does not match certificate {} — the identity files are \
+             inconsistent",
+            key_path(dir).display(),
+            cert_path(dir).display()
+        );
+    }
+    let cached = std::fs::read_to_string(device_id_path(dir)).ok();
+    if cached.as_deref().map(str::trim) != Some(device_id.as_str()) {
+        if cached.is_some() {
+            tracing::warn!(
+                "{} is stale; rewriting it from the certificate",
+                device_id_path(dir).display()
+            );
+        }
+        if let Err(e) = write_atomic(&device_id_path(dir), device_id.as_bytes(), 0o644) {
+            tracing::warn!("could not refresh {}: {e:#}", device_id_path(dir).display());
+        }
+    }
+    Ok(Identity {
+        cert,
+        key_bytes,
+        fingerprint,
+        device_id,
+    })
+}
+
+/// Warn if the private key is readable by group/other, and tighten it to 0600.
+#[cfg(unix)]
+fn check_key_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(md) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = md.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            "device key {} has permissions {mode:o} (readable by others); resetting to 600",
+            path.display()
+        );
+        eprintln!(
+            "[mftp] warning: device key {} had permissions {mode:o}; reset to 600. \
+             If others could read it, consider regenerating the identity.",
+            path.display()
+        );
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("could not chmod {}: {e}", path.display());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn check_key_permissions(_path: &std::path::Path) {}
 
 /// Generate a fresh persistent-style identity (Ed25519 key + bound cert) in
 /// memory, without touching disk.
@@ -195,39 +277,26 @@ fn generate() -> Result<Identity> {
     })
 }
 
-/// Persist an identity to `dir` with private material at mode 0600.
-fn persist(dir: &std::path::Path, id: &Identity) {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!("could not create {}: {e}", dir.display());
-        return;
-    }
-    // The certificate is public; the key must be private.
-    let _ = std::fs::write(cert_path(dir), id.cert.as_ref());
-    let _ = std::fs::write(device_id_path(dir), &id.device_id);
-    write_private(&key_path(dir), &id.key_bytes);
-}
-
-#[cfg(unix)]
-fn write_private(path: &std::path::Path, bytes: &[u8]) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
+/// Persist an identity to `dir`: the private key atomically at mode 0600 (set
+/// on the freshly created file, so it holds even if a key file pre-existed),
+/// then the public certificate and the device-id cache.
+fn persist(dir: &std::path::Path, id: &Identity) -> Result<()> {
+    #[cfg(unix)]
     {
-        Ok(mut f) => {
-            let _ = f.write_all(bytes);
-        }
-        Err(e) => tracing::warn!("could not write device key {}: {e}", path.display()),
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create {}", dir.display()))?;
     }
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &std::path::Path, bytes: &[u8]) {
-    let _ = std::fs::write(path, bytes);
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    write_atomic(&key_path(dir), &id.key_bytes, 0o600).context("write device key")?;
+    write_atomic(&cert_path(dir), id.cert.as_ref(), 0o644).context("write device cert")?;
+    write_atomic(&device_id_path(dir), id.device_id.as_bytes(), 0o644)
+        .context("write device id")?;
+    Ok(())
 }
 
 // ── Authorized-devices store (M4: daemon identity auth) ─────────────────────────
@@ -526,6 +595,58 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         // No temp files left behind.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stale_device_id_cache_is_ignored_and_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = load_or_create_in(dir.path()).unwrap();
+        std::fs::write(dir.path().join("device_id"), "f".repeat(64)).unwrap();
+        let again = load_or_create_in(dir.path()).unwrap();
+        assert_eq!(again.device_id, id.device_id, "derived from the cert");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("device_id")).unwrap(),
+            id.device_id
+        );
+    }
+
+    #[test]
+    fn partial_or_mismatched_identity_is_an_error_not_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_in(dir.path()).unwrap();
+        let cert = std::fs::read(dir.path().join("device_cert.der")).unwrap();
+        std::fs::remove_file(dir.path().join("device_key.der")).unwrap();
+        assert!(load_or_create_in(dir.path()).is_err(), "key missing");
+        // The surviving cert was not overwritten by a fresh identity.
+        assert_eq!(
+            std::fs::read(dir.path().join("device_cert.der")).unwrap(),
+            cert
+        );
+
+        // A key from another identity does not match the cert.
+        let other = tempfile::tempdir().unwrap();
+        load_or_create_in(other.path()).unwrap();
+        std::fs::copy(
+            other.path().join("device_key.der"),
+            dir.path().join("device_key.der"),
+        )
+        .unwrap();
+        assert!(load_or_create_in(dir.path()).is_err(), "key/cert mismatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_in(dir.path()).unwrap();
+        let key = dir.path().join("device_key.der");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key), 0o600);
+        // Loosened perms are tightened on the next load.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_or_create_in(dir.path()).unwrap();
+        assert_eq!(mode(&key), 0o600);
     }
 
     #[test]
