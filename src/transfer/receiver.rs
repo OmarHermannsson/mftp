@@ -790,6 +790,18 @@ struct StripeBuffer {
     received_parity: usize,
 }
 
+/// Shared FEC stripe state across all stream workers.
+#[derive(Default)]
+struct FecStripes {
+    /// Stripes still accumulating shards.
+    bufs: HashMap<u32, StripeBuffer>,
+    /// Stripes already extracted for processing.  Shards arriving after their
+    /// stripe completed (typically surplus parity) are dropped instead of
+    /// starting a fresh `StripeBuffer` that would either leak (never becoming
+    /// ready) or reconstruct and rewrite the stripe a second time.
+    done: std::collections::HashSet<u32>,
+}
+
 impl StripeBuffer {
     fn new(
         stripe_index: u32,
@@ -828,19 +840,36 @@ impl StripeBuffer {
                     j
                 );
             }
+            // Parity metadata describes every data shard of the stripe; a
+            // mismatched count would index out of bounds in process_stripe.
+            if fcd.shard_lengths.len() != self.data_shards
+                || fcd.shard_compressed.len() != self.data_shards
+            {
+                bail!(
+                    "FEC stripe {}: parity metadata has {}/{} entries, expected {}",
+                    self.stripe_index,
+                    fcd.shard_lengths.len(),
+                    fcd.shard_compressed.len(),
+                    self.data_shards
+                );
+            }
             if self.parity[j].is_none() {
                 self.parity[j] = Some(fcd.payload);
                 self.received_parity += 1;
             }
             // All parity shards for the same stripe carry identical metadata;
             // store it once from whichever arrives first.
-            if self.shard_lengths.is_none() && !fcd.shard_lengths.is_empty() {
+            if self.shard_lengths.is_none() {
                 self.shard_lengths = Some(fcd.shard_lengths);
                 self.shard_compressed_flags = Some(fcd.shard_compressed);
             }
         } else {
             let i = fcd.shard_index_in_stripe as usize;
-            if i >= self.data_shards {
+            // Only the first `real_data_count` positions carry real chunks; the
+            // rest of a short last stripe is synthetic padding that is never
+            // sent.  Accepting a shard there would count towards `is_ready`
+            // while a real slot is still empty (and panic in process_stripe).
+            if i >= self.real_data_count {
                 bail!(
                     "FEC stripe {}: data shard index {} out of range",
                     self.stripe_index,
@@ -1223,9 +1252,8 @@ where
     }
 
     // For FEC transfers, workers share a stripe accumulator map.
-    let fec_stripe_bufs: Option<Arc<Mutex<HashMap<u32, StripeBuffer>>>> = if manifest.fec.is_some()
-    {
-        Some(Arc::new(Mutex::new(HashMap::new())))
+    let fec_stripe_bufs: Option<Arc<Mutex<FecStripes>>> = if manifest.fec.is_some() {
+        Some(Arc::new(Mutex::new(FecStripes::default())))
     } else {
         None
     };
@@ -2470,7 +2498,7 @@ async fn recv_fec_stream_worker<R>(
     pb: Arc<ProgressBar>,
     hasher: Option<Arc<ChunkHasher>>,
     progress_tx: tokio::sync::mpsc::Sender<u64>,
-    stripe_bufs: Arc<Mutex<HashMap<u32, StripeBuffer>>>,
+    stripe_bufs: Arc<Mutex<FecStripes>>,
     stats: Arc<ReceiverStats>,
     write_sem: Arc<tokio::sync::Semaphore>,
     deferred: crate::fs_ext::DeferredDontneed,
@@ -2491,6 +2519,7 @@ where
     let total_chunks = manifest.total_chunks;
     let chunk_size = manifest.chunk_size;
     let transfer_id = manifest.transfer_id;
+    let total_stripes = total_chunks.div_ceil(data_shards as u64);
     let mut shard_count = 0u64;
 
     loop {
@@ -2552,23 +2581,33 @@ where
         }
 
         let stripe_index = fcd.stripe_index;
+        if stripe_index as u64 >= total_stripes {
+            bail!("FEC shard: stripe_index {stripe_index} out of range (total stripes {total_stripes})");
+        }
 
         // Insert shard into the shared buffer; extract the stripe if it is now ready.
         let ready_stripe = {
-            let mut bufs = stripe_bufs
+            let mut st = stripe_bufs
                 .lock()
                 .expect("FEC stripe buffer mutex poisoned");
+            if st.done.contains(&stripe_index) {
+                // Late shard (usually surplus parity) for a stripe that was
+                // already processed — nothing left to do with it.
+                shard_count += 1;
+                continue;
+            }
             let real_count = {
                 let first = stripe_index as u64 * data_shards as u64;
                 (total_chunks - first).min(data_shards as u64) as usize
             };
-            let buf = bufs.entry(stripe_index).or_insert_with(|| {
+            let buf = st.bufs.entry(stripe_index).or_insert_with(|| {
                 StripeBuffer::new(stripe_index, data_shards, parity_shards, real_count)
             });
             buf.insert(fcd)?;
             let ready = buf.is_ready();
             if ready {
-                bufs.remove(&stripe_index)
+                st.done.insert(stripe_index);
+                st.bufs.remove(&stripe_index)
             } else {
                 None
             }
@@ -3090,6 +3129,110 @@ mod tests {
         let got = std::fs::read(&p).unwrap();
         assert_eq!(got.len(), 8192);
         assert!(got[..4096].iter().all(|&b| b == 0xAB));
+    }
+
+    // ── FEC stripe accounting ─────────────────────────────────────────────────
+
+    fn fec_shard(
+        stripe: u32,
+        idx: u16,
+        parity: bool,
+        payload: Vec<u8>,
+        lens: Vec<u32>,
+    ) -> FecChunkData {
+        let hash = *blake3::hash(&payload).as_bytes();
+        FecChunkData {
+            transfer_id: [0u8; 16],
+            chunk_index: if parity { u64::MAX } else { idx as u64 },
+            chunk_hash: hash,
+            compressed: false,
+            stripe_index: stripe,
+            shard_index_in_stripe: idx,
+            is_parity: parity,
+            shard_compressed: vec![0; lens.len()],
+            shard_lengths: lens,
+            payload,
+        }
+    }
+
+    /// Feed `shards` through one FEC stream worker for a 1:2 single-chunk
+    /// transfer and return (worker result, bytes credited to the progress bar).
+    async fn run_fec_worker(shards: Vec<FecChunkData>) -> (Result<()>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = base_manifest();
+        m.file_size = MIN_CHUNK_SIZE as u64;
+        m.total_chunks = 1;
+        m.fec = Some(FecParams {
+            data_shards: 1,
+            parity_shards: 2,
+        });
+        let f = Arc::new(open_and_preallocate(&dir.path().join("o"), m.file_size, false).unwrap());
+        let resume = Arc::new(Mutex::new(ResumeState::new(dir.path(), &m.transfer_id, 1)));
+        let pb = Arc::new(ProgressBar::hidden());
+        let (ptx, _prx) = tokio::sync::mpsc::channel(64);
+        let (mut w, r) = tokio::io::duplex(1 << 20);
+        for s in &shards {
+            framing::send_fec_chunk_data(&mut w, s).await.unwrap();
+        }
+        drop(w);
+        let res = recv_fec_stream_worker(
+            r,
+            f,
+            resume,
+            m,
+            Arc::clone(&pb),
+            None,
+            ptx,
+            Arc::new(Mutex::new(FecStripes::default())),
+            ReceiverStats::new(),
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            crate::fs_ext::DeferredDontneed::noop(),
+        )
+        .await;
+        (res, pb.position())
+    }
+
+    #[tokio::test]
+    async fn fec_late_parity_after_stripe_complete_is_dropped() {
+        let data = vec![7u8; MIN_CHUNK_SIZE];
+        let (parity, lens) = crate::fec::codec::FecEncoder::new(1, 2)
+            .unwrap()
+            .encode(vec![data.clone()])
+            .unwrap();
+        // Data shard completes the stripe; both parity shards arrive late.  With
+        // p >= d the second late parity used to make a fresh buffer "ready" and
+        // reconstruct + rewrite the stripe (double-counting progress).
+        let shards = vec![
+            fec_shard(0, 0, false, data, vec![]),
+            fec_shard(0, 1, true, parity[0].clone(), lens.clone()),
+            fec_shard(0, 2, true, parity[1].clone(), lens),
+        ];
+        let (res, written) = run_fec_worker(shards).await;
+        res.unwrap();
+        assert_eq!(
+            written, MIN_CHUNK_SIZE as u64,
+            "stripe processed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_bogus_stripe_and_shard_indices_error_not_panic() {
+        let data = vec![1u8; MIN_CHUNK_SIZE];
+        // stripe_index past the end used to underflow `total_chunks - first`.
+        let (res, _) = run_fec_worker(vec![fec_shard(5, 0, false, data.clone(), vec![])]).await;
+        assert!(res.is_err());
+        // Parity metadata with the wrong number of entries.
+        let (res, _) = run_fec_worker(vec![fec_shard(0, 1, true, data, vec![1, 2, 3])]).await;
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn stripe_rejects_data_shard_in_padding_slot() {
+        // Last stripe with 1 real chunk out of 4 data shards: slot 2 is padding.
+        let mut sb = StripeBuffer::new(0, 4, 1, 1);
+        let r = sb.insert(fec_shard(0, 2, false, vec![0u8; 8], vec![]));
+        assert!(r.is_err());
+        assert!(!sb.is_ready());
     }
 
     // ── Symlink escape (adversarial DirEntries) ───────────────────────────────
