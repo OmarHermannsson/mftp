@@ -46,8 +46,13 @@ pub enum DaemonResponse {
         device_id: String,
         fingerprint: String,
     },
+    /// The *effective* authorized set currently applied by the daemon (from
+    /// `acl.toml` or `authorized_devices`), whether it is enforced, and where it
+    /// comes from.
     Trust {
         devices: Vec<String>,
+        enforced: bool,
+        source: AuthSource,
     },
     /// Result of an Add/Remove: whether the set actually changed.
     TrustChanged {
@@ -158,6 +163,9 @@ pub struct DaemonState {
     acl: crate::service::acl::ReloadableAcl,
     /// The currently applied policy's source + effective device set.
     applied: std::sync::RwLock<(AuthSource, Vec<String>)>,
+    /// Serializes daemon-trust edits (read-modify-write of authorized_devices +
+    /// reload) so concurrent control requests cannot lose an update.
+    trust_edit: std::sync::Mutex<()>,
 }
 
 impl DaemonState {
@@ -183,6 +191,7 @@ impl DaemonState {
             allowlist: crate::net::connection::ReloadableAllowlist::new(policy.verifier_ids()),
             acl: crate::service::acl::ReloadableAcl::new(policy.acl.clone()),
             applied: std::sync::RwLock::new((policy.source, policy.authorized)),
+            trust_edit: std::sync::Mutex::new(()),
         })
     }
 
@@ -242,33 +251,57 @@ fn handle_request(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
                 message: format!("identity: {e:#}"),
             },
         },
-        DaemonRequest::ListTrust => match crate::identity::load_authorized_in(&state.config_dir) {
-            Ok(devices) => DaemonResponse::Trust { devices },
-            Err(e) => DaemonResponse::Error {
-                message: format!("{e:#}"),
-            },
+        DaemonRequest::ListTrust => DaemonResponse::Trust {
+            devices: state.authorized_devices(),
+            enforced: state.auth_enforced(),
+            source: state.auth_source(),
         },
-        DaemonRequest::AddTrust { device_id } => {
-            match crate::identity::add_authorized_in(&state.config_dir, &device_id) {
-                Ok(changed) => DaemonResponse::TrustChanged { changed },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("{e:#}"),
-                },
-            }
-        }
-        DaemonRequest::RemoveTrust { device_id } => {
-            match crate::identity::remove_authorized_in(&state.config_dir, &device_id) {
-                Ok(changed) => DaemonResponse::TrustChanged { changed },
-                Err(e) => DaemonResponse::Error {
-                    message: format!("{e:#}"),
-                },
-            }
-        }
+        DaemonRequest::AddTrust { device_id } => edit_trust(state, |dir| {
+            crate::identity::add_authorized_in(dir, &device_id)
+        }),
+        DaemonRequest::RemoveTrust { device_id } => edit_trust(state, |dir| {
+            crate::identity::remove_authorized_in(dir, &device_id)
+        }),
         DaemonRequest::Status => DaemonResponse::Status {
             listening_on: state.listening_on.clone(),
             auth_enforced: state.auth_enforced(),
             authorized_count: state.authorized_devices().len(),
             transfers_completed: state.transfers_completed.load(Ordering::Relaxed),
+        },
+    }
+}
+
+/// Apply a daemon-trust edit to `authorized_devices` and immediately reload it
+/// into the live verifier (the same operation as SIGHUP), so the change takes
+/// effect for the next connection without a restart.
+///
+/// When `acl.toml` governs authorization, editing `authorized_devices` would
+/// have no effect, so the request is refused with an explanatory error instead
+/// of silently succeeding.
+fn edit_trust(state: &DaemonState, edit: impl FnOnce(&Path) -> Result<bool>) -> DaemonResponse {
+    let _guard = state.trust_edit.lock().expect("trust edit lock poisoned");
+    let result = (|| -> Result<bool> {
+        // Re-check against disk, not only the applied state: an ACL added since
+        // the last reload also governs.
+        if state.auth_source() == AuthSource::Acl
+            || AuthPolicy::load(&state.config_dir)?.source == AuthSource::Acl
+        {
+            anyhow::bail!(
+                "authorization is governed by {} — edit its [peers] and reload the daemon \
+                 (SIGHUP) instead of using daemon-trust",
+                state.config_dir.join("acl.toml").display()
+            );
+        }
+        let changed = edit(&state.config_dir)?;
+        state
+            .reload()
+            .context("trust file updated but reloading it into the daemon failed")?;
+        Ok(changed)
+    })();
+    match result {
+        Ok(changed) => DaemonResponse::TrustChanged { changed },
+        Err(e) => DaemonResponse::Error {
+            message: format!("{e:#}"),
         },
     }
 }
@@ -757,7 +790,7 @@ mod tests {
             .await
             .unwrap()
         {
-            DaemonResponse::Trust { devices } => assert!(devices.is_empty()),
+            DaemonResponse::Trust { devices, .. } => assert!(devices.is_empty()),
             other => panic!("expected Trust, got {other:?}"),
         }
 
@@ -777,7 +810,19 @@ mod tests {
             }
         }
 
-        // Now listed and auth is enforced.
+        // Applied live (no reload needed): listed and auth is enforced.
+        match client_request(&sock, DaemonRequest::ListTrust)
+            .await
+            .unwrap()
+        {
+            DaemonResponse::Trust {
+                devices, enforced, ..
+            } => {
+                assert_eq!(devices, vec![id.clone()]);
+                assert!(enforced);
+            }
+            other => panic!("expected Trust, got {other:?}"),
+        }
         match client_request(&sock, DaemonRequest::Status).await.unwrap() {
             DaemonResponse::Status {
                 auth_enforced,
@@ -797,6 +842,63 @@ mod tests {
         {
             DaemonResponse::TrustChanged { changed } => assert!(changed),
             other => panic!("expected TrustChanged, got {other:?}"),
+        }
+
+        // Removing the last device keeps the daemon enforcing (deny-all).
+        match client_request(&sock, DaemonRequest::Status).await.unwrap() {
+            DaemonResponse::Status {
+                auth_enforced,
+                authorized_count,
+                ..
+            } => {
+                assert!(auth_enforced, "removing the last device must not open");
+                assert_eq!(authorized_count, 0);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_trust_refused_when_acl_governs() {
+        use crate::service::acl::{Acl, PeerPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let peer = "c".repeat(64);
+        let mut acl = Acl::default();
+        acl.set_peer(
+            &peer,
+            PeerPolicy {
+                output_subdir: "c".into(),
+                quota_bytes: None,
+            },
+        );
+        acl.save(dir.path()).unwrap();
+        let (sock, _state) = spawn_test_daemon(dir.path()).await;
+
+        // List reflects the effective (ACL) set.
+        match client_request(&sock, DaemonRequest::ListTrust)
+            .await
+            .unwrap()
+        {
+            DaemonResponse::Trust {
+                devices, source, ..
+            } => {
+                assert_eq!(devices, vec![peer]);
+                assert_eq!(source, AuthSource::Acl);
+            }
+            other => panic!("expected Trust, got {other:?}"),
+        }
+        // Editing the allowlist is refused with a clear error.
+        match client_request(
+            &sock,
+            DaemonRequest::AddTrust {
+                device_id: "d".repeat(64),
+            },
+        )
+        .await
+        .unwrap()
+        {
+            DaemonResponse::Error { message } => assert!(message.contains("acl.toml")),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 }

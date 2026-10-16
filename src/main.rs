@@ -627,9 +627,21 @@ async fn run_daemon_ctl(socket: &std::path::Path, req: mftp::daemon::DaemonReque
             println!("Device ID:   {device_id}");
             println!("Fingerprint: {fingerprint}");
         }
-        DaemonResponse::Trust { devices } => {
-            if devices.is_empty() {
+        DaemonResponse::Trust {
+            devices,
+            enforced,
+            source,
+        } => {
+            use mftp::daemon::AuthSource;
+            match source {
+                AuthSource::Acl => println!("# authorization governed by acl.toml"),
+                AuthSource::Allowlist => println!("# authorization governed by authorized_devices"),
+                AuthSource::Open => {}
+            }
+            if !enforced {
                 println!("(no authorized devices — receiver is open)");
+            } else if devices.is_empty() {
+                println!("(no authorized devices — all senders are denied)");
             } else {
                 for d in devices {
                     println!("{d}");
