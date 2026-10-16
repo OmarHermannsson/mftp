@@ -224,6 +224,12 @@ impl ResumeState {
     }
 
     pub fn mark_received(&mut self, chunk_index: u64) {
+        // Callers validate indices against the manifest; never panic on a
+        // stray out-of-range one.
+        if chunk_index >= self.total_chunks {
+            debug_assert!(false, "mark_received({chunk_index}) out of range");
+            return;
+        }
         let word = (chunk_index / 64) as usize;
         let bit = chunk_index % 64;
         self.received[word] |= 1 << bit;

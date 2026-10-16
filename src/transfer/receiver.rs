@@ -915,6 +915,7 @@ fn write_fec_chunk(
     compressed: bool,
     expected_hash: Option<[u8; 32]>,
     chunk_size: usize,
+    file_size: u64,
     out_file: &std::fs::File,
     resume: &Mutex<ResumeState>,
     hasher: &Option<Arc<ChunkHasher>>,
@@ -928,6 +929,13 @@ fn write_fec_chunk(
     } else {
         payload.to_vec()
     };
+    let want = expected_chunk_len(chunk_index, chunk_size, file_size);
+    if data.len() != want {
+        bail!(
+            "FEC chunk {chunk_index}: {} bytes, expected {want}",
+            data.len()
+        );
+    }
 
     let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
     if let Some(expected) = expected_hash {
@@ -988,6 +996,7 @@ fn write_fec_chunk(
 fn process_stripe(
     stripe: StripeBuffer,
     chunk_size: usize,
+    file_size: u64,
     out_file: Arc<std::fs::File>,
     resume: Arc<Mutex<ResumeState>>,
     hasher: Option<Arc<ChunkHasher>>,
@@ -1011,6 +1020,7 @@ fn process_stripe(
                 *compressed,
                 Some(*hash),
                 chunk_size,
+                file_size,
                 &out_file,
                 &resume,
                 &hasher,
@@ -1074,6 +1084,7 @@ fn process_stripe(
             compressed,
             expected_hash,
             chunk_size,
+            file_size,
             &out_file,
             &resume,
             &hasher,
@@ -1510,7 +1521,7 @@ where
                 pt.out_file.as_ref(),
                 pt.layout.as_ref(),
                 &pt.resume,
-                manifest.chunk_size,
+                &manifest,
                 &pt.pb,
             )
             .await?;
@@ -1558,6 +1569,13 @@ where
     .await?;
 
     Ok(ctrl_send)
+}
+
+/// Exact byte length of chunk `idx` (`< total_chunks`): `chunk_size`, except a
+/// shorter final chunk.
+fn expected_chunk_len(idx: u64, chunk_size: usize, file_size: u64) -> usize {
+    let offset = idx.saturating_mul(chunk_size as u64);
+    file_size.saturating_sub(offset).min(chunk_size as u64) as usize
 }
 
 /// Build an attributable error naming the chunks (and, for FEC, stripes) that
@@ -1618,15 +1636,37 @@ async fn write_repair_chunk(
     out_file: Option<&Arc<std::fs::File>>,
     layout: Option<&Arc<ConcatLayout>>,
     resume: &Arc<Mutex<ResumeState>>,
-    chunk_size: usize,
+    manifest: &TransferManifest,
     pb: &ProgressBar,
 ) -> Result<()> {
+    let chunk_size = manifest.chunk_size;
+    // The repair frame is peer-supplied: it must name a chunk of this transfer
+    // and carry exactly that chunk's length, or it could write past the file
+    // (or another file of a directory) and index the resume bitvector OOB.
+    if cd.chunk_index >= manifest.total_chunks {
+        bail!(
+            "repair chunk index {} out of range (total_chunks {})",
+            cd.chunk_index,
+            manifest.total_chunks
+        );
+    }
+    if cd.transfer_id != manifest.transfer_id {
+        bail!("repair chunk {}: transfer_id mismatch", cd.chunk_index);
+    }
     let data = if cd.compressed {
         compress::decompress_chunk(&cd.payload, chunk_size)
             .with_context(|| format!("decompress repair chunk {}", cd.chunk_index))?
     } else {
         cd.payload.clone()
     };
+    let want = expected_chunk_len(cd.chunk_index, chunk_size, manifest.file_size);
+    if data.len() != want {
+        bail!(
+            "repair chunk {}: {} bytes, expected {want}",
+            cd.chunk_index,
+            data.len()
+        );
+    }
     let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
     if computed != cd.chunk_hash {
         bail!("repair chunk {} failed hash verification", cd.chunk_index);
@@ -2363,6 +2403,7 @@ where
         }
 
         let chunk_size = manifest.chunk_size;
+        let want_len = expected_chunk_len(chunk_index, chunk_size, manifest.file_size);
         let out_file = out_file.as_ref().map(Arc::clone);
         let layout = layout.as_ref().map(Arc::clone);
         let hasher = hasher.as_ref().map(Arc::clone);
@@ -2393,7 +2434,6 @@ where
             } else {
                 chunk.payload
             };
-
             let computed: [u8; 32] = *blake3::hash(&data).as_bytes();
             if computed != chunk.chunk_hash {
                 // Drop the corrupt chunk and keep the worker (and its stream)
@@ -2416,6 +2456,15 @@ where
                     "chunk hash mismatch; dropping (will be repaired or re-fetched)"
                 );
                 return Ok(());
+            }
+            // A self-consistent but wrongly sized chunk (hash matches its own
+            // bytes) would write past this chunk's range: into the next chunk,
+            // past EOF, or across file boundaries in a directory transfer.
+            if data.len() != want_len {
+                bail!(
+                    "chunk {chunk_index}: {} bytes, expected {want_len}",
+                    data.len()
+                );
             }
 
             let write_start = std::time::Instant::now();
@@ -2534,6 +2583,7 @@ where
     let parity_shards = fec_params.parity_shards;
     let total_chunks = manifest.total_chunks;
     let chunk_size = manifest.chunk_size;
+    let file_size = manifest.file_size;
     let transfer_id = manifest.transfer_id;
     let total_stripes = total_chunks.div_ceil(data_shards as u64);
     let mut shard_count = 0u64;
@@ -2645,7 +2695,7 @@ where
             stats.in_flight_chunks.fetch_add(1, Ordering::Relaxed);
             processing.spawn_blocking(move || {
                 let peak_write_us = process_stripe(
-                    stripe, chunk_size, out_file, resume, hasher, pb, ptx, deferred_c,
+                    stripe, chunk_size, file_size, out_file, resume, hasher, pb, ptx, deferred_c,
                 );
                 drop(write_permit);
                 // Use the pwrite time returned by process_stripe (excludes resume
@@ -3169,6 +3219,46 @@ mod tests {
         let got = std::fs::read(&p).unwrap();
         assert_eq!(got.len(), 8192);
         assert!(got[..4096].iter().all(|&b| b == 0xAB));
+    }
+
+    // ── Peer-supplied repair chunks ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn repair_chunk_index_and_length_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = base_manifest();
+        m.file_size = (MIN_CHUNK_SIZE * 2) as u64;
+        m.total_chunks = 2;
+        let f = Arc::new(open_and_preallocate(&dir.path().join("o"), m.file_size, false).unwrap());
+        let resume = Arc::new(Mutex::new(ResumeState::new(dir.path(), &m.transfer_id, 2)));
+        let pb = ProgressBar::hidden();
+        let cd = |idx: u64, len: usize| {
+            let payload = vec![5u8; len];
+            ChunkData {
+                transfer_id: m.transfer_id,
+                chunk_index: idx,
+                chunk_hash: *blake3::hash(&payload).as_bytes(),
+                compressed: false,
+                payload,
+            }
+        };
+        // Out-of-range index used to index the resume bitvector out of bounds.
+        let c = cd(9, MIN_CHUNK_SIZE);
+        let r = write_repair_chunk(&c, Some(&f), None, &resume, &m, &pb);
+        assert!(r.await.is_err());
+        // Oversized (but hash-consistent) payload would write past its chunk.
+        let c = cd(1, MIN_CHUNK_SIZE * 3);
+        let r = write_repair_chunk(&c, Some(&f), None, &resume, &m, &pb);
+        assert!(r.await.is_err());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("o")).unwrap().len(),
+            m.file_size
+        );
+        // A well-formed repair chunk is accepted and marked.
+        let c = cd(1, MIN_CHUNK_SIZE);
+        let r = write_repair_chunk(&c, Some(&f), None, &resume, &m, &pb);
+        r.await.unwrap();
+        assert!(resume.lock().unwrap().is_received(1));
     }
 
     // ── FEC stripe accounting ─────────────────────────────────────────────────

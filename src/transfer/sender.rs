@@ -1051,10 +1051,16 @@ where
         .await?
         .ok_or_else(|| anyhow::anyhow!("stream closed before Ready message"))?;
     let have: HashSet<u64> = match ready {
+        // Ready.total_chunks comes from the peer; only our own manifest value
+        // bounds the chunk indices (a larger one made skip_count exceed
+        // total_chunks and underflowed `remaining`).
         ReceiverMessage::Ready {
             received_bits,
-            total_chunks,
-        } => bits_to_chunk_set(&received_bits, total_chunks),
+            total_chunks: peer_total,
+        } => {
+            check_ready_bits(&received_bits, peer_total, total_chunks)?;
+            bits_to_chunk_set(&received_bits, total_chunks)
+        }
         ReceiverMessage::Error { message, .. } => {
             // The receiver refused before data started (e.g. out of space) — mark
             // it non-retryable so SSH mode doesn't fall back to a doomed SFTP run.
@@ -2014,6 +2020,22 @@ fn print_completion(
     Ok(())
 }
 
+/// Sanity-check a receiver's `Ready` against our manifest: it must describe the
+/// same number of chunks and carry no more bitvector words than that needs.
+fn check_ready_bits(bits: &[u64], peer_total: u64, total_chunks: u64) -> Result<()> {
+    if peer_total != total_chunks {
+        bail!("receiver Ready reports {peer_total} chunks, but this transfer has {total_chunks}");
+    }
+    let max_words = total_chunks.div_ceil(64);
+    if bits.len() as u64 > max_words {
+        bail!(
+            "receiver Ready bitvector has {} words, expected at most {max_words}",
+            bits.len()
+        );
+    }
+    Ok(())
+}
+
 /// Reconstruct a `HashSet` of chunk indices from a packed bitvector.
 fn bits_to_chunk_set(bits: &[u64], total_chunks: u64) -> HashSet<u64> {
     bits.iter()
@@ -2737,7 +2759,8 @@ where
             received_bits,
             total_chunks: tc,
         } => {
-            let s = complete_fec_stripes(&received_bits, tc, fec_params.data_shards);
+            check_ready_bits(&received_bits, tc, total_chunks)?;
+            let s = complete_fec_stripes(&received_bits, total_chunks, fec_params.data_shards);
             let skipped_chunks = s.len() as u64 * fec_params.data_shards as u64;
             let remaining_chunks = total_chunks.saturating_sub(skipped_chunks);
             info!(
@@ -2996,6 +3019,18 @@ mod tests {
             Duration::from_millis(1)
         ));
         assert!(!should_switch_to_tcp(false, Duration::ZERO, Duration::ZERO));
+    }
+
+    #[test]
+    fn ready_bits_bounded_by_our_manifest() {
+        // Matching total and bitvector length is fine.
+        assert!(check_ready_bits(&[u64::MAX; 2], 100, 100).is_ok());
+        // A receiver claiming more chunks than we have must be rejected …
+        assert!(check_ready_bits(&[u64::MAX; 2], 1_000, 100).is_err());
+        // … as must an oversized bitvector.
+        assert!(check_ready_bits(&[0; 3], 100, 100).is_err());
+        // Bits past our total are ignored, so skip_count ≤ total_chunks.
+        assert_eq!(bits_to_chunk_set(&[u64::MAX; 2], 100).len(), 100);
     }
 
     /// Regression test for the late-scaling end-of-transfer deadlock.
