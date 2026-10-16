@@ -1391,7 +1391,9 @@ where
                         }
                     }
                     current_workers = accepted;
-                    let _ = ack_req_tx.send(accepted as u8).await;
+                    let _ = ack_req_tx
+                        .send(crate::transfer::negotiate::stream_count_u8(accepted))
+                        .await;
                 } else if target < current_workers {
                     // Scale-down: no stream management needed on the receiver side.
                     // The sender will close excess streams (QUIC FIN / TLS shutdown);
@@ -1404,7 +1406,9 @@ where
                         current_workers - target
                     );
                     current_workers = target;
-                    let _ = ack_req_tx.send(target as u8).await;
+                    let _ = ack_req_tx
+                        .send(crate::transfer::negotiate::stream_count_u8(target))
+                        .await;
                 }
             }
         }

@@ -886,7 +886,9 @@ where
                     }
                     Some(ScaleMsg::Ack(accepted)) if !fec_enabled => {
                         let current = current_streams.load(AtomicOrd::Relaxed);
-                        let new_count = accepted as usize;
+                        // Never let a (buggy/malicious) ack of 0 stop every worker
+                        // while chunks are still queued.
+                        let new_count = (accepted as usize).max(1);
                         if new_count < current {
                             // Receiver accepted fewer streams than we opened — either a
                             // scale-down ack or a partial scale-up (some accepts failed).
@@ -1474,7 +1476,11 @@ where
     )
     .await?;
 
-    // Workers done; all feeders should have finished by now (channel closed).
+    // Workers done.  Normally the feeders finished and closed the channel, but
+    // if every worker exited early (e.g. scale-down overshoot) a feeder would
+    // block forever in send_blocking; dropping the last receiver unblocks it
+    // with an error instead.
+    drop(work_rx);
     for feeder in feeders {
         feeder.await.context("feeder task panicked")??;
     }
@@ -1727,6 +1733,11 @@ fn ack_timeout(rtt: Duration, file_size: u64) -> Duration {
 /// truly in parallel with the async executor.  Workers can therefore call
 /// `try_recv` immediately and find a chunk waiting, enabling the
 /// compress/hash pipeline to overlap with network sends.
+/// Feeder error when every stream worker is gone before all chunks were
+/// handed out.  On an aborted transfer this error is never observed (the
+/// feeder is detached); otherwise it surfaces instead of a silent hang.
+const WORKERS_GONE: &str = "all stream workers exited before every chunk was dispatched";
+
 fn feed_chunks(
     path: &Path,
     file_size: u64,
@@ -1760,7 +1771,7 @@ fn feed_chunks(
         // feeder waits here, naturally throttling disk reads to the network
         // send rate.  An Err means all receivers (workers) have closed.
         if tx.send_blocking((idx, raw)).is_err() {
-            break;
+            bail!(WORKERS_GONE);
         }
     }
 
@@ -2089,7 +2100,7 @@ fn feed_chunks_range(
         let raw = crate::fs_ext::read_exact_at_vec(&file, len, offset)
             .with_context(|| format!("read chunk {idx}"))?;
         if tx.send_blocking((idx, raw)).is_err() {
-            break;
+            bail!(WORKERS_GONE);
         }
     }
     Ok(())
@@ -2345,7 +2356,7 @@ fn feed_chunks_concat(
         }
 
         if tx.send_blocking((idx, buf)).is_err() {
-            break; // workers closed — abort cleanly
+            bail!(WORKERS_GONE);
         }
     }
 
