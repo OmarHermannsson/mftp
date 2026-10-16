@@ -625,8 +625,9 @@ pub async fn serve_one_stdio(
     // looping here instead of exiting we keep both endpoints bound so the
     // retry can succeed without relaunching the receiver.
     //
-    // A timeout is applied to each accept as a safety net: 5 minutes for the
-    // initial connection, 60 seconds for the retry.  This prevents the
+    // A timeout is applied to each *accept* (not the transfer that follows) as
+    // a safety net: 5 minutes for the initial connection, 60 seconds for the
+    // retry.  This prevents the
     // receiver from hanging indefinitely when SIGHUP is not delivered (e.g.
     // the user has SSH ControlMaster enabled and the muxed session outlives
     // our SSH child, or a network partition where TCP keepalives haven't
@@ -637,17 +638,10 @@ pub async fn serve_one_stdio(
         } else {
             STDIO_RETRY_TIMEOUT
         };
-        let result =
-            tokio::time::timeout(timeout, accept_one_quic_or_tcp(&quic_server, &tcp_server)).await;
+        let result = accept_one_quic_or_tcp(&quic_server, &tcp_server, timeout).await;
         match result {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(e)) if attempt == 0 => {
-                // First transfer failed; stay alive so the sender's automatic
-                // resume retry can reconnect to the same port.
-                warn!("transfer failed (attempt 1), waiting for resume retry: {e:#}");
-            }
-            Ok(Err(e)) => return Err(e),
-            Err(_elapsed) => bail!(
+            Ok(()) => return Ok(()),
+            Err(e) if e.is::<AcceptTimedOut>() => bail!(
                 "no {} received within {}s — exiting",
                 if attempt == 0 {
                     "connection"
@@ -656,6 +650,12 @@ pub async fn serve_one_stdio(
                 },
                 timeout.as_secs(),
             ),
+            Err(e) if attempt == 0 => {
+                // First transfer failed; stay alive so the sender's automatic
+                // resume retry can reconnect to the same port.
+                warn!("transfer failed (attempt 1), waiting for resume retry: {e:#}");
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -665,18 +665,70 @@ pub async fn serve_one_stdio(
 /// immediately closed by the sender with the "switching to tcp" sentinel
 /// (RTT-based LAN detection), fall through to accept the follow-up TCP+TLS
 /// connection instead.
-async fn accept_one_quic_or_tcp(quic: &Server, tcp: &TcpServer) -> Result<()> {
-    tokio::select! {
-        res = quic.accept_one() => {
-            match res {
-                Ok(()) => Ok(()),
-                Err(e) if e.is::<SwitchToTcp>() => tcp.accept_one().await,
-                Err(e) => Err(e),
+///
+/// `accept_timeout` bounds only the wait for each connection; the transfer
+/// itself may take as long as it needs. A timed-out wait returns
+/// [`AcceptTimedOut`].
+async fn accept_one_quic_or_tcp(
+    quic: &Server,
+    tcp: &TcpServer,
+    accept_timeout: Duration,
+) -> Result<()> {
+    enum Accepted {
+        Quic(quinn::Connection),
+        Tcp(Box<ServerTlsStream<tokio::net::TcpStream>>),
+    }
+    let accept_quic = async {
+        let incoming = quic
+            .endpoint
+            .accept()
+            .await
+            .ok_or_else(|| anyhow!("endpoint closed before any connection arrived"))?;
+        incoming.await.context("connection setup failed")
+    };
+    let accepted = tokio::time::timeout(accept_timeout, async {
+        tokio::select! {
+            c = accept_quic => c.map(Accepted::Quic),
+            t = tcp.accept_control() => t.map(|t| Accepted::Tcp(Box::new(t))),
+        }
+    })
+    .await
+    .map_err(|_| anyhow::Error::new(AcceptTimedOut))??;
+
+    let handle_tcp = |tls| {
+        handle_tcp_connection(
+            tls,
+            Arc::clone(&tcp.listener),
+            Arc::clone(&tcp.acceptor),
+            tcp.output_dir.clone(),
+        )
+    };
+    match accepted {
+        Accepted::Quic(conn) => {
+            info!("connection from {}", conn.remote_address());
+            match handle_quic_connection(conn, None, quic.output_dir.clone().into()).await {
+                Err(e) if e.is::<SwitchToTcp>() => {
+                    let tls = tokio::time::timeout(accept_timeout, tcp.accept_control())
+                        .await
+                        .map_err(|_| anyhow::Error::new(AcceptTimedOut))??;
+                    handle_tcp(tls).await
+                }
+                other => other,
             }
         }
-        res = tcp.accept_one() => res,
+        Accepted::Tcp(tls) => handle_tcp(*tls).await,
     }
 }
+
+/// No connection arrived within `serve_one_stdio`'s accept window.
+#[derive(Debug)]
+struct AcceptTimedOut;
+impl std::fmt::Display for AcceptTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timed out waiting for a connection")
+    }
+}
+impl std::error::Error for AcceptTimedOut {}
 
 // ── Per-connection logic: QUIC ────────────────────────────────────────────────
 
@@ -3772,6 +3824,46 @@ fn ensure_no_symlink_prefix(base_dir: &std::path::Path, rel: &str) -> Result<()>
 mod tests {
     use super::*;
     use crate::protocol::messages::{Compression, FecParams, StreamHello};
+
+    /// serve_one_stdio's accept timeout must bound only the wait for a
+    /// connection, never the transfer that follows (a long SSH transfer used
+    /// to be cancelled after 5 minutes).
+    #[tokio::test]
+    async fn stdio_accept_timeout_does_not_cut_off_accepted_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let quic = Server::bind("127.0.0.1:0".parse().unwrap(), dir.path().to_owned()).unwrap();
+        let tcp = TcpServer::bind("127.0.0.1:0".parse().unwrap(), dir.path().to_owned())
+            .await
+            .unwrap();
+        let addr = tcp.local_addr;
+        let fp = tcp.fingerprint.clone();
+
+        // Nothing connects: the short accept window expires.
+        let err = accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(err.is::<AcceptTimedOut>(), "{err:#}");
+
+        // A connection that arrives in time keeps the call alive well past the
+        // accept window (here it just goes quiet; a real transfer would run).
+        let task = tokio::spawn(async move {
+            accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(300)).await
+        });
+        let client = crate::net::tcp::connect_tls(addr, Some(&fp), None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !task.is_finished(),
+            "accepted connection was cut off by the accept timeout"
+        );
+        drop(client);
+        let res = task.await.unwrap();
+        assert!(
+            !res.as_ref().is_err_and(|e| e.is::<AcceptTimedOut>()),
+            "{res:?}"
+        );
+    }
 
     #[tokio::test]
     async fn stream_hello_skipped_when_not_expected() {
