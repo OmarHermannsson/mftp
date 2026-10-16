@@ -490,7 +490,18 @@ pub struct SshDest {
 /// valid port number.
 /// Returns `Err` if the destination looks like an SSH path but no username
 /// can be determined (no `user@` prefix and `$USER`/`$LOGNAME` are both unset).
+///
+/// The URL form `ssh://[user@]host[:port][/path]` is also accepted and is the
+/// way to give a non-default SSH port (the port is passed to `ssh -p` and used
+/// by the SFTP fallback).  IPv6 hosts may be bracketed (`user@[::1]:/path`).
+///
+/// Destinations whose user or host begins with `-` are rejected: `ssh(1)`
+/// would otherwise parse them as options (e.g. `-oProxyCommand=…`).
 pub fn parse_ssh_dest(dest: &str) -> Result<Option<SshDest>> {
+    if let Some(rest) = dest.strip_prefix("ssh://") {
+        return parse_ssh_url(dest, rest).map(Some);
+    }
+
     let Some(colon) = dest.rfind(':') else {
         return Ok(None);
     };
@@ -502,31 +513,119 @@ pub fn parse_ssh_dest(dest: &str) -> Result<Option<SshDest>> {
         return Ok(None);
     }
 
-    let (user_host, user, host) = if let Some(at) = before.find('@') {
-        (
-            before.to_owned(),
-            before[..at].to_owned(),
-            before[at + 1..].to_owned(),
-        )
-    } else {
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "cannot determine SSH username for {dest:?}: \
-                     no user@host prefix and $USER/$LOGNAME are not set"
-                )
-            })?;
-        (before.to_owned(), user, before.to_owned())
-    };
+    let (user, host) = split_user_host(before);
+    build_dest(dest, user, host, after.to_owned(), None).map(Some)
+}
 
-    Ok(Some(SshDest {
+/// Parse the part after `ssh://`: `[user@]host[:port][/path]`.
+fn parse_ssh_url(dest: &str, rest: &str) -> Result<SshDest> {
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_owned()),
+        None => (rest, ".".to_owned()),
+    };
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        // [v6]:port or [v6]
+        let close = inner
+            .find(']')
+            .with_context(|| format!("unterminated '[' in SSH destination {dest:?}"))?;
+        let port = match &inner[close + 1..] {
+            "" => None,
+            p => Some(p.strip_prefix(':').unwrap_or(p)),
+        };
+        (&inner[..close], port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let port = port
+        .map(|p| {
+            p.parse::<u16>()
+                .ok()
+                .filter(|&p| p != 0)
+                .with_context(|| format!("invalid SSH port {p:?} in {dest:?}"))
+        })
+        .transpose()?;
+    build_dest(
+        dest,
+        userinfo.map(str::to_owned),
+        host.to_owned(),
+        path,
+        port,
+    )
+}
+
+/// Split `[user@]host` (host optionally `[bracketed]`).
+fn split_user_host(before: &str) -> (Option<String>, String) {
+    let (user, host) = match before.find('@') {
+        Some(at) => (Some(before[..at].to_owned()), &before[at + 1..]),
+        None => (None, before),
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    (user, host.to_owned())
+}
+
+fn default_user(dest: &str) -> Result<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "cannot determine SSH username for {dest:?}: \
+                 no user@host prefix and $USER/$LOGNAME are not set"
+            )
+        })
+}
+
+/// Validate the components and assemble an [`SshDest`].
+///
+/// With no explicit user, `user_host` is just the host so `ssh(1)` still
+/// applies any `User` from ssh_config; `user` (for the SFTP fallback, which
+/// does not read ssh_config) defaults to `$USER`/`$LOGNAME`.
+fn build_dest(
+    dest: &str,
+    explicit_user: Option<String>,
+    host: String,
+    remote_path: String,
+    port: Option<u16>,
+) -> Result<SshDest> {
+    let user = match &explicit_user {
+        Some(u) => u.clone(),
+        None => default_user(dest)?,
+    };
+    if host.is_empty() {
+        bail!("SSH destination {dest:?} has no host");
+    }
+    if user.is_empty() {
+        bail!("SSH destination {dest:?} has an empty user name");
+    }
+    // ssh(1) would parse a leading '-' as an option (e.g. -oProxyCommand=…).
+    if host.starts_with('-') || user.starts_with('-') {
+        bail!("refusing SSH destination {dest:?}: user/host must not start with '-'");
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) || user.contains(char::is_control)
+    {
+        bail!("refusing SSH destination {dest:?}: invalid characters in user/host");
+    }
+    // ssh(1) takes IPv6 literals unbracketed.
+    let user_host = match explicit_user {
+        Some(_) => format!("{user}@{host}"),
+        None => host.clone(),
+    };
+    Ok(SshDest {
         user_host,
         user,
         host,
-        remote_path: after.to_owned(),
-        port: None,
-    }))
+        remote_path,
+        port,
+    })
 }
 
 // ── SSH launch + transfer ─────────────────────────────────────────────────────
@@ -866,7 +965,8 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use super::{
         download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
-        platform_matches, remote_bootstrap_script, remote_sh_command, shell_quote, RemotePlatform,
+        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command, shell_quote,
+        RemotePlatform,
     };
 
     /// The remote command must be ONE shell word after `sh -c`, on one line,
@@ -1017,6 +1117,51 @@ mod tests {
             std::fs::read_dir(decoy.path()).unwrap().next().is_none(),
             "nothing may be written through a planted symlink"
         );
+    }
+
+    #[test]
+    fn parse_dest_rejects_option_injection() {
+        for d in [
+            "-oProxyCommand=touch /tmp/pwn:/x",
+            "-oProxyCommand=x@host:/x",
+            "user@-oProxyCommand=x:/x",
+            "ssh://-oProxyCommand=x/x",
+            "ssh://user@-host/x",
+        ] {
+            assert!(parse_ssh_dest(d).is_err(), "{d:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_dest_forms() {
+        let d = parse_ssh_dest("alice@example.com:/data").unwrap().unwrap();
+        assert_eq!(
+            (d.user.as_str(), d.host.as_str(), d.user_host.as_str()),
+            ("alice", "example.com", "alice@example.com")
+        );
+        assert_eq!((d.remote_path.as_str(), d.port), ("/data", None));
+
+        // Plain host:port stays a direct address.
+        assert!(parse_ssh_dest("example.com:4433").unwrap().is_none());
+
+        // ssh:// URL with a port.
+        let d = parse_ssh_dest("ssh://bob@host.example:2222/srv/in")
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.user.as_str(), d.host.as_str()), ("bob", "host.example"));
+        assert_eq!((d.remote_path.as_str(), d.port), ("/srv/in", Some(2222)));
+
+        // Bracketed IPv6, both forms.
+        let d = parse_ssh_dest("ssh://carol@[::1]:2200/tmp")
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.host.as_str(), d.port), ("::1", Some(2200)));
+        let d = parse_ssh_dest("carol@[fe80::1]:/tmp").unwrap().unwrap();
+        assert_eq!(d.host, "fe80::1");
+
+        // Bad ports.
+        assert!(parse_ssh_dest("ssh://h:0/x").is_err());
+        assert!(parse_ssh_dest("ssh://h:99999/x").is_err());
     }
 
     #[test]
