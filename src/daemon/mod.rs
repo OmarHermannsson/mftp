@@ -433,8 +433,8 @@ impl Daemon {
     ///
     /// When an authorization file exists (acl.toml or authorized_devices — see
     /// [`AuthPolicy`]), mutual-TLS DeviceId auth is enforced and only QUIC is
-    /// served (the TCP path does not present client certs, so serving it under
-    /// auth would be a bypass). A malformed or unreadable authorization file is
+    /// served (TCP+TLS supports only a fixed DeviceId list, not the live SIGHUP-
+    /// reloadable allowlist, so it is not offered). A malformed or unreadable authorization file is
     /// a hard error: the daemon refuses to start rather than fail open.
     pub async fn bind(opts: DaemonOptions) -> Result<Daemon> {
         let id = crate::identity::load_or_create_in(&opts.config_dir)?;
