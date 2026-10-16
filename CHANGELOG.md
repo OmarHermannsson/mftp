@@ -5,7 +5,29 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
-_Nothing user-facing yet._
+### Security
+- **Daemon authorization fails closed.** A malformed/unreadable `acl.toml` or
+  `authorized_devices` is a startup error (SIGHUP keeps the previous policy);
+  an existing-but-empty allowlist denies everyone instead of opening the
+  receiver. `daemon-trust` changes apply live and are refused when `acl.toml`
+  governs; status/list report the effective policy.
+- ACL `output_subdir`s must be distinct, non-nested, and not empty/`.`; ACL
+  keys are normalized like the TLS allowlist.
+- LAN discovery no longer pins an unauthenticated announcement's Device ID —
+  the receiver goes through TOFU (or `--trust-device`), and conflicting
+  answers for one name are an error.
+- HTTP dashboard: header timeout/size cap, connection cap, DNS-rebinding Host
+  check, warning when bound to a non-loopback address.
+- Control socket is 0600 in a 0700 dir and is never stolen from a live daemon.
+- Device identity: DeviceId always derived from the cert, key/cert mismatch and
+  partial identities are errors, keys kept at 0600, persist errors propagate.
+- At-rest encryption format v2 (`MFE2`): per-file keys, truncation and reorder
+  detection (library-level; not yet wired into the daemon).
+
+### Fixed
+- `-n 0`, `--chunk-size 0`/absurd sizes and negative/NaN `--tcp-below-rtt`
+  (CLI or config.toml) are rejected with a clear error instead of panicking.
+- `--help` no longer recommends `--fec` for lossy links.
 
 ## [0.2.2] — 2026-06-05
 
