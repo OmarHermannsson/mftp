@@ -26,7 +26,10 @@ fn make_file(dir: &std::path::Path, name: &str, size: usize) -> std::path::PathB
 #[tokio::test]
 async fn rendezvous_resolves_and_transfers() -> anyhow::Result<()> {
     // 1. Rendezvous broker.
-    let broker_srv = RendezvousServer::bind("127.0.0.1:0".parse()?).await?;
+    // Loopback candidates are refused by default; this single-host test opts in.
+    let broker_srv = RendezvousServer::bind("127.0.0.1:0".parse()?)
+        .await?
+        .allow_loopback_candidates(true);
     let broker = broker_srv.local_addr()?;
     tokio::spawn(async move {
         let _ = broker_srv.serve().await;
@@ -47,8 +50,9 @@ async fn rendezvous_resolves_and_transfers() -> anyhow::Result<()> {
     let recv_addr = server.local_addr;
     let recv_task = tokio::spawn(async move { server.accept_one().await });
 
-    // 3. Receiver registers at the broker and holds its presence open.
-    let mut presence = register(broker, &id.device_id, vec![recv_addr]).await?;
+    // 3. Receiver registers at the broker (signing the broker's challenge with
+    //    its identity key) and holds its presence open.
+    let mut presence = register(broker, &id, vec![recv_addr]).await?;
     let _presence_task = tokio::spawn(async move {
         // Drain offers so the presence connection stays alive during the test.
         let _ = presence.next_offer().await;
