@@ -363,14 +363,22 @@ pub fn peer_device_id(conn: &quinn::Connection) -> Option<String> {
 /// A bound TCP+TLS server, ready to accept incoming transfers.
 ///
 /// Uses the same self-signed-certificate / TOFU model as QUIC so the
-/// fingerprint can be shared across both transports.  Transfers are served
-/// sequentially (one at a time) — connection ordering is used to assign data
-/// streams without an extra protocol header, so a transfer owns the listener
-/// for its whole lifetime (data streams are also accepted mid-transfer for
-/// dynamic scaling) and two transfers cannot safely run concurrently without a
-/// protocol change.  To keep one idle or slow peer from wedging the server, the
-/// control-connection TLS handshake is bounded by [`TLS_HANDSHAKE_TIMEOUT`] and
-/// a failed or timed-out handshake is skipped.
+/// fingerprint can be shared across both transports.
+///
+/// [`TcpServer::serve`] handles transfers **concurrently**: every connection is
+/// TLS-handshaken on its own task and classified by its first frame — a
+/// `NegotiateRequest` opens a transfer (control connection), a v7
+/// `StreamHello` names the transfer a data connection belongs to, and the
+/// [`TcpStreamRouter`] hands it to that transfer. Pre-v7 senders send no
+/// `StreamHello`, so their data connections can only be matched by arrival:
+/// at most one such legacy transfer runs at a time. Data connections must come
+/// from the same IP as their control connection. Handshakes and the first
+/// frame are bounded by [`TLS_HANDSHAKE_TIMEOUT`] / [`HANDSHAKE_READ_TIMEOUT`],
+/// so idle peers can't wedge the server.
+///
+/// [`TcpServer::accept_one`] serves a single transfer that owns the listener
+/// (data connections are taken in arrival order), as the SSH one-shot server
+/// and tests use it.
 pub struct TcpServer {
     listener: Arc<TcpListener>,
     acceptor: Arc<TlsAcceptor>,
@@ -464,20 +472,29 @@ impl TcpServer {
         .await
     }
 
-    /// Accept and handle transfers sequentially, indefinitely.
+    /// Accept and handle transfers concurrently, indefinitely (see the type docs
+    /// for how data connections are routed to their transfer).
     pub async fn serve(self) -> Result<()> {
+        let router = Arc::new(TcpStreamRouter::default());
         loop {
-            let tls = self.accept_control().await?;
-            if let Err(e) = handle_tcp_connection(
-                tls,
-                Arc::clone(&self.listener),
-                Arc::clone(&self.acceptor),
-                self.output_dir.clone(),
-            )
-            .await
-            {
-                tracing::error!("transfer error: {e:#}");
-            }
+            let (raw, peer_addr) = match self.listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("TCP accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let acceptor = Arc::clone(&self.acceptor);
+            let router = Arc::clone(&router);
+            let output_dir = self.output_dir.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    serve_routed_tcp_connection(raw, peer_addr, acceptor, router, output_dir).await
+                {
+                    tracing::error!("TCP connection from {peer_addr}: {e:#}");
+                }
+            });
         }
     }
 }
@@ -763,14 +780,20 @@ async fn handle_quic_connection(
     let closer = conn.clone();
     let supersede: SupersedeFn =
         Arc::new(move || closer.close(0u32.into(), b"superseded by reconnect"));
-    let result = run_receive(ctrl_send, ctrl_recv, route, Some(supersede), move || {
-        let rx = rx.clone();
-        async move {
-            rx.recv()
-                .await
-                .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
-        }
-    })
+    let result = run_receive(
+        ctrl_send,
+        ctrl_recv,
+        route,
+        Some(supersede),
+        move |_transfer_id| {
+            let rx = rx.clone();
+            async move {
+                rx.recv()
+                    .await
+                    .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
+            }
+        },
+    )
     .await;
     feeders.abort_all();
     let mut ctrl_send = result?;
@@ -802,21 +825,250 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
-    run_receive(ctrl_send, ctrl_recv, output_dir.into(), None, move || {
-        let listener = Arc::clone(&listener);
-        let acceptor = Arc::clone(&acceptor);
-        async move {
-            let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
-            raw.set_nodelay(true)?;
-            let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
-                .await
-                .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
-                .context("TLS handshake on data stream")?;
-            Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
-        }
-    })
+    run_receive(
+        ctrl_send,
+        ctrl_recv,
+        output_dir.into(),
+        None,
+        move |_transfer_id| {
+            let listener = Arc::clone(&listener);
+            let acceptor = Arc::clone(&acceptor);
+            async move {
+                let (raw, _peer) = listener.accept().await.context("accept TCP data stream")?;
+                raw.set_nodelay(true)?;
+                let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
+                    .await
+                    .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
+                    .context("TLS handshake on data stream")?;
+                Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>)
+            }
+        },
+    )
     .await?;
     Ok(())
+}
+
+// ── Concurrent TCP: routing data connections to transfers ─────────────────────
+
+type DataStream = Box<dyn AsyncRead + Unpin + Send + 'static>;
+
+/// How long a classified data connection waits for its transfer to start
+/// accepting streams (the sender opens them right after `Ready`, a moment
+/// before the receiver registers).
+const TCP_ROUTE_WAIT: Duration = Duration::from_secs(10);
+
+/// Which transfer a TCP data connection belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TcpRouteKey {
+    /// v7+: named by the connection's `StreamHello`.
+    Transfer([u8; 16]),
+    /// Pre-v7 sender (no `StreamHello`): the single legacy transfer.
+    Legacy,
+}
+
+/// Registry of in-progress TCP transfers on a shared listener, mapping each
+/// to the channel its data connections are delivered on.
+#[derive(Default)]
+struct TcpStreamRouter {
+    routes: Mutex<HashMap<TcpRouteKey, (std::net::IpAddr, async_channel::Sender<DataStream>)>>,
+    changed: tokio::sync::Notify,
+}
+
+/// Unregisters a [`TcpStreamRouter`] route on drop.
+struct TcpRouteGuard {
+    router: Arc<TcpStreamRouter>,
+    key: TcpRouteKey,
+}
+
+impl Drop for TcpRouteGuard {
+    fn drop(&mut self) {
+        self.router
+            .routes
+            .lock()
+            .expect("tcp router mutex poisoned")
+            .remove(&self.key);
+        self.router.changed.notify_waiters();
+    }
+}
+
+impl TcpStreamRouter {
+    /// Start accepting data connections for `key` from `peer_ip`.
+    fn register(
+        self: &Arc<Self>,
+        key: TcpRouteKey,
+        peer_ip: std::net::IpAddr,
+    ) -> Result<(async_channel::Receiver<DataStream>, TcpRouteGuard)> {
+        let mut routes = self.routes.lock().expect("tcp router mutex poisoned");
+        if routes.contains_key(&key) {
+            bail!(match key {
+                TcpRouteKey::Legacy => {
+                    "another pre-v7 TCP transfer is already in progress on this receiver; \
+                     retry once it finishes (or upgrade the sender)"
+                }
+                TcpRouteKey::Transfer(_) => {
+                    "the same transfer is already in progress on this receiver"
+                }
+            });
+        }
+        let (tx, rx) = async_channel::unbounded();
+        routes.insert(key, (peer_ip, tx));
+        drop(routes);
+        self.changed.notify_waiters();
+        Ok((
+            rx,
+            TcpRouteGuard {
+                router: Arc::clone(self),
+                key,
+            },
+        ))
+    }
+
+    /// Hand a data connection to its transfer, waiting up to [`TCP_ROUTE_WAIT`]
+    /// for the transfer to register.
+    async fn deliver(
+        &self,
+        key: TcpRouteKey,
+        peer_ip: std::net::IpAddr,
+        stream: DataStream,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + TCP_ROUTE_WAIT;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let route = self
+                .routes
+                .lock()
+                .expect("tcp router mutex poisoned")
+                .get(&key)
+                .cloned();
+            if let Some((ip, tx)) = route {
+                if ip != peer_ip {
+                    bail!("data connection from {peer_ip} for a transfer controlled from {ip}");
+                }
+                return tx
+                    .send(stream)
+                    .await
+                    .map_err(|_| anyhow!("transfer ended before this data connection arrived"));
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                bail!("no transfer in progress for this data connection");
+            }
+        }
+    }
+}
+
+/// What a TCP connection on a shared listener turned out to be.
+enum TcpConnKind {
+    Control { legacy: bool },
+    Data(TcpRouteKey),
+}
+
+/// TLS-handshake one connection from the shared listener, classify it by its
+/// first frame and either run its transfer (control) or hand it to its
+/// transfer (data).
+async fn serve_routed_tcp_connection(
+    raw: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    acceptor: Arc<TlsAcceptor>,
+    router: Arc<TcpStreamRouter>,
+    output_dir: PathBuf,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    raw.set_nodelay(true)?;
+    let mut tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
+        .await
+        .map_err(|_| anyhow!("TLS handshake timed out"))?
+        .context("TLS handshake")?;
+
+    // Classify by the first frame's length: a NegotiateRequest and a
+    // StreamHello have fixed bincode sizes that no ChunkData frame can match.
+    let neg_len = bincode::serialized_size(&NegotiateRequest {
+        cpu_cores: 0,
+        protocol_version: 0,
+    })? as u32;
+    let hello_len = bincode::serialized_size(&crate::protocol::messages::StreamHello {
+        transfer_id: [0; 16],
+        stream_seq: 0,
+    })? as u32;
+    let mut prefix = vec![0u8; 4];
+    handshake_read("first frame", async {
+        tls.read_exact(&mut prefix)
+            .await
+            .context("read first frame")
+    })
+    .await?;
+    let len = u32::from_le_bytes(prefix[..4].try_into().expect("4 bytes"));
+    let kind = if len == neg_len || len == hello_len {
+        prefix.resize(4 + len as usize, 0);
+        handshake_read("first frame", async {
+            tls.read_exact(&mut prefix[4..])
+                .await
+                .context("read first frame")
+        })
+        .await?;
+        if len == neg_len {
+            let req: NegotiateRequest = bincode::deserialize(&prefix[4..])?;
+            TcpConnKind::Control {
+                legacy: !crate::protocol::messages::stream_hello_active(
+                    crate::protocol::messages::advertised_version(),
+                    req.protocol_version,
+                ),
+            }
+        } else {
+            let hello: crate::protocol::messages::StreamHello = bincode::deserialize(&prefix[4..])?;
+            TcpConnKind::Data(TcpRouteKey::Transfer(hello.transfer_id))
+        }
+    } else {
+        // Pre-v7 data connection: starts straight with a chunk frame.
+        TcpConnKind::Data(TcpRouteKey::Legacy)
+    };
+
+    let peer_ip = peer_addr.ip();
+    match kind {
+        TcpConnKind::Data(key) => {
+            // Re-prepend what we consumed: run_receive re-reads (and validates)
+            // the StreamHello itself.
+            let stream = std::io::Cursor::new(prefix).chain(tls);
+            router.deliver(key, peer_ip, Box::new(stream)).await
+        }
+        TcpConnKind::Control { legacy } => {
+            info!("TCP transfer from {peer_addr}");
+            let (ctrl_recv, ctrl_send) = tokio::io::split(tls);
+            let ctrl_recv = std::io::Cursor::new(prefix).chain(ctrl_recv);
+            let mut route: Option<(async_channel::Receiver<DataStream>, TcpRouteGuard)> = None;
+            run_receive(
+                ctrl_send,
+                ctrl_recv,
+                output_dir.into(),
+                None,
+                move |transfer_id| {
+                    let rx = match &route {
+                        Some((rx, _)) => Ok(rx.clone()),
+                        None => {
+                            let key = if legacy {
+                                TcpRouteKey::Legacy
+                            } else {
+                                TcpRouteKey::Transfer(transfer_id)
+                            };
+                            router.register(key, peer_ip).map(|(rx, guard)| {
+                                route = Some((rx.clone(), guard));
+                                rx
+                            })
+                        }
+                    };
+                    async move {
+                        rx?.recv()
+                            .await
+                            .map_err(|_| anyhow!("TCP data stream router closed"))
+                    }
+                },
+            )
+            .await?;
+            Ok(())
+        }
+    }
 }
 
 // ── FEC stripe accumulator ────────────────────────────────────────────────────
@@ -1159,7 +1411,8 @@ fn process_stripe(
 /// Core receive logic shared by both the QUIC and TCP paths.
 ///
 /// Handles the full negotiation → manifest → data transfer → verification flow.
-/// `accept_stream` is a factory called once per data stream; it must return a
+/// `accept_stream` is a factory called once per data stream (with the
+/// manifest's `transfer_id`, for transports that route streams by it); it must return a
 /// future that yields a readable stream (QUIC `RecvStream` or TCP+TLS stream).
 ///
 /// Returns the write half of the control stream so the QUIC caller can send
@@ -1174,7 +1427,7 @@ async fn run_receive<CW, CR, F, Fut>(
 where
     CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
     CR: tokio::io::AsyncRead + Unpin + Send + 'static,
-    F: FnMut() -> Fut,
+    F: FnMut([u8; 16]) -> Fut,
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
     let Route {
@@ -1367,7 +1620,7 @@ where
     let mut accept_tasks: JoinSet<Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> =
         JoinSet::new();
     for _ in 0..manifest.num_streams {
-        let fut = accept_stream();
+        let fut = accept_stream(manifest.transfer_id);
         accept_tasks.spawn(async move {
             tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut)
                 .await
@@ -1491,7 +1744,7 @@ where
                     }
                     let mut accepted = current_workers;
                     for _ in 0..new_count {
-                        let fut = accept_stream();
+                        let fut = accept_stream(manifest.transfer_id);
                         match tokio::time::timeout(DATA_STREAM_ACCEPT_TIMEOUT, fut).await {
                             Ok(Ok(stream)) => {
                                 let out_file = pt.out_file.clone();

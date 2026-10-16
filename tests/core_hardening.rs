@@ -75,3 +75,44 @@ async fn idle_tcp_connection_does_not_wedge_server() {
     let got = std::fs::read(recv_dir.path().join("after_idle.bin")).unwrap();
     assert_eq!(got, std::fs::read(&src).unwrap());
 }
+
+/// `TcpServer::serve` runs transfers concurrently: each data connection is
+/// routed to its transfer by its `StreamHello`, so two senders (several
+/// streams each) sharing one listener — plus an idle connection squatting on
+/// it — all complete with intact output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_serve_runs_transfers_concurrently() {
+    let src_dir = TempDir::new().unwrap();
+    let recv_dir = TempDir::new().unwrap();
+    let a = make_file(src_dir.path(), "conc_a.bin", 6 * 1024 * 1024 + 11);
+    let b = make_file(src_dir.path(), "conc_b.bin", 5 * 1024 * 1024 + 7);
+
+    let server = TcpServer::bind("127.0.0.1:0".parse().unwrap(), recv_dir.path().to_owned())
+        .await
+        .unwrap();
+    let addr = server.local_addr;
+    let fingerprint = server.fingerprint.clone();
+    let serve = tokio::spawn(server.serve());
+    let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let cfg = |fp: &str| SendConfig {
+        streams: Some(4),
+        ..tcp_config(fp.to_owned())
+    };
+    let (ra, rb) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(
+            sender::send(a.clone(), addr, cfg(&fingerprint)),
+            sender::send(b.clone(), addr, cfg(&fingerprint)),
+        )
+    })
+    .await
+    .expect("concurrent TCP transfers must not hang");
+    ra.expect("transfer a ok");
+    rb.expect("transfer b ok");
+    serve.abort();
+
+    for src in [&a, &b] {
+        let got = std::fs::read(recv_dir.path().join(src.file_name().unwrap())).unwrap();
+        assert_eq!(got, std::fs::read(src).unwrap());
+    }
+}

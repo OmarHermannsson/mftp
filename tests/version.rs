@@ -95,6 +95,30 @@ async fn transfers_complete_when_negotiated_down_to_v6() -> anyhow::Result<()> {
         assert_eq!(std::fs::read(&b)?, std::fs::read(got.join("b.bin"))?);
     }
 
+    // ── TCP via the concurrent `TcpServer::serve` (pre-v7 data connections carry
+    //    no StreamHello, so they take the legacy arrival-order route). ────────
+    {
+        let send_dir = TempDir::new()?;
+        let recv_dir = TempDir::new()?;
+        let src = make_file(send_dir.path(), "v6tcp.bin", 64 * 1024 * 9 + 5);
+        let server = mftp::transfer::receiver::TcpServer::bind(
+            "127.0.0.1:0".parse()?,
+            recv_dir.path().to_owned(),
+        )
+        .await?;
+        let addr = server.local_addr;
+        let mut cfg = send_config(server.fingerprint.clone(), false);
+        cfg.forced_transport = Some(mftp::transfer::sender::ForcedTransport::Tcp);
+        let serve = tokio::spawn(server.serve());
+        sender::send(src.clone(), addr, cfg).await?;
+        serve.abort();
+        assert_eq!(
+            std::fs::read(&src)?,
+            std::fs::read(recv_dir.path().join("v6tcp.bin"))?,
+            "TCP transfer completes at v6 through the concurrent server"
+        );
+    }
+
     test_hooks::force_local_version(None);
     Ok(())
 }
