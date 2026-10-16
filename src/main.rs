@@ -274,7 +274,8 @@ enum Command {
     },
     /// Run a zero-knowledge UDP relay: blindly forward QUIC datagrams to a
     /// receiver when hole punching fails. End-to-end TLS keeps the relay from
-    /// seeing file data. Senders aim `mftp send <file> <relay-addr>` at it.
+    /// seeing file data. Senders aim `mftp send <file> <relay-addr>` at it,
+    /// with the printed session token in `MFTP_RELAY_TOKEN`.
     Relay {
         /// Address to listen on for sender datagrams
         #[arg(default_value = "0.0.0.0:7780")]
@@ -602,6 +603,11 @@ async fn main() -> Result<()> {
             println!(
                 "relay listening on {} → forwarding to {to_addr}",
                 relay.local_addr()
+            );
+            println!(
+                "session token: {} (sender: export {}=<token>)",
+                relay.token_hex(),
+                mftp::reach::relay::TOKEN_ENV
             );
             relay.run().await
         }
