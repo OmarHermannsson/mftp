@@ -698,7 +698,9 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fp = cert_fingerprint(end_entity);
-        match load_known_host(self.server_addr) {
+        let known = load_known_host(self.server_addr)
+            .map_err(|e| rustls::Error::General(format!("{e:#}")))?;
+        match known {
             Some(known_fp) => {
                 if fp != known_fp {
                     return Err(rustls::Error::General(format!(
@@ -960,26 +962,67 @@ fn known_hosts_path() -> Option<PathBuf> {
 }
 
 /// Look up the stored fingerprint for `addr` in `~/.config/mftp/known_hosts`.
-fn load_known_host(addr: SocketAddr) -> Option<String> {
-    let path = known_hosts_path()?;
-    let content = std::fs::read_to_string(path).ok()?;
+///
+/// `Ok(None)` means "never seen" (no file, no `$HOME`, or no entry) and leads
+/// to a TOFU prompt.  Anything that makes the stored trust *unknowable* — an
+/// unreadable file, or a malformed entry for this very address — is an error,
+/// so a damaged file can never silently downgrade a pinned host back to
+/// first-use prompting.  See [`parse_known_host`].
+fn load_known_host(addr: SocketAddr) -> Result<Option<String>> {
+    let Some(path) = known_hosts_path() else {
+        return Ok(None);
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    parse_known_host(&content, addr)
+}
+
+/// Find `addr`'s fingerprint in known_hosts `content` (`<addr> <fp>` lines,
+/// any whitespace, `#` comments).
+///
+/// Malformed lines are handled consistently: a malformed line for **this**
+/// address (missing or non-hex fingerprint, extra fields) is an error; a
+/// malformed line for another address is skipped with a warning.  The first
+/// well-formed entry for the address wins.
+fn parse_known_host(content: &str, addr: SocketAddr) -> Result<Option<String>> {
     let key = addr.to_string();
-    for line in content.lines() {
+    for (i, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        let mut parts = line.splitn(2, ' ');
-        if parts.next()? == key {
-            return Some(parts.next()?.trim().to_owned());
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let well_formed = fields.len() == 2
+            && fields[1].len() == 64
+            && fields[1].bytes().all(|b| b.is_ascii_hexdigit());
+        if fields[0] != key {
+            if !well_formed {
+                tracing::warn!(
+                    "~/.config/mftp/known_hosts line {}: malformed entry — skipped",
+                    i + 1
+                );
+            }
+            continue;
         }
+        if !well_formed {
+            bail!(
+                "~/.config/mftp/known_hosts line {}: malformed entry for {key} \
+                 (expected `<addr> <64-hex fingerprint>`); fix or remove it",
+                i + 1
+            );
+        }
+        return Ok(Some(fields[1].to_ascii_lowercase()));
     }
-    None
+    Ok(None)
 }
 
 /// Append an `addr fingerprint` entry to `~/.config/mftp/known_hosts`.
 fn store_known_host(addr: SocketAddr, fp: &str) {
     let Some(path) = known_hosts_path() else {
+        tracing::warn!("$HOME is not set — not remembering the fingerprint for {addr}");
         return;
     };
     if let Some(parent) = path.parent() {
@@ -1000,8 +1043,12 @@ fn store_known_host(addr: SocketAddr, fp: &str) {
         .create(true)
         .append(true)
         .open(&path);
-    if let Ok(mut f) = file {
-        let _ = writeln!(f, "{addr} {fp}");
+    match file.and_then(|mut f| writeln!(f, "{addr} {fp}")) {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(
+            "could not record fingerprint for {addr} in {}: {e}",
+            path.display()
+        ),
     }
 }
 
@@ -1049,6 +1096,28 @@ mod tests {
         // Still rejects genuinely wrong input.
         assert!(PinnedFingerprintVerifier::new("deadbeef").is_err());
         assert!(PinnedFingerprintVerifier::new(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn known_host_parsing_is_strict_for_own_address() {
+        let addr: SocketAddr = "10.0.0.5:4433".parse().unwrap();
+        let fp = "AB".repeat(32);
+        // Tabs, comments, unrelated junk lines are fine; result is lowercased.
+        let ok = format!("# c\n10.0.0.9:1 garbage here\n10.0.0.5:4433\t{fp}\n");
+        assert_eq!(
+            parse_known_host(&ok, addr).unwrap(),
+            Some(fp.to_ascii_lowercase())
+        );
+        // No entry → None (TOFU prompt).
+        assert_eq!(parse_known_host("10.0.0.6:1 ab\n", addr).unwrap(), None);
+        // Address present but no / bad fingerprint → error, never a re-prompt.
+        for bad in [
+            "10.0.0.5:4433\n",
+            "10.0.0.5:4433 deadbeef\n",
+            &format!("10.0.0.5:4433 {fp} extra\n"),
+        ] {
+            assert!(parse_known_host(bad, addr).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
