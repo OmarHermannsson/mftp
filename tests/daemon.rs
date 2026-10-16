@@ -405,7 +405,8 @@ async fn daemon_open_mode_accepts_sender_without_identity() -> anyhow::Result<()
     Ok(())
 }
 
-/// A peer already at/over its ACL byte quota is rejected at connect time, while
+/// A peer already at/over its ACL byte quota is rejected at connect time, a
+/// transfer bigger than the remaining quota is refused after its manifest, and
 /// a peer under quota is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_enforces_acl_quota_at_connect() -> anyhow::Result<()> {
@@ -441,6 +442,21 @@ async fn daemon_enforces_acl_quota_at_connect() -> anyhow::Result<()> {
     )
     .await?;
     assert!(out.path().join("tenant/ok.bin").exists());
+
+    // Under quota now, but this transfer alone would overshoot it → refused
+    // once the manifest reveals its size.
+    let big = make_file(send_dir.path(), "big.bin", 2 * 1024 * 1024);
+    let too_big = sender::send(
+        big,
+        addr,
+        auth_send_config(fingerprint.clone(), sender_id.clone()),
+    )
+    .await;
+    assert!(
+        too_big.is_err(),
+        "transfer larger than remaining quota must be refused"
+    );
+    assert!(!out.path().join("tenant/big.bin").exists());
 
     // Fill the tenant dir past the quota → the next connection is refused.
     std::fs::write(out.path().join("tenant/filler.bin"), vec![0u8; 1024 * 1024])?;

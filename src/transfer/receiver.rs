@@ -254,7 +254,7 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("endpoint closed before any connection arrived"))?;
         let conn = incoming.await.context("connection setup failed")?;
         info!("connection from {}", conn.remote_address());
-        handle_quic_connection(conn, None, self.output_dir.clone()).await
+        handle_quic_connection(conn, None, self.output_dir.clone().into()).await
     }
 
     /// Accept one transfer, treating any additional connections that arrive
@@ -267,7 +267,12 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("endpoint closed before any connection arrived"))?;
         let conn = incoming.await.context("connection setup failed")?;
         info!("connection from {} (multipath)", conn.remote_address());
-        handle_quic_connection(conn, Some(self.endpoint.clone()), self.output_dir.clone()).await
+        handle_quic_connection(
+            conn,
+            Some(self.endpoint.clone()),
+            self.output_dir.clone().into(),
+        )
+        .await
     }
 
     /// Accept and handle transfers indefinitely (QUIC only; use `listen` for
@@ -279,7 +284,8 @@ impl Server {
     }
 
     /// Like [`Server::serve`], but `router` maps each connection's peer DeviceId
-    /// (extracted from its client certificate under mutual-TLS auth) to the
+    /// to a [`Route`] (or plain output directory)
+    /// (extracted from its client certificate under mutual-TLS auth): the
     /// output directory its files should land in — the basis for per-peer tenant
     /// isolation (M8 ACLs). `router` receives `None` when the peer presented no
     /// usable identity.
@@ -291,9 +297,10 @@ impl Server {
     /// one of many *concurrent* transfers needs a transfer_id→path registry and
     /// is deliberately out of scope for the shared accept loop (mixing the two
     /// is what let an unrelated connection corrupt an in-flight transfer).
-    pub async fn serve_with_router<F>(self, router: F) -> Result<()>
+    pub async fn serve_with_router<F, R>(self, router: F) -> Result<()>
     where
-        F: Fn(Option<&str>) -> Result<PathBuf> + Send + Sync + 'static,
+        F: Fn(Option<&str>) -> Result<R> + Send + Sync + 'static,
+        R: Into<Route>,
     {
         let router = std::sync::Arc::new(router);
         let completed = self.completed.clone();
@@ -305,8 +312,8 @@ impl Server {
                     Ok(conn) => {
                         info!("connection from {}", conn.remote_address());
                         let peer = peer_device_id(&conn);
-                        let out = match router(peer.as_deref()) {
-                            Ok(d) => d,
+                        let route: Route = match router(peer.as_deref()) {
+                            Ok(r) => r.into(),
                             Err(e) => {
                                 tracing::error!("rejecting connection: {e:#}");
                                 conn.close(1u32.into(), b"not authorized");
@@ -316,7 +323,7 @@ impl Server {
                         // Single connection per transfer (endpoint = None): no
                         // cross-connection feeder, so a second sender can never
                         // be absorbed into this transfer.
-                        match handle_quic_connection(conn, None, out).await {
+                        match handle_quic_connection(conn, None, route).await {
                             Ok(()) => {
                                 // Count only genuine completions (handle_quic_connection
                                 // returns Ok after the whole-file hash verifies and the
@@ -676,7 +683,7 @@ async fn drain_uni_streams(
 async fn handle_quic_connection(
     conn: quinn::Connection,
     endpoint: Option<quinn::Endpoint>,
-    output_dir: PathBuf,
+    route: Route,
 ) -> Result<()> {
     let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
         Ok(s) => s,
@@ -730,20 +737,14 @@ async fn handle_quic_connection(
     let closer = conn.clone();
     let supersede: SupersedeFn =
         Arc::new(move || closer.close(0u32.into(), b"superseded by reconnect"));
-    let result = run_receive(
-        ctrl_send,
-        ctrl_recv,
-        output_dir,
-        Some(supersede),
-        move || {
-            let rx = rx.clone();
-            async move {
-                rx.recv()
-                    .await
-                    .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
-            }
-        },
-    )
+    let result = run_receive(ctrl_send, ctrl_recv, route, Some(supersede), move || {
+        let rx = rx.clone();
+        async move {
+            rx.recv()
+                .await
+                .map_err(|_| anyhow!("data stream source closed before all streams arrived"))
+        }
+    })
     .await;
     feeders.abort_all();
     let mut ctrl_send = result?;
@@ -775,7 +776,7 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
-    run_receive(ctrl_send, ctrl_recv, output_dir, None, move || {
+    run_receive(ctrl_send, ctrl_recv, output_dir.into(), None, move || {
         let listener = Arc::clone(&listener);
         let acceptor = Arc::clone(&acceptor);
         async move {
@@ -1140,7 +1141,7 @@ fn process_stripe(
 async fn run_receive<CW, CR, F, Fut>(
     mut ctrl_send: CW,
     mut ctrl_recv: CR,
-    output_dir: PathBuf,
+    route: Route,
     supersede: Option<SupersedeFn>,
     mut accept_stream: F,
 ) -> Result<CW>
@@ -1150,6 +1151,10 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Box<dyn AsyncRead + Unpin + Send + 'static>>> + Send + 'static,
 {
+    let Route {
+        output_dir,
+        max_new_bytes,
+    } = route;
     // The opening flight (NegotiateRequest, manifest, DirEntries) is sent by the
     // sender immediately after connecting; bound each read so a peer that
     // connects and goes silent (or stalls mid-frame after claiming a large
@@ -1218,6 +1223,25 @@ where
         files = ?entry_count,
         "transfer started"
     );
+
+    // Admission: refuse a transfer that would push the peer past its quota.
+    if let Some(limit) = max_new_bytes {
+        let incoming = new_bytes_needed(&output_dir, &manifest, dir_entries.as_deref());
+        if incoming > limit {
+            let e = anyhow!(
+                "transfer needs {incoming} new bytes but only {limit} remain in this peer's quota"
+            );
+            let _ = framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Error {
+                    message: format!("{e:#}"),
+                    fatal: true,
+                },
+            )
+            .await;
+            return Err(e);
+        }
+    }
 
     // Refuse a second concurrent transfer into the same destination: two
     // writers (each with its own resume state) would interleave chunks
@@ -1947,6 +1971,49 @@ impl ConcatLayout {
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Where a routed connection's files land, and how many new bytes it may add.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub output_dir: PathBuf,
+    /// Remaining byte budget (e.g. a tenant quota minus current usage); a
+    /// transfer needing more new bytes than this is refused after its manifest
+    /// is read. `None` = unlimited.
+    pub max_new_bytes: Option<u64>,
+}
+
+impl From<PathBuf> for Route {
+    fn from(output_dir: PathBuf) -> Self {
+        Route {
+            output_dir,
+            max_new_bytes: None,
+        }
+    }
+}
+
+/// Bytes a transfer will add on disk beyond what its destination already holds
+/// (a resumed transfer's preallocated file is already counted as used).
+fn new_bytes_needed(
+    output_dir: &std::path::Path,
+    manifest: &TransferManifest,
+    dir_entries: Option<&[FileEntry]>,
+) -> u64 {
+    let existing = |p: std::path::PathBuf| {
+        std::fs::symlink_metadata(p)
+            .ok()
+            .filter(|m| m.is_file())
+            .map_or(0, |m| m.len())
+    };
+    let root = output_dir.join(&manifest.file_name);
+    match dir_entries {
+        Some(entries) => entries
+            .iter()
+            .filter(|e| matches!(e.kind, FileKind::File))
+            .map(|e| e.size.saturating_sub(existing(root.join(&e.path))))
+            .fold(0u64, u64::saturating_add),
+        None => manifest.file_size.saturating_sub(existing(root)),
+    }
+}
 
 /// Closes the connection behind an in-progress transfer so a reconnecting
 /// sender can take over its destination.

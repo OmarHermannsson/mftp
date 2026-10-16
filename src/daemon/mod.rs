@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::protocol::framing;
+use crate::transfer::receiver::Route;
 
 /// A request from a CLI client to the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,23 +601,26 @@ impl Daemon {
                 Ok(Some((device.to_owned(), dir, quota)))
             })?;
             let Some((device, dir, quota)) = routed else {
-                return Ok(output_root.clone());
+                return Ok(Route::from(output_root.clone()));
             };
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("create tenant dir {}", dir.display()))?;
-            // Enforce the peer's byte quota against its current on-disk usage.
-            // This rejects a peer already at/over quota at connect time
-            // (bounding its total to ~quota + one in-flight transfer). The
-            // incoming transfer's size is unknown here: the router runs before
-            // the manifest is read, and the receiver exposes no post-manifest
-            // admission hook yet.
+            // Enforce the peer's byte quota: reject a peer already at/over it
+            // here, and hand the receiver the remaining budget so a transfer
+            // larger than that is refused once its manifest (size) is known.
+            // Concurrent transfers from one peer each see the same budget.
+            let mut max_new_bytes = None;
             if let Some(limit) = quota {
                 let used = run_blocking(|| dir_size_bytes(&dir));
                 if used >= limit {
                     anyhow::bail!("{device} is at/over its quota ({used} of {limit} bytes used)");
                 }
+                max_new_bytes = Some(limit - used);
             }
-            Ok(dir)
+            Ok(Route {
+                output_dir: dir,
+                max_new_bytes,
+            })
         });
 
         let control_fut = serve_control(control, Arc::clone(&state));
