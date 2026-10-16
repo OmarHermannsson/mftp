@@ -1209,6 +1209,24 @@ where
         "transfer started"
     );
 
+    // Refuse a second concurrent transfer into the same destination: two
+    // writers (each with its own resume state) would interleave chunks
+    // undetected.  Held until this function returns.
+    let _dest_guard = match claim_destination(&output_dir, &manifest.file_name) {
+        Ok(g) => g,
+        Err(e) => {
+            let _ = framing::send_message(
+                &mut ctrl_send,
+                &ReceiverMessage::Error {
+                    message: format!("{e:#}"),
+                    fatal: true,
+                },
+            )
+            .await;
+            return Err(e);
+        }
+    };
+
     let pt = match prepare_transfer(&manifest, dir_entries.as_deref(), &output_dir) {
         Ok(pt) => pt,
         Err(e) => {
@@ -1822,6 +1840,44 @@ impl ConcatLayout {
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Destinations (`output_dir/file_name`) with a transfer in progress in this
+/// process.
+static ACTIVE_DESTINATIONS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// Releases a [`claim_destination`] registration on drop.
+struct DestinationGuard(PathBuf);
+
+impl Drop for DestinationGuard {
+    fn drop(&mut self) {
+        if let Some(set) = ACTIVE_DESTINATIONS.get() {
+            set.lock()
+                .expect("destination registry mutex poisoned")
+                .remove(&self.0);
+        }
+    }
+}
+
+/// Register `output_dir/file_name` as the target of an in-progress transfer,
+/// failing if another transfer in this process already writes there.
+///
+/// The key uses the canonicalised output directory so different spellings of
+/// the same directory (relative path, trailing `.`, symlinked parent) collide.
+fn claim_destination(output_dir: &std::path::Path, file_name: &str) -> Result<DestinationGuard> {
+    let dir = std::fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
+    let key = dir.join(file_name);
+    let set = ACTIVE_DESTINATIONS.get_or_init(Default::default);
+    let mut g = set.lock().expect("destination registry mutex poisoned");
+    if !g.insert(key.clone()) {
+        bail!(
+            "another transfer to {} is already in progress on this receiver; \
+             retry once it finishes",
+            key.display()
+        );
+    }
+    Ok(DestinationGuard(key))
+}
 
 /// Prepared state for a transfer: output target, resume state, progress bar,
 /// and the resume bitvector to include in the Ready message.
@@ -3244,6 +3300,21 @@ mod tests {
         let got = std::fs::read(&p).unwrap();
         assert_eq!(got.len(), 8192);
         assert!(got[..4096].iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn concurrent_claims_on_same_destination_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = claim_destination(dir.path(), "same.bin").unwrap();
+        // Same target, different spelling of the directory.
+        let alias = dir.path().join(".");
+        assert!(claim_destination(&alias, "same.bin").is_err());
+        // A different file in the same directory is fine.
+        let other = claim_destination(dir.path(), "other.bin").unwrap();
+        drop(g);
+        // Released on drop.
+        let _again = claim_destination(dir.path(), "same.bin").unwrap();
+        drop(other);
     }
 
     // ── Peer-supplied repair chunks ───────────────────────────────────────────
