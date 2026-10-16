@@ -18,13 +18,23 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::service::acl::Acl;
 use crate::service::queue::Queue;
+
+/// The daemon's live authorization state, as shown on the dashboard.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuthView {
+    pub enforced: bool,
+    pub authorized_count: usize,
+}
 
 /// State the HTTP surface reports on.
 pub struct HttpState {
     pub config_dir: PathBuf,
     pub listening_on: String,
+    /// Snapshot of the *applied* authorization policy (what the TLS verifier is
+    /// actually enforcing), rather than a fresh — possibly unparseable — read of
+    /// the files on disk.
+    pub auth: Arc<dyn Fn() -> AuthView + Send + Sync>,
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
@@ -113,13 +123,7 @@ fn route(path: &str, state: &HttpState) -> (&'static str, &'static str, String) 
 }
 
 fn status_json(state: &HttpState) -> String {
-    let acl = Acl::load(&state.config_dir).unwrap_or_default();
-    let authorized = crate::identity::load_authorized_in(&state.config_dir);
-    let auth_count = if acl.is_empty() {
-        authorized.len()
-    } else {
-        acl.authorized_ids().len()
-    };
+    let auth = (state.auth)();
     let q = Queue::load(&state.config_dir).unwrap_or_default();
     let queued = q
         .jobs()
@@ -133,8 +137,8 @@ fn status_json(state: &HttpState) -> String {
         .count();
     serde_json::json!({
         "listening_on": state.listening_on,
-        "auth_enforced": auth_count > 0,
-        "authorized_count": auth_count,
+        "auth_enforced": auth.enforced,
+        "authorized_count": auth.authorized_count,
         "queued": queued,
         "active": active,
     })
@@ -174,6 +178,10 @@ mod tests {
         let state = Arc::new(HttpState {
             config_dir: dir.path().to_owned(),
             listening_on: "127.0.0.1:7777".into(),
+            auth: Arc::new(|| AuthView {
+                enforced: true,
+                authorized_count: 3,
+            }),
         });
         tokio::spawn(async move {
             let _ = serve(listener, state).await;
@@ -182,6 +190,8 @@ mod tests {
         let status = http_get(addr, "/status").await;
         assert!(status.contains("200 OK"));
         assert!(status.contains("\"listening_on\""));
+        assert!(status.contains("\"auth_enforced\":true"));
+        assert!(status.contains("\"authorized_count\":3"));
 
         let queue = http_get(addr, "/queue").await;
         assert!(queue.contains("a.bin"), "queue JSON lists the job");

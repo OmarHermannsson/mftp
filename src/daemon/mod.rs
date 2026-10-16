@@ -65,6 +65,83 @@ pub enum DaemonResponse {
     },
 }
 
+/// Where the daemon's effective authorized-device set comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthSource {
+    /// Neither `acl.toml` nor `authorized_devices` exists: any sender may
+    /// connect (classic receiver behaviour).
+    Open,
+    /// The plain `authorized_devices` allowlist (M4).
+    Allowlist,
+    /// The per-peer `acl.toml` policy (M8).
+    Acl,
+}
+
+/// The effective authorization policy, loaded from the config dir in one pass.
+///
+/// **Fail-closed rules**: a malformed or unreadable `acl.toml` /
+/// `authorized_devices` is an error (never "empty → open"), and an
+/// authorization file that *exists* keeps the daemon enforcing even when it
+/// lists no devices — removing the last device denies everyone instead of
+/// silently re-opening the receiver. Open mode requires that neither file
+/// exists.
+#[derive(Debug, Clone)]
+pub struct AuthPolicy {
+    pub acl: crate::service::acl::Acl,
+    /// Effective authorized DeviceIds (normalized, sorted).
+    pub authorized: Vec<String>,
+    pub source: AuthSource,
+}
+
+impl AuthPolicy {
+    /// Load the policy from `config_dir`: the ACL's peers if `acl.toml` has any,
+    /// else the `authorized_devices` allowlist, else open mode.
+    pub fn load(config_dir: &Path) -> Result<AuthPolicy> {
+        let acl = crate::service::acl::Acl::load(config_dir)?;
+        if !acl.is_empty() {
+            let authorized = acl.authorized_ids();
+            return Ok(AuthPolicy {
+                acl,
+                authorized,
+                source: AuthSource::Acl,
+            });
+        }
+        let acl_file_exists = config_dir.join("acl.toml").symlink_metadata().is_ok();
+        let (mut authorized, source) = match crate::identity::load_authorized_opt_in(config_dir)? {
+            Some(ids) => (ids, AuthSource::Allowlist),
+            None if acl_file_exists => (Vec::new(), AuthSource::Acl),
+            None => (Vec::new(), AuthSource::Open),
+        };
+        authorized.sort();
+        authorized.dedup();
+        Ok(AuthPolicy {
+            acl,
+            authorized,
+            source,
+        })
+    }
+
+    /// Whether mutual-TLS DeviceId auth is enforced.
+    pub fn enforced(&self) -> bool {
+        self.source != AuthSource::Open
+    }
+
+    /// The id set handed to the TLS verifier. The verifier treats an empty set
+    /// as *open*, so an enforcing policy with no devices is expressed as a
+    /// sentinel that no real (hex) DeviceId can ever match — deny-all.
+    fn verifier_ids(&self) -> Vec<String> {
+        if self.enforced() && self.authorized.is_empty() {
+            vec![DENY_ALL_SENTINEL.to_string()]
+        } else {
+            self.authorized.clone()
+        }
+    }
+}
+
+/// Allowlist entry that matches no DeviceId (DeviceIds are 64 hex chars), used
+/// to keep the verifier enforcing when the authorized set is empty.
+const DENY_ALL_SENTINEL: &str = "!deny-all";
+
 /// Shared daemon state behind the control socket.
 pub struct DaemonState {
     /// Config directory holding identity + authorized_devices.
@@ -75,25 +152,70 @@ pub struct DaemonState {
     /// receiver (see [`crate::transfer::receiver::Server::count_completions_into`]),
     /// which increments it as transfers complete.
     pub transfers_completed: Arc<AtomicU64>,
+    /// Live authorized-device set the TLS verifier consults.
+    allowlist: crate::net::connection::ReloadableAllowlist,
+    /// Live per-peer routing/quota policy the connection router consults.
+    acl: crate::service::acl::ReloadableAcl,
+    /// The currently applied policy's source + effective device set.
+    applied: std::sync::RwLock<(AuthSource, Vec<String>)>,
 }
 
 impl DaemonState {
-    pub fn new(config_dir: PathBuf, listening_on: String) -> Self {
-        Self::with_counter(config_dir, listening_on, Arc::new(AtomicU64::new(0)))
+    /// Load the authorization policy from `config_dir` (a malformed/unreadable
+    /// policy is an error) and build the live allowlist + ACL handles from it.
+    pub fn load(config_dir: PathBuf, listening_on: String) -> Result<Self> {
+        Self::load_with_counter(config_dir, listening_on, Arc::new(AtomicU64::new(0)))
     }
 
-    /// Like [`new`](Self::new), but shares an existing completed-transfer counter
-    /// (so the network receiver and the Status reply observe the same value).
-    pub fn with_counter(
+    /// Like [`load`](Self::load), but shares an existing completed-transfer
+    /// counter (so the network receiver and the Status reply observe the same
+    /// value).
+    pub fn load_with_counter(
         config_dir: PathBuf,
         listening_on: String,
         transfers_completed: Arc<AtomicU64>,
-    ) -> Self {
-        DaemonState {
+    ) -> Result<Self> {
+        let policy = AuthPolicy::load(&config_dir)?;
+        Ok(DaemonState {
             config_dir,
             listening_on,
             transfers_completed,
-        }
+            allowlist: crate::net::connection::ReloadableAllowlist::new(policy.verifier_ids()),
+            acl: crate::service::acl::ReloadableAcl::new(policy.acl.clone()),
+            applied: std::sync::RwLock::new((policy.source, policy.authorized)),
+        })
+    }
+
+    /// Re-read the policy from disk and swap it into the live verifier + router.
+    /// On a load error the previous policy stays in force and the error is
+    /// returned. Returns the new authorized count.
+    pub fn reload(&self) -> Result<usize> {
+        let policy = AuthPolicy::load(&self.config_dir)?;
+        let n = policy.authorized.len();
+        self.allowlist.replace(policy.verifier_ids());
+        self.acl.replace(policy.acl);
+        *self.applied.write().expect("auth state lock poisoned") =
+            (policy.source, policy.authorized);
+        Ok(n)
+    }
+
+    /// Source of the currently applied authorization policy.
+    pub fn auth_source(&self) -> AuthSource {
+        self.applied.read().expect("auth state lock poisoned").0
+    }
+
+    /// The currently applied effective authorized DeviceIds.
+    pub fn authorized_devices(&self) -> Vec<String> {
+        self.applied
+            .read()
+            .expect("auth state lock poisoned")
+            .1
+            .clone()
+    }
+
+    /// Whether the live TLS verifier is enforcing DeviceId auth.
+    pub fn auth_enforced(&self) -> bool {
+        !self.allowlist.is_empty()
     }
 }
 
@@ -120,8 +242,11 @@ fn handle_request(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
                 message: format!("identity: {e:#}"),
             },
         },
-        DaemonRequest::ListTrust => DaemonResponse::Trust {
-            devices: crate::identity::load_authorized_in(&state.config_dir),
+        DaemonRequest::ListTrust => match crate::identity::load_authorized_in(&state.config_dir) {
+            Ok(devices) => DaemonResponse::Trust { devices },
+            Err(e) => DaemonResponse::Error {
+                message: format!("{e:#}"),
+            },
         },
         DaemonRequest::AddTrust { device_id } => {
             match crate::identity::add_authorized_in(&state.config_dir, &device_id) {
@@ -139,15 +264,12 @@ fn handle_request(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
                 },
             }
         }
-        DaemonRequest::Status => {
-            let authorized = crate::identity::load_authorized_in(&state.config_dir);
-            DaemonResponse::Status {
-                listening_on: state.listening_on.clone(),
-                auth_enforced: !authorized.is_empty(),
-                authorized_count: authorized.len(),
-                transfers_completed: state.transfers_completed.load(Ordering::Relaxed),
-            }
-        }
+        DaemonRequest::Status => DaemonResponse::Status {
+            listening_on: state.listening_on.clone(),
+            auth_enforced: state.auth_enforced(),
+            authorized_count: state.authorized_devices().len(),
+            transfers_completed: state.transfers_completed.load(Ordering::Relaxed),
+        },
     }
 }
 
@@ -218,21 +340,13 @@ pub struct DaemonOptions {
 pub struct Daemon {
     server: crate::transfer::receiver::Server,
     control: UnixListener,
+    /// Shared state, including the live allowlist + ACL that SIGHUP reloads.
     state: Arc<DaemonState>,
-    /// Live per-peer routing/quota policy; reloaded on SIGHUP alongside the
-    /// allowlist.
-    acl: crate::service::acl::ReloadableAcl,
     output_dir: PathBuf,
     socket_path: PathBuf,
-    /// Config dir, re-read on SIGHUP to refresh the live allowlist.
-    config_dir: PathBuf,
-    /// Live authorized-device set the TLS verifier consults; reloaded on SIGHUP.
-    allowlist: crate::net::connection::ReloadableAllowlist,
     device_id: String,
     fingerprint: String,
     local_addr: std::net::SocketAddr,
-    auth_enforced: bool,
-    authorized_count: usize,
     /// Real address the HTTP dashboard bound to, if enabled.
     http_addr: Option<std::net::SocketAddr>,
     /// Whether the LAN discovery responder came up.
@@ -245,42 +359,46 @@ impl Daemon {
     /// Bind the network receiver, control socket, and optional HTTP/discovery,
     /// using the persistent device identity in `opts.config_dir`.
     ///
-    /// When the config dir's authorized set (acl.toml peers, else
-    /// authorized_devices) is non-empty, mutual-TLS DeviceId auth is enforced
-    /// and only QUIC is served (the TCP path does not present client certs, so
-    /// serving it under auth would be a bypass).
+    /// When an authorization file exists (acl.toml or authorized_devices — see
+    /// [`AuthPolicy`]), mutual-TLS DeviceId auth is enforced and only QUIC is
+    /// served (the TCP path does not present client certs, so serving it under
+    /// auth would be a bypass). A malformed or unreadable authorization file is
+    /// a hard error: the daemon refuses to start rather than fail open.
     pub async fn bind(opts: DaemonOptions) -> Result<Daemon> {
         let id = crate::identity::load_or_create_in(&opts.config_dir)?;
 
         // M8: an ACL (acl.toml), if present, supplies the authorized peers and
         // their per-tenant output dirs/quotas. Otherwise fall back to the M4
         // plain allowlist (authorized_devices).
-        let (acl, authorized) = load_acl_and_authorized(&opts.config_dir);
-        let auth_enforced = !authorized.is_empty();
-        let authorized_count = authorized.len();
-
+        //
         // The verifier reads the allowlist and the router reads the ACL on every
         // connection, so a SIGHUP reload (see `serve`) swaps both in place and
         // takes effect for subsequent connections — new trust *and* new per-peer
-        // routing/quotas — without rebinding.
-        let allowlist = crate::net::connection::ReloadableAllowlist::new(authorized);
-        let acl = crate::service::acl::ReloadableAcl::new(acl);
+        // routing/quotas — without rebinding. One counter is shared by the
+        // network receiver (which increments it per completed transfer) and
+        // DaemonState (which reports it in Status); `listening_on` is filled in
+        // once the endpoint is bound.
+        let completed = Arc::new(AtomicU64::new(0));
+        let mut state = DaemonState::load_with_counter(
+            opts.config_dir.clone(),
+            String::new(),
+            Arc::clone(&completed),
+        )
+        .context("load daemon authorization policy")?;
 
         let key = crate::net::connection::make_private_key(id.key_bytes.clone())?;
-        // One counter shared by the network receiver (which increments it per
-        // completed transfer) and DaemonState (which reports it in Status).
-        let completed = Arc::new(AtomicU64::new(0));
         let server = crate::transfer::receiver::Server::bind_with_reloadable_auth(
             opts.bind,
             opts.output_dir.clone(),
             id.cert.clone(),
             key,
             id.fingerprint.clone(),
-            allowlist.clone(),
+            state.allowlist.clone(),
         )?
-        .count_completions_into(Arc::clone(&completed));
+        .count_completions_into(completed);
         let local_addr = server.local_addr;
         let listening_on = local_addr.to_string();
+        state.listening_on = listening_on.clone();
 
         let mut background = Vec::new();
 
@@ -305,11 +423,7 @@ impl Daemon {
         }
 
         let control = bind_control_socket(&opts.socket_path)?;
-        let state = Arc::new(DaemonState::with_counter(
-            opts.config_dir.clone(),
-            listening_on.clone(),
-            completed,
-        ));
+        let state = Arc::new(state);
 
         // M8: optional HTTP status API + Web UI dashboard.
         let mut http_addr = None;
@@ -318,9 +432,14 @@ impl Daemon {
                 .await
                 .with_context(|| format!("bind HTTP dashboard on {addr}"))?;
             http_addr = Some(http_listener.local_addr()?);
+            let auth_state = Arc::clone(&state);
             let http_state = Arc::new(crate::service::http::HttpState {
                 config_dir: opts.config_dir.clone(),
                 listening_on: listening_on.clone(),
+                auth: Arc::new(move || crate::service::http::AuthView {
+                    enforced: auth_state.auth_enforced(),
+                    authorized_count: auth_state.authorized_devices().len(),
+                }),
             });
             background.push(tokio::spawn(async move {
                 let _ = crate::service::http::serve(http_listener, http_state).await;
@@ -331,16 +450,11 @@ impl Daemon {
             server,
             control,
             state,
-            acl,
             output_dir: opts.output_dir,
             socket_path: opts.socket_path,
-            config_dir: opts.config_dir,
-            allowlist,
             device_id: id.device_id,
             fingerprint: id.fingerprint,
             local_addr,
-            auth_enforced,
-            authorized_count,
             http_addr,
             announced,
             background,
@@ -374,9 +488,7 @@ impl Daemon {
     /// programmatically (the production daemon drives it from SIGHUP instead).
     pub fn reloader(&self) -> Reloader {
         Reloader {
-            config_dir: self.config_dir.clone(),
-            acl: self.acl.clone(),
-            allowlist: self.allowlist.clone(),
+            state: Arc::clone(&self.state),
         }
     }
 
@@ -394,11 +506,8 @@ impl Daemon {
             server,
             control,
             state,
-            acl,
             output_dir,
             socket_path,
-            config_dir,
-            allowlist,
             background,
             ..
         } = self;
@@ -407,7 +516,7 @@ impl Daemon {
         // land in its own subdir (tenant isolation); without one, the shared root.
         // The router reads the *live* ACL on every connection, so a SIGHUP reload
         // changes routing/quotas for subsequent transfers.
-        let acl_for_router = acl.clone();
+        let acl_for_router = state.acl.clone();
         let output_root = output_dir.clone();
         let serve_fut = server.serve_with_router(move |peer| {
             acl_for_router.with(|acl| {
@@ -428,7 +537,7 @@ impl Daemon {
             })
         });
 
-        let control_fut = serve_control(control, state);
+        let control_fut = serve_control(control, Arc::clone(&state));
         tokio::pin!(serve_fut);
         tokio::pin!(control_fut);
         tokio::pin!(shutdown);
@@ -445,10 +554,14 @@ impl Daemon {
                 r = &mut serve_fut => break r,
                 r = &mut control_fut => break r,
                 _ = &mut shutdown => break Ok(()),
-                _ = wait_for_sighup(&mut sighup) => {
-                    let n = apply_reload(&config_dir, &acl, &allowlist);
-                    tracing::info!("SIGHUP: reloaded {n} authorized device(s) + ACL");
-                }
+                _ = wait_for_sighup(&mut sighup) => match state.reload() {
+                    Ok(n) => tracing::info!("SIGHUP: reloaded {n} authorized device(s) + ACL"),
+                    // Fail closed: a broken edit must not drop (or open) the
+                    // authorization currently in force.
+                    Err(e) => tracing::error!(
+                        "SIGHUP: reload failed, keeping the previous authorization config: {e:#}"
+                    ),
+                },
             }
         };
 
@@ -465,43 +578,16 @@ impl Daemon {
 /// A handle for reloading the daemon's authorized-device set and ACL from disk
 /// into the running receiver (what SIGHUP does).  Obtain via [`Daemon::reloader`].
 pub struct Reloader {
-    config_dir: PathBuf,
-    acl: crate::service::acl::ReloadableAcl,
-    allowlist: crate::net::connection::ReloadableAllowlist,
+    state: Arc<DaemonState>,
 }
 
 impl Reloader {
     /// Re-read the authorized set + ACL from disk and apply both to the running
-    /// receiver; returns the new authorized count.
-    pub fn reload(&self) -> usize {
-        apply_reload(&self.config_dir, &self.acl, &self.allowlist)
+    /// receiver; returns the new authorized count. On error (malformed or
+    /// unreadable policy) the previous policy stays in force.
+    pub fn reload(&self) -> Result<usize> {
+        self.state.reload()
     }
-}
-
-/// Load the ACL and the derived authorized set from disk in one pass: the ACL's
-/// peers if `acl.toml` has any, else the plain `authorized_devices` allowlist.
-fn load_acl_and_authorized(config_dir: &Path) -> (crate::service::acl::Acl, Vec<String>) {
-    let acl = crate::service::acl::Acl::load(config_dir).unwrap_or_default();
-    let authorized = if acl.is_empty() {
-        crate::identity::load_authorized_in(config_dir)
-    } else {
-        acl.authorized_ids()
-    };
-    (acl, authorized)
-}
-
-/// Reload the authorized set + ACL from disk and swap both live handles in place;
-/// returns the new authorized count. Shared by SIGHUP and [`Reloader::reload`].
-fn apply_reload(
-    config_dir: &Path,
-    acl: &crate::service::acl::ReloadableAcl,
-    allowlist: &crate::net::connection::ReloadableAllowlist,
-) -> usize {
-    let (new_acl, authorized) = load_acl_and_authorized(config_dir);
-    let n = authorized.len();
-    allowlist.replace(authorized);
-    acl.replace(new_acl);
-    n
 }
 
 /// Await the next SIGHUP, or never (if the handler could not be registered).
@@ -538,10 +624,6 @@ pub async fn run(
     let config_dir =
         crate::identity::config_dir().context("cannot locate config dir ($HOME unset)")?;
 
-    let acl_present = !crate::service::acl::Acl::load(&config_dir)
-        .unwrap_or_default()
-        .is_empty();
-
     let daemon = Daemon::bind(DaemonOptions {
         bind,
         output_dir,
@@ -555,12 +637,20 @@ pub async fn run(
     println!("mftpd listening on {} (QUIC)", daemon.local_addr());
     println!("Device ID: {}", daemon.device_id());
     println!("Fingerprint: {}", daemon.fingerprint());
-    if daemon.auth_enforced {
-        let mode = if acl_present { "ACL" } else { "allowlist" };
-        println!(
-            "Identity auth: ENFORCED via {mode} ({} authorized device(s))",
-            daemon.authorized_count
-        );
+    let state = daemon.state();
+    if state.auth_enforced() {
+        let mode = match state.auth_source() {
+            AuthSource::Acl => "ACL",
+            _ => "allowlist",
+        };
+        let n = state.authorized_devices().len();
+        println!("Identity auth: ENFORCED via {mode} ({n} authorized device(s))");
+        if n == 0 {
+            println!(
+                "  (no devices authorized — all senders are denied; delete the empty \
+                 authorization file to run open)"
+            );
+        }
     } else {
         println!("Identity auth: open (add devices with `mftp daemon-trust add <id>`)");
     }
@@ -610,10 +700,8 @@ mod tests {
     async fn spawn_test_daemon(dir: &Path) -> (PathBuf, Arc<DaemonState>) {
         let sock = dir.join("test.sock");
         let listener = bind_control_socket(&sock).unwrap();
-        let state = Arc::new(DaemonState::new(
-            dir.to_owned(),
-            "127.0.0.1:7777".to_string(),
-        ));
+        let state =
+            Arc::new(DaemonState::load(dir.to_owned(), "127.0.0.1:7777".to_string()).unwrap());
         let st = Arc::clone(&state);
         tokio::spawn(async move {
             let _ = serve_control(listener, st).await;

@@ -243,7 +243,7 @@ async fn daemon_reload_admits_newly_authorized_device() -> anyhow::Result<()> {
 
     // Authorize the device on disk and reload (what SIGHUP does).
     mftp::identity::add_authorized_in(dcfg.path(), &device)?;
-    assert_eq!(reloader.reload(), 2, "reload sees both authorized devices");
+    assert_eq!(reloader.reload()?, 2, "reload sees both authorized devices");
 
     // The same device now completes a transfer through the running daemon.
     let sender_id2 = mftp::identity::load_or_create_in(scfg.path())?;
@@ -323,7 +323,7 @@ async fn daemon_reload_applies_acl_routing_change() -> anyhow::Result<()> {
         },
     );
     acl2.save(dcfg.path())?;
-    reloader.reload();
+    reloader.reload()?;
 
     // The next transfer routes to the new subdir — no restart.
     let sender_id2 = mftp::identity::load_or_create_in(scfg.path())?;
@@ -394,6 +394,105 @@ async fn daemon_open_mode_accepts_sender_without_identity() -> anyhow::Result<()
         std::fs::read(&src)?,
         std::fs::read(out.path().join("open.bin"))?,
         "open-mode transfer without client identity succeeds"
+    );
+
+    shutdown_tx.send(()).expect("send shutdown");
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("serve task did not panic")
+        .expect("serve returns Ok");
+    Ok(())
+}
+
+/// A malformed `acl.toml` must make startup fail (fail closed) instead of being
+/// read as an empty ACL — which would leave the daemon open to any sender.
+#[tokio::test]
+async fn daemon_bind_fails_on_malformed_acl() -> anyhow::Result<()> {
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    std::fs::write(dcfg.path().join("acl.toml"), "peers = [this is not toml")?;
+    let result = Daemon::bind(DaemonOptions {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        output_dir: out.path().to_owned(),
+        socket_path: dcfg.path().join("mftpd.sock"),
+        config_dir: dcfg.path().to_owned(),
+        announce_name: None,
+        http: None,
+    })
+    .await;
+    assert!(
+        result.is_err(),
+        "malformed acl.toml must be a startup error"
+    );
+    Ok(())
+}
+
+/// A reload that hits a malformed policy keeps the previous one in force, and
+/// revoking the last authorized device keeps the daemon enforcing (deny-all)
+/// rather than flipping it to open mode.
+#[tokio::test]
+async fn daemon_reload_fails_closed() -> anyhow::Result<()> {
+    let dcfg = TempDir::new()?;
+    let out = TempDir::new()?;
+    let id = "a".repeat(64);
+    mftp::identity::add_authorized_in(dcfg.path(), &id)?;
+
+    let daemon = bind_test_daemon(&dcfg, &out).await;
+    let addr = daemon.local_addr();
+    let fingerprint = daemon.fingerprint().to_owned();
+    let socket = daemon.control_socket().to_owned();
+    let reloader = daemon.reloader();
+    let (shutdown_tx, serve) = spawn_serve(daemon);
+
+    let status = |socket: std::path::PathBuf| async move {
+        match client_request(&socket, DaemonRequest::Status).await? {
+            DaemonResponse::Status {
+                auth_enforced,
+                authorized_count,
+                ..
+            } => anyhow::Ok((auth_enforced, authorized_count)),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    };
+    assert_eq!(status(socket.clone()).await?, (true, 1));
+
+    // Broken ACL on disk → reload errors, previous policy is kept.
+    std::fs::write(dcfg.path().join("acl.toml"), "garbage = = =")?;
+    assert!(reloader.reload().is_err(), "malformed acl must fail reload");
+    assert_eq!(status(socket.clone()).await?, (true, 1), "previous kept");
+    std::fs::remove_file(dcfg.path().join("acl.toml"))?;
+
+    // Remove the last device → still enforced, with nobody authorized.
+    match client_request(
+        &socket,
+        DaemonRequest::RemoveTrust {
+            device_id: id.clone(),
+        },
+    )
+    .await?
+    {
+        DaemonResponse::TrustChanged { changed } => assert!(changed),
+        other => panic!("expected TrustChanged, got {other:?}"),
+    }
+    reloader.reload()?;
+    assert_eq!(
+        status(socket.clone()).await?,
+        (true, 0),
+        "deny-all, not open"
+    );
+
+    // A sender with no identity is now rejected (not admitted as "open").
+    let send_dir = TempDir::new()?;
+    let src = make_file(send_dir.path(), "denied.bin", 64 * 1024);
+    let mut cfg = auth_send_config(
+        fingerprint,
+        mftp::identity::load_or_create_in(TempDir::new()?.path())?,
+    );
+    cfg.client_identity = None;
+    assert!(
+        sender::send(src, addr, cfg).await.is_err(),
+        "deny-all daemon must reject"
     );
 
     shutdown_tx.send(()).expect("send shutdown");
