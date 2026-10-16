@@ -970,7 +970,7 @@ fn write_fec_chunk(
         }
     };
     if let Some(snap) = snap {
-        snap.write_to_disk()?;
+        snap.write_to_disk_best_effort();
     }
 
     debug!(chunk = chunk_index, "FEC chunk written");
@@ -1650,7 +1650,7 @@ async fn write_repair_chunk(
         r.mark_received(chunk_index);
         r.snapshot()?
     };
-    snap.write_to_disk()?;
+    snap.write_to_disk_best_effort();
     pb.inc(n);
     Ok(())
 }
@@ -2459,7 +2459,7 @@ where
                 }
             };
             if let Some(snap) = snap {
-                snap.write_to_disk()?;
+                snap.write_to_disk_best_effort();
             }
             stats.in_flight_chunks.fetch_sub(1, Ordering::Relaxed);
 
