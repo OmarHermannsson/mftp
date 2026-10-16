@@ -1392,7 +1392,7 @@ where
     let total_chunks = file_size.div_ceil(chunk_size as u64);
     let feeders: Vec<tokio::task::JoinHandle<Result<()>>> = if let Some(ents) = entries {
         // Directory path: always use a single sequential feeder over the concat
-        // stream.  The pre-reading optimisation in feed_chunks_concat already
+        // stream.  The cached-handle reads in feed_chunks_concat already
         // handles NVMe efficiently; parallel-reads is not useful for the
         // scatter-gather read pattern needed here.
         let root = file.to_owned();
@@ -2130,15 +2130,13 @@ fn feed_chunks_range(
 
 // ── Recursive directory support ───────────────────────────────────────────────
 
-/// Threshold below which a file's contents are pre-read into memory during
-/// directory scan.  Pre-reading small files avoids `open()`/`close()` overhead
-/// for every chunk that spans many tiny files.
-const PREREAD_THRESHOLD: u64 = 256 * 1024; // 256 KiB
+/// Files at or below this size skip the `POSIX_FADV_SEQUENTIAL` hint when the
+/// directory feeder opens them (read-ahead tuning is pointless for a file that
+/// is read in one or two `pread`s).
+const SMALL_FILE_THRESHOLD: u64 = 256 * 1024; // 256 KiB
 
 /// Walk `root` and return a sorted list of `FileEntry` items representing the
 /// complete directory tree.  Symlinks are preserved (not followed).
-/// Files ≥ 1 entry and ≤ PREREAD_THRESHOLD are flagged for pre-reading by the
-/// caller.
 pub(crate) fn scan_directory(root: &Path, preserve: bool) -> Result<Vec<FileEntry>> {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -2259,9 +2257,12 @@ fn directory_transfer_id(
 /// Read file entries into the per-chunk feeder channel, treating all File
 /// entries as a single virtual concatenated byte stream.
 ///
-/// Small files (≤ PREREAD_THRESHOLD) are pre-read into memory up front so the
-/// inner loop only does memory copies for them, avoiding repeated `open()`
-/// overhead when a single chunk spans many tiny files.
+/// Files are opened lazily as the chunk being assembled reaches them, and the
+/// current handle is kept open across consecutive chunks, so every file is
+/// opened once and memory stays bounded by the in-flight chunks (small files
+/// used to be pre-read into RAM up front — the whole tree for a tree of small
+/// files).  A file that shrank since the scan fails the transfer with an error
+/// instead of panicking or sending short data.
 ///
 /// Designed to run in `tokio::task::spawn_blocking`.
 fn feed_chunks_concat(
@@ -2278,21 +2279,6 @@ fn feed_chunks_concat(
         .filter(|e| matches!(e.kind, FileKind::File) && e.size > 0)
         .collect();
 
-    // Pre-read small files into memory.
-    let preread: Vec<Option<Vec<u8>>> = file_entries
-        .iter()
-        .map(|e| {
-            if e.size <= PREREAD_THRESHOLD {
-                let path = root.join(&e.path);
-                std::fs::read(&path)
-                    .with_context(|| format!("pre-read {}", path.display()))
-                    .ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-
     // Build prefix sums over file sizes.
     let mut prefix_sums: Vec<u64> = Vec::with_capacity(file_entries.len() + 1);
     let mut acc = 0u64;
@@ -2304,9 +2290,10 @@ fn feed_chunks_concat(
 
     let total_chunks = total_bytes.div_ceil(chunk_size as u64);
 
-    // Keep one open large-file handle to avoid repeated open/close when
-    // many consecutive chunks land in the same large file.
-    let mut cur_large: Option<(usize, std::fs::File)> = None;
+    // Keep the current file's handle open: consecutive chunks usually land in
+    // the same (large) file, and a small file spanning a chunk boundary is
+    // read across two chunks — either way it is opened only once.
+    let mut cur: Option<(usize, std::fs::File)> = None;
 
     for idx in 0..total_chunks {
         if skip.contains(&idx) {
@@ -2332,45 +2319,31 @@ fn feed_chunks_concat(
             let remaining_in_file = (file_end - pos) as usize;
             let take = remaining_in_file.min(chunk_len - written);
 
-            if let Some(ref data) = preread[fi] {
-                // Small file: copy from pre-read buffer.
-                let src_start = offset_in_file as usize;
-                buf[written..written + take].copy_from_slice(&data[src_start..src_start + take]);
-            } else {
-                // Large file: use cached handle or open new one.
-                let file = match &cur_large {
-                    Some((open_fi, _)) if *open_fi == fi => {
-                        cur_large.as_ref().map(|(_, f)| f).unwrap()
-                    }
-                    _ => {
-                        let path = root.join(&file_entries[fi].path);
-                        let f = std::fs::File::open(&path)
-                            .with_context(|| format!("open {}", path.display()))?;
+            let file = match &cur {
+                Some((open_fi, f)) if *open_fi == fi => f,
+                _ => {
+                    let path = root.join(&file_entries[fi].path);
+                    let f = std::fs::File::open(&path)
+                        .with_context(|| format!("open {}", path.display()))?;
 
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::unix::io::AsRawFd;
-                            unsafe {
-                                libc::posix_fadvise(
-                                    f.as_raw_fd(),
-                                    0,
-                                    0,
-                                    libc::POSIX_FADV_SEQUENTIAL,
-                                );
-                            }
+                    #[cfg(target_os = "linux")]
+                    if file_entries[fi].size > SMALL_FILE_THRESHOLD {
+                        use std::os::unix::io::AsRawFd;
+                        unsafe {
+                            libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
                         }
-
-                        cur_large = Some((fi, f));
-                        cur_large.as_ref().map(|(_, f)| f).unwrap()
                     }
-                };
-                crate::fs_ext::read_exact_at(
-                    file,
-                    &mut buf[written..written + take],
-                    offset_in_file,
+
+                    &cur.insert((fi, f)).1
+                }
+            };
+            crate::fs_ext::read_exact_at(file, &mut buf[written..written + take], offset_in_file)
+                .with_context(|| {
+                format!(
+                    "read {} at {offset_in_file} (file changed since scan?)",
+                    file_entries[fi].path
                 )
-                .with_context(|| format!("read file[{fi}] at {offset_in_file}"))?;
-            }
+            })?;
 
             written += take;
             pos += take as u64;
@@ -2391,7 +2364,7 @@ fn feed_chunks_concat(
 /// byte offset where the chunk starts, walk the prefix-sum table to find the
 /// file(s) the chunk spans and read each overlapping slice in turn.  Used by
 /// the in-band repair path to re-read a chunk by its global index without the
-/// feeder's pre-read cache (repair handles only a bounded handful of chunks).
+/// feeder's cached handle (repair handles only a bounded handful of chunks).
 fn read_concat_chunk_into(
     root: &Path,
     file_entries: &[&FileEntry],
