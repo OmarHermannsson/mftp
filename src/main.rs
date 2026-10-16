@@ -155,10 +155,10 @@ enum Command {
         /// Direct mode (QUIC/TCP): default auto-negotiated from RTT + CPU cores.
         /// SFTP fallback: default 8 (each stream is one SSH/SFTP connection;
         /// scales linearly — raise to 12 if the remote sshd allows it).
-        #[arg(short = 'n', long, value_name = "N")]
+        #[arg(short = 'n', long, value_name = "N", value_parser = parse_streams_arg)]
         streams: Option<usize>,
-        /// Chunk size in bytes (default: auto-negotiated from RTT)
-        #[arg(long)]
+        /// Chunk size in bytes, 4096..=134217728 (default: auto-negotiated from RTT)
+        #[arg(long, value_parser = parse_chunk_size_arg)]
         chunk_size: Option<usize>,
         /// Number of QUIC connections (paths) to bond for one transfer (default 1).
         ///
@@ -203,7 +203,7 @@ enum Command {
         /// Left as `Option` (rather than a clap `default_value`) so the config file
         /// can supply the default; the built-in fallback `DEFAULT_TCP_BELOW_RTT_MS`
         /// is applied in `main` after merging CLI > config.
-        #[arg(long, value_name = "MS")]
+        #[arg(long, value_name = "MS", value_parser = parse_tcp_below_rtt_arg)]
         tcp_below_rtt: Option<f64>,
         /// Use multiple parallel file readers instead of a single sequential reader.
         ///
@@ -325,6 +325,33 @@ fn parse_fec(s: &str) -> Result<FecParams> {
         data_shards,
         parity_shards,
     })
+}
+
+/// clap parser for `-n/--streams`: a positive integer within the receiver's limit.
+fn parse_streams_arg(s: &str) -> std::result::Result<usize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a positive integer, got {s:?}"))?;
+    mftp::config::validate_streams(n).map_err(|e| e.to_string())
+}
+
+/// clap parser for `--chunk-size`: bytes within the receiver's accepted range.
+fn parse_chunk_size_arg(s: &str) -> std::result::Result<usize, String> {
+    let n: usize = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a size in bytes, got {s:?}"))?;
+    mftp::config::validate_chunk_size(n).map_err(|e| e.to_string())
+}
+
+/// clap parser for `--tcp-below-rtt`: a finite, non-negative number of ms.
+fn parse_tcp_below_rtt_arg(s: &str) -> std::result::Result<f64, String> {
+    let ms: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("expected a number of milliseconds, got {s:?}"))?;
+    mftp::config::validate_tcp_below_rtt(ms).map_err(|e| e.to_string())
 }
 
 /// Map a transport name from the config file to a `ForcedTransport`.
@@ -676,7 +703,26 @@ async fn run_daemon_ctl(socket: &std::path::Path, req: mftp::daemon::DaemonReque
 
 #[cfg(test)]
 mod tests {
-    use super::parse_fec;
+    use super::{parse_chunk_size_arg, parse_fec, parse_streams_arg, parse_tcp_below_rtt_arg};
+
+    #[test]
+    fn tuning_args_reject_out_of_range() {
+        assert!(parse_streams_arg("0").is_err());
+        assert!(parse_streams_arg("-1").is_err());
+        assert!(parse_streams_arg("100000").is_err());
+        assert_eq!(parse_streams_arg("8"), Ok(8));
+
+        assert!(parse_chunk_size_arg("0").is_err());
+        assert!(parse_chunk_size_arg("1").is_err());
+        assert!(parse_chunk_size_arg("1099511627776").is_err());
+        assert_eq!(parse_chunk_size_arg("1048576"), Ok(1_048_576));
+
+        for bad in ["-1", "NaN", "inf", "-inf", "1e300", "abc"] {
+            assert!(parse_tcp_below_rtt_arg(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_tcp_below_rtt_arg("0"), Ok(0.0));
+        assert_eq!(parse_tcp_below_rtt_arg("15.5"), Ok(15.5));
+    }
 
     #[test]
     fn fec_valid() {
