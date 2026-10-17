@@ -409,6 +409,10 @@ fn remote_bootstrap_script(
     .join(" ")
 }
 
+/// How long the sender waits for the remote one-shot server to exit after the
+/// transfer before tearing the SSH session down.
+const REMOTE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Environment variable through which the SSH launcher hands the remote
 /// one-shot `mftp server` the sender's DeviceId to require.
 pub const REQUIRE_PEER_ENV: &str = "MFTP_REQUIRE_PEER";
@@ -836,6 +840,14 @@ pub async fn send_via_ssh(
         tracing::debug!("ssh preamble: {line}");
     };
 
+    // Keep draining the server's stdout: it writes heartbeats there (see
+    // `spawn_ssh_session_watchdog` in the receiver), and if this process dies
+    // the resulting broken pipe is what tears the SSH session — and so the
+    // remote server — down.
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+    });
+
     eprintln!(
         "Remote server ready  port={}  fp={}…",
         hs.port,
@@ -929,9 +941,10 @@ pub async fn send_via_ssh(
         return Ok(());
     }
 
-    // Transfer complete — give the remote server a moment to exit cleanly.
-    // KillOnDrop fires on drop regardless, so this is best-effort.
-    let _ = ssh.0.wait().await;
+    // Transfer complete — give the remote server a moment to exit cleanly,
+    // then KillOnDrop ends the session (bounded: a remote that never exits must
+    // not hang the sender).
+    let _ = tokio::time::timeout(REMOTE_EXIT_GRACE, ssh.0.wait()).await;
     Ok(())
 }
 

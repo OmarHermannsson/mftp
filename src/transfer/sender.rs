@@ -1601,15 +1601,24 @@ where
 {
     let mut round = 0u32;
     loop {
-        let msg = tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx.recv())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "timed out waiting for receiver acknowledgement after all data was sent"
-                )
-                .context(AckTimeoutAfterComplete)
-            })?
-            .context("receiver closed without completing")?;
+        // "All data sent" only means queued: on a slow link much of it can
+        // still be in flight. The timeout therefore restarts whenever the
+        // receiver reports progress (its Progress messages drive `pb`), and
+        // only an acknowledgement-less window with no progress fails.
+        let mut last_pos = pb.position();
+        let msg = loop {
+            match tokio::time::timeout(ack_timeout(rtt, file_size), completion_rx.recv()).await {
+                Ok(m) => break m,
+                Err(_) if pb.position() > last_pos => last_pos = pb.position(),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "timed out waiting for receiver acknowledgement after all data was sent"
+                    )
+                    .context(AckTimeoutAfterComplete))
+                }
+            }
+        }
+        .context("receiver closed without completing")?;
 
         let chunks = match msg {
             ReceiverMessage::Retransmit { chunks } => chunks,

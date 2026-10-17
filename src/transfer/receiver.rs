@@ -626,6 +626,8 @@ pub async fn serve_one_stdio(
 
     // Machine-readable handshake — the SSH launcher reads exactly this line.
     println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\"}}");
+    #[cfg(unix)]
+    spawn_ssh_session_watchdog();
 
     // Accept up to 2 connections: the initial transfer and one resume retry.
     //
@@ -669,6 +671,57 @@ pub async fn serve_one_stdio(
         }
     }
     Ok(())
+}
+
+/// Exit as soon as the SSH session that launched this one-shot server is gone.
+///
+/// sshd sends no SIGHUP to commands of a session without a terminal, so a
+/// sender that dies (or is killed) mid-transfer would otherwise leave this
+/// server running until the transfer's own timeouts fire — indefinitely for a
+/// TCP peer that vanished without a FIN. Every couple of seconds this writes a
+/// heartbeat newline to stdout (the sender drains it): if the sender is gone,
+/// its local `ssh` hits a broken pipe and exits, sshd then closes our stdout,
+/// and the write fails or `poll` reports POLLERR/POLLHUP. Only armed when
+/// stdout is a pipe or socket (as under sshd), never for a terminal/file.
+/// Exiting abruptly is safe: resume state is crash-consistent by design.
+#[cfg(unix)]
+fn spawn_ssh_session_watchdog() {
+    let fd = libc::STDOUT_FILENO;
+    // SAFETY: fstat only writes into the zeroed stat buffer we own.
+    let is_pipe_or_socket = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(fd, &mut st) == 0
+            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK)
+    };
+    if !is_pipe_or_socket {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            every.tick().await;
+            let heartbeat = {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                out.write_all(b"\n").and_then(|()| out.flush())
+            };
+            if heartbeat.is_err() {
+                warn!("SSH session closed; exiting one-shot server");
+                std::process::exit(1);
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: 0,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, zero timeout (never blocks).
+            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ready > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                warn!("SSH session closed; exiting one-shot server");
+                std::process::exit(1);
+            }
+        }
+    });
 }
 
 /// Race QUIC and TCP for one complete transfer.  If the QUIC connection is
