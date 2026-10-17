@@ -654,6 +654,7 @@ impl Daemon {
                 output_dir: dir,
                 budget,
                 observer: None,
+                file_name: None,
             })
         };
         let shutdown_jobs = Arc::clone(&jobs);

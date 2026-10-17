@@ -615,7 +615,11 @@ async fn main() -> Result<()> {
                 }
                 _ => None,
             };
-            receiver::serve_one_stdio(output_dir, port, require_peer).await
+            // scp-style `host:/dir/newname`: the name to store the transfer as.
+            let file_name = std::env::var(mftp::ssh::OUTPUT_NAME_ENV)
+                .ok()
+                .filter(|n| !n.is_empty());
+            receiver::serve_one_stdio(output_dir, port, require_peer, file_name).await
         }
         Command::Decrypt { key, input, output } => {
             let key = mftp::service::encrypt::load_key_file(&key)?;

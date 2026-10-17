@@ -1258,3 +1258,61 @@ async fn test_tcp_client_auth_admits_only_required_peer() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// A route's `file_name` stores the transfer under a new name (scp-style
+/// `host:/dir/newname`), validated like a sender-supplied name.
+#[tokio::test]
+async fn test_route_file_name_renames_and_is_validated() -> anyhow::Result<()> {
+    use mftp::transfer::receiver::Route;
+    let send_dir = TempDir::new()?;
+    let recv_dir = TempDir::new()?;
+    let src = make_test_file(send_dir.path(), "original.bin", 300 * 1024);
+
+    for (name, ok) in [("renamed.bin", true), ("../escape.bin", false)] {
+        let server = Server::bind("127.0.0.1:0".parse()?, recv_dir.path().to_owned())?;
+        let addr = server.local_addr;
+        let fingerprint = server.fingerprint.clone();
+        let out = recv_dir.path().to_owned();
+        let serve = tokio::spawn(server.serve_with_router(move |_peer| {
+            Ok(Route {
+                file_name: Some(name.to_owned()),
+                ..Route::from(out.clone())
+            })
+        }));
+        let res = sender::send(
+            src.clone(),
+            addr,
+            SendConfig {
+                streams: Some(2),
+                chunk_size: Some(64 * 1024),
+                compress: false,
+                compress_level: 3,
+                trusted_fingerprint: Some(fingerprint),
+                trusted_device: None,
+                client_identity: None,
+                forced_transport: Some(ForcedTransport::Quic),
+                tcp_rtt_threshold: std::time::Duration::ZERO,
+                fec: None,
+                parallel_reads: false,
+                paths: 1,
+                recursive: false,
+                preserve: false,
+            },
+        )
+        .await;
+        serve.abort();
+        assert_eq!(res.is_ok(), ok, "{name}: {res:?}");
+    }
+    assert_eq!(
+        std::fs::read(&src)?,
+        std::fs::read(recv_dir.path().join("renamed.bin"))?
+    );
+    assert!(!recv_dir.path().join("original.bin").exists());
+    assert!(!recv_dir
+        .path()
+        .parent()
+        .unwrap()
+        .join("escape.bin")
+        .exists());
+    Ok(())
+}

@@ -42,8 +42,10 @@ use crate::ssh::SshDest;
 /// SFTP request size and reduce round-trips.
 const SFTP_BUFFER: usize = 1024 * 1024; // 1 MiB
 
-/// Transfer `file` to `dest.remote_path/<filename>` using `n_streams`
-/// parallel SFTP connections.
+/// Transfer `file` to `dest.remote_path` using `n_streams` parallel SFTP
+/// connections, with scp-like destination semantics: an existing remote
+/// directory (or a path ending in `/`) receives `<dir>/<filename>`, anything
+/// else is the destination file path itself (`host:/dir/newname`).
 ///
 /// This is fully synchronous work (libssh2 is blocking), so each stream
 /// runs on a dedicated `spawn_blocking` thread.
@@ -58,8 +60,6 @@ pub async fn send_via_sftp(file: PathBuf, dest: SshDest, n_streams: usize) -> Re
         .with_context(|| format!("stat {}", file.display()))?
         .len();
 
-    let remote_path = format!("{}/{}", dest.remote_path.trim_end_matches('/'), file_name);
-
     eprintln!(
         "[mftp] SFTP fallback: {n_streams} streams → {} (single SSH encryption layer)",
         dest.user_host
@@ -67,13 +67,13 @@ pub async fn send_via_sftp(file: PathBuf, dest: SshDest, n_streams: usize) -> Re
 
     // Pre-create and sparse-allocate the remote file with one session so
     // all N workers can open it for writing without racing on creation.
-    {
+    let remote_path = {
         let d = dest.clone();
-        let rp = remote_path.clone();
-        tokio::task::spawn_blocking(move || create_remote_file(&d, &rp, file_size))
+        let name = file_name.clone();
+        tokio::task::spawn_blocking(move || create_remote_file(&d, &name, file_size))
             .await
-            .context("SFTP file-creation task panicked")??;
-    }
+            .context("SFTP file-creation task panicked")??
+    };
 
     let segment = file_size.div_ceil(n_streams as u64);
     let progress = Arc::new(AtomicU64::new(0));
@@ -180,12 +180,30 @@ fn sftp_worker(
 
 // ── Remote file creation ──────────────────────────────────────────────────────
 
-/// Create (or truncate) the remote file and sparse-allocate it to `file_size`
-/// bytes so all stream workers can write at arbitrary offsets without
-/// extending the file themselves.
-fn create_remote_file(dest: &SshDest, remote_path: &str, file_size: u64) -> Result<()> {
+/// Resolve the destination file path (see [`send_via_sftp`]), create (or
+/// truncate) it and sparse-allocate it to `file_size` bytes so all stream
+/// workers can write at arbitrary offsets without extending the file
+/// themselves. Returns the resolved remote path.
+fn create_remote_file(dest: &SshDest, file_name: &str, file_size: u64) -> Result<String> {
     let sess = ssh_connect(dest).context("SFTP creation connect")?;
     let sftp = sess.sftp().context("open SFTP subsystem for creation")?;
+
+    // `host:` (empty path) means the login directory.
+    let target = match dest.remote_path.as_str() {
+        "" => ".",
+        p => p,
+    };
+    let into_dir = target.ends_with('/')
+        || sftp
+            .stat(Path::new(target))
+            .map(|st| st.is_dir())
+            .unwrap_or(false);
+    let remote_path = if into_dir {
+        format!("{}/{}", target.trim_end_matches('/'), file_name)
+    } else {
+        target.to_owned()
+    };
+    let remote_path = remote_path.as_str();
 
     let mut f = sftp
         .open_mode(
@@ -205,7 +223,7 @@ fn create_remote_file(dest: &SshDest, remote_path: &str, file_size: u64) -> Resu
             .context("SFTP sparse allocation write")?;
     }
 
-    Ok(())
+    Ok(remote_path.to_owned())
 }
 
 // ── SSH connection helpers ────────────────────────────────────────────────────

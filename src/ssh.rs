@@ -376,7 +376,7 @@ fn remote_bootstrap_script(
     require_peer: Option<&str>,
 ) -> String {
     let short = &sha256_hex[..16.min(sha256_hex.len())];
-    let env_prefix = require_peer_env(require_peer);
+    let env_prefix = server_env(require_peer);
     let quoted_dir = shell_quote(remote_path);
     let port_arg = match remote_port {
         Some(p) => format!(" --port {p}"),
@@ -403,9 +403,7 @@ fn remote_bootstrap_script(
         r#"else t="$f.tmp.$$"; rm -f "$t"; cat > "$t";"#.to_owned(),
         r#"if ok "$t"; then chmod 700 "$t"; mv -f "$t" "$f"; echo "[mftp] binary installed ($(wc -c < "$f" | tr -d " ") bytes)" >&2;"#.to_owned(),
         r#"else rm -f "$t"; echo "[mftp] uploaded binary failed integrity verification; refusing to run it" >&2; exit 1; fi; fi;"#.to_owned(),
-        // scp-like destination semantics: a non-directory path is a file
-        // destination whose parent is the output dir.
-        format!(r#"d={quoted_dir}; if [ -d "$d" ]; then :; else d=$(dirname "$d"); fi;"#),
+        remote_dest_fragment(&quoted_dir),
         format!(r#"umask "$um"; exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
     ]
     .join(" ")
@@ -415,17 +413,35 @@ fn remote_bootstrap_script(
 /// one-shot `mftp server` the sender's DeviceId to require.
 pub const REQUIRE_PEER_ENV: &str = "MFTP_REQUIRE_PEER";
 
-/// `env MFTP_REQUIRE_PEER=<id> ` prefix for the remote server command (empty
-/// when no id). `env` works from any login shell, and a binary predating the
-/// variable just ignores it. Ids that aren't plain hex are dropped rather than
-/// interpolated into the remote command.
-fn require_peer_env(require_peer: Option<&str>) -> String {
-    match require_peer {
-        Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            format!("env {REQUIRE_PEER_ENV}={id} ")
-        }
-        _ => String::new(),
+/// Environment variable through which the SSH launcher tells the remote
+/// one-shot `mftp server` to store the transfer under a new name (scp-style
+/// `host:/dir/newname`). Empty = keep the sender's name.
+pub const OUTPUT_NAME_ENV: &str = "MFTP_OUTPUT_NAME";
+
+/// scp-like destination semantics, as a shell fragment run on the remote:
+/// sets `$d` to the output directory and `$n` to the name to store the
+/// transfer under (empty = the sender's). An existing directory, or a path
+/// ending in `/`, is the output directory itself; anything else is a file
+/// destination — its parent is the output directory and its last component
+/// the new name.
+fn remote_dest_fragment(quoted_path: &str) -> String {
+    format!(
+        r#"d={quoted_path}; n=; case "$d" in */) ;; *) if [ -d "$d" ]; then :; else n=$(basename "$d"); d=$(dirname "$d"); fi;; esac;"#
+    )
+}
+
+/// `env MFTP_OUTPUT_NAME="$n" [MFTP_REQUIRE_PEER=<id>] ` prefix for the remote
+/// server command (pairs with [`remote_dest_fragment`]). A binary predating
+/// these variables just ignores them. Ids that aren't plain hex are dropped
+/// rather than interpolated into the remote command.
+fn server_env(require_peer: Option<&str>) -> String {
+    let mut env = format!(r#"env {OUTPUT_NAME_ENV}="$n" "#);
+    if let Some(id) =
+        require_peer.filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        env.push_str(&format!("{REQUIRE_PEER_ENV}={id} "));
     }
+    env
 }
 
 /// Wrap `script` as a single remote command string `sh -c '<script>'`.
@@ -936,21 +952,20 @@ fn spawn_remote_binary(
         Some(p) => format!(" --port {p}"),
         None => String::new(),
     };
-    // Use scp-like semantics: if the remote path is not an existing directory,
-    // treat it as a file destination and use its parent as the output dir.
-    // E.g. host:/data/file writes to /data/file (parent = /data, filename from manifest).
+    // scp-like semantics (see `remote_dest_fragment`): host:/data/new.bin
+    // writes /data/new.bin, host:/data/ (or an existing dir) writes inside it.
     let quoted_dir = shell_quote(&dest.remote_path);
-    let remote_cmd = format!(
-        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {}{} server --output-dir \"$d\"{}",
-        require_peer_env(require_peer),
+    let script = format!(
+        r#"{} exec {}{} server --output-dir "$d"{}"#,
+        remote_dest_fragment(&quoted_dir),
+        server_env(require_peer),
         shell_quote(bin),
         port_arg,
     );
-    // Pass the command as a single argument so SSH sends it verbatim to the
-    // remote login shell.  Using `sh -c <script>` here would make `server`
-    // and `--output-dir` become $0/$1 (ignored) instead of mftp arguments.
+    // One `sh -c '<script>'` word, so the POSIX fragment also works when the
+    // remote login shell is csh/fish.
     ssh_command(dest)
-        .arg(&remote_cmd)
+        .arg(remote_sh_command(&script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1005,9 +1020,44 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use super::{
         download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
-        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command,
-        require_peer_env, shell_quote, RemotePlatform, REQUIRE_PEER_ENV,
+        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command, server_env,
+        shell_quote, RemotePlatform, OUTPUT_NAME_ENV, REQUIRE_PEER_ENV,
     };
+
+    /// scp-like destination resolution, run through a real `sh`: an existing
+    /// dir or a trailing `/` is the output dir; anything else is a new name in
+    /// its parent.
+    #[cfg(unix)]
+    #[test]
+    fn remote_dest_fragment_resolves_like_scp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        let resolve = |path: &str| {
+            let script = format!(
+                r#"{} printf "%s|%s" "$d" "$n""#,
+                super::remote_dest_fragment(&shell_quote(path))
+            );
+            let o = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(o.status.success());
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(resolve(root), format!("{root}|"));
+        assert_eq!(resolve(&format!("{root}/")), format!("{root}/|"));
+        assert_eq!(
+            resolve(&format!("{root}/new name.bin")),
+            format!("{root}|new name.bin")
+        );
+        // A trailing slash on a missing path still means "directory".
+        assert_eq!(
+            resolve(&format!("{root}/missing/")),
+            format!("{root}/missing/|")
+        );
+        assert_eq!(resolve("relative.bin"), ".|relative.bin");
+    }
 
     /// The remote command must be ONE shell word after `sh -c`, on one line,
     /// with no `!`/backslashes inside the script (csh/fish compatibility).
@@ -1030,9 +1080,10 @@ mod tests {
         assert!(cmd.starts_with("sh -c '"));
         assert!(cmd.ends_with('\''));
         assert!(script.contains("--port 9000"));
-        assert!(script.contains(&format!("env {REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        assert!(script.contains(&format!("{REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        assert!(script.contains(&format!(r#"env {OUTPUT_NAME_ENV}="$n""#)));
         // Anything but plain hex is never interpolated into the command.
-        assert_eq!(require_peer_env(Some("x; rm -rf ~")), "");
+        assert!(!server_env(Some("x; rm -rf ~")).contains("rm"));
     }
 
     /// Run the bootstrap exactly as the remote login shell would (`sh -c` of

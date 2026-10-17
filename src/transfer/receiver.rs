@@ -473,7 +473,7 @@ impl TcpServer {
             tls,
             Arc::clone(&self.listener),
             Arc::clone(&self.acceptor),
-            self.output_dir.clone(),
+            self.output_dir.clone().into(),
         )
         .await
     }
@@ -582,10 +582,13 @@ pub async fn listen_tcp(bind: SocketAddr, config: ReceiveConfig) -> Result<()> {
 /// demand a matching client certificate, so another host that reaches the
 /// printed port first can't claim the one-shot slot and write into the
 /// remote directory.
+///
+/// `file_name`: store the transfer under this name (see [`Route::file_name`]).
 pub async fn serve_one_stdio(
     output_dir: PathBuf,
     port: Option<u16>,
     require_peer: Option<String>,
+    file_name: Option<String>,
 ) -> Result<()> {
     use std::net::SocketAddr;
 
@@ -644,7 +647,8 @@ pub async fn serve_one_stdio(
         } else {
             STDIO_RETRY_TIMEOUT
         };
-        let result = accept_one_quic_or_tcp(&quic_server, &tcp_server, timeout).await;
+        let result =
+            accept_one_quic_or_tcp(&quic_server, &tcp_server, timeout, file_name.clone()).await;
         match result {
             Ok(()) => return Ok(()),
             Err(e) if e.is::<AcceptTimedOut>() => bail!(
@@ -679,6 +683,7 @@ async fn accept_one_quic_or_tcp(
     quic: &Server,
     tcp: &TcpServer,
     accept_timeout: Duration,
+    file_name: Option<String>,
 ) -> Result<()> {
     enum Accepted {
         Quic(quinn::Connection),
@@ -701,18 +706,22 @@ async fn accept_one_quic_or_tcp(
     .await
     .map_err(|_| anyhow::Error::new(AcceptTimedOut))??;
 
+    let route = |dir: &PathBuf| Route {
+        file_name: file_name.clone(),
+        ..Route::from(dir.clone())
+    };
     let handle_tcp = |tls| {
         handle_tcp_connection(
             tls,
             Arc::clone(&tcp.listener),
             Arc::clone(&tcp.acceptor),
-            tcp.output_dir.clone(),
+            route(&tcp.output_dir),
         )
     };
     match accepted {
         Accepted::Quic(conn) => {
             info!("connection from {}", conn.remote_address());
-            match handle_quic_connection(conn, None, quic.output_dir.clone().into()).await {
+            match handle_quic_connection(conn, None, route(&quic.output_dir)).await {
                 Err(e) if e.is::<SwitchToTcp>() => {
                     let tls = tokio::time::timeout(accept_timeout, tcp.accept_control())
                         .await
@@ -871,7 +880,7 @@ async fn handle_tcp_connection(
     ctrl_stream: ServerTlsStream<tokio::net::TcpStream>,
     listener: Arc<TcpListener>,
     acceptor: Arc<TlsAcceptor>,
-    output_dir: PathBuf,
+    route: Route,
 ) -> Result<()> {
     let control_peer = TcpPeer {
         ip: ctrl_stream.get_ref().0.peer_addr()?.ip(),
@@ -880,41 +889,35 @@ async fn handle_tcp_connection(
     let peer = control_peer.device.clone();
     let (ctrl_recv, ctrl_send) = tokio::io::split(ctrl_stream);
 
-    run_receive(
-        ctrl_send,
-        ctrl_recv,
-        output_dir.into(),
-        peer,
-        move |_transfer_id| {
-            let listener = Arc::clone(&listener);
-            let acceptor = Arc::clone(&acceptor);
-            let control_peer = control_peer.clone();
-            async move {
-                // Data connections are taken in arrival order, but only from
-                // the control connection's peer (same IP and client identity);
-                // anything else is dropped and the next one awaited.
-                loop {
-                    let (raw, addr) = listener.accept().await.context("accept TCP data stream")?;
-                    raw.set_nodelay(true)?;
-                    let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
-                        .await
-                        .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
-                        .context("TLS handshake on data stream")?;
-                    let data_peer = TcpPeer {
-                        ip: addr.ip(),
-                        device: tls_peer_device_id(&tls),
-                    };
-                    if data_peer == control_peer {
-                        return Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>);
-                    }
-                    warn!(
-                        "dropping data connection from {data_peer}: transfer is controlled \
-                         from {control_peer}"
-                    );
+    run_receive(ctrl_send, ctrl_recv, route, peer, move |_transfer_id| {
+        let listener = Arc::clone(&listener);
+        let acceptor = Arc::clone(&acceptor);
+        let control_peer = control_peer.clone();
+        async move {
+            // Data connections are taken in arrival order, but only from
+            // the control connection's peer (same IP and client identity);
+            // anything else is dropped and the next one awaited.
+            loop {
+                let (raw, addr) = listener.accept().await.context("accept TCP data stream")?;
+                raw.set_nodelay(true)?;
+                let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(raw))
+                    .await
+                    .map_err(|_| anyhow!("TLS handshake on data stream timed out"))?
+                    .context("TLS handshake on data stream")?;
+                let data_peer = TcpPeer {
+                    ip: addr.ip(),
+                    device: tls_peer_device_id(&tls),
+                };
+                if data_peer == control_peer {
+                    return Ok(Box::new(tls) as Box<dyn AsyncRead + Unpin + Send + 'static>);
                 }
+                warn!(
+                    "dropping data connection from {data_peer}: transfer is controlled \
+                         from {control_peer}"
+                );
             }
-        },
-    )
+        }
+    })
     .await?;
     Ok(())
 }
@@ -1571,6 +1574,7 @@ where
         output_dir,
         budget,
         observer,
+        file_name: file_name_override,
     } = route;
     // The opening flight (NegotiateRequest, manifest, DirEntries) is sent by the
     // sender immediately after connecting; bound each read so a peer that
@@ -1605,11 +1609,15 @@ where
 
     // The manifest is small and fixed-shape (directory entries travel
     // separately in DirEntries), so the 1 MiB control cap is ample.
-    let manifest: TransferManifest =
+    let mut manifest: TransferManifest =
         handshake_read("TransferManifest", framing::recv_message(&mut ctrl_recv))
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream closed before TransferManifest"))?;
     validate_manifest(&manifest)?;
+    if let Some(name) = file_name_override {
+        manifest.file_name = name;
+        validate_manifest(&manifest).context("requested destination name")?;
+    }
 
     // Protocol version 3+: read DirEntries immediately after the manifest.
     // v2 senders don't send this message; skip the read for them.
@@ -2421,6 +2429,10 @@ pub struct Route {
     /// Lifecycle hooks for the transfer on this connection (the daemon's queue
     /// and at-rest encryption).
     pub observer: Option<Arc<dyn TransferObserver>>,
+    /// Store the transfer under this name instead of the sender's (a single
+    /// file, or a directory transfer's root) — scp-style `host:/dir/newname`.
+    /// Validated like a sender-supplied name.
+    pub file_name: Option<String>,
 }
 
 impl From<PathBuf> for Route {
@@ -2429,6 +2441,7 @@ impl From<PathBuf> for Route {
             output_dir,
             budget: None,
             observer: None,
+            file_name: None,
         }
     }
 }
@@ -4018,7 +4031,7 @@ mod tests {
         let fp = tcp.fingerprint.clone();
 
         // Nothing connects: the short accept window expires.
-        let err = accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(100))
+        let err = accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(100), None)
             .await
             .unwrap_err();
         assert!(err.is::<AcceptTimedOut>(), "{err:#}");
@@ -4026,7 +4039,7 @@ mod tests {
         // A connection that arrives in time keeps the call alive well past the
         // accept window (here it just goes quiet; a real transfer would run).
         let task = tokio::spawn(async move {
-            accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(300)).await
+            accept_one_quic_or_tcp(&quic, &tcp, Duration::from_millis(300), None).await
         });
         let client = crate::net::tcp::connect_tls(addr, Some(&fp), None, None)
             .await
