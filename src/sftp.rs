@@ -193,15 +193,16 @@ fn create_remote_file(dest: &SshDest, file_name: &str, file_size: u64) -> Result
         "" => ".",
         p => p,
     };
-    let into_dir = target.ends_with('/')
-        || sftp
-            .stat(Path::new(target))
-            .map(|st| st.is_dir())
-            .unwrap_or(false);
-    let remote_path = if into_dir {
-        format!("{}/{}", target.trim_end_matches('/'), file_name)
-    } else {
-        target.to_owned()
+    let is_dir = sftp
+        .stat(Path::new(target))
+        .map(|st| st.is_dir())
+        .unwrap_or(false);
+    // Same rules as the direct path's remote shell fragment.
+    let (dir, name) = crate::ssh::resolve_scp_dest(target, is_dir);
+    let name = name.as_deref().unwrap_or(file_name);
+    let remote_path = match dir.trim_end_matches('/') {
+        "" => format!("/{name}"),
+        d => format!("{d}/{name}"),
     };
     let remote_path = remote_path.as_str();
 

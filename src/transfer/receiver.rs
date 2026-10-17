@@ -625,7 +625,8 @@ pub async fn serve_one_stdio(
     .await?;
 
     // Machine-readable handshake — the SSH launcher reads exactly this line.
-    println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\"}}");
+    // `rename`: this server honours MFTP_OUTPUT_NAME (see `Route::file_name`).
+    println!("{{\"port\":{port},\"fingerprint\":\"{fingerprint}\",\"rename\":true}}");
     #[cfg(unix)]
     spawn_ssh_session_watchdog();
 
@@ -680,48 +681,48 @@ pub async fn serve_one_stdio(
 /// server running until the transfer's own timeouts fire — indefinitely for a
 /// TCP peer that vanished without a FIN. Every couple of seconds this writes a
 /// heartbeat newline to stdout (the sender drains it): if the sender is gone,
-/// its local `ssh` hits a broken pipe and exits, sshd then closes our stdout,
-/// and the write fails or `poll` reports POLLERR/POLLHUP. Only armed when
-/// stdout is a pipe or socket (as under sshd), never for a terminal/file.
-/// Exiting abruptly is safe: resume state is crash-consistent by design.
+/// its local `ssh` hits a broken pipe and exits, sshd closes our stdout, and
+/// the next write fails with EPIPE.
+///
+/// Runs on its own OS thread: if a sender doesn't drain stdout (an older
+/// client, or one suspended with Ctrl-Z) the write simply blocks that thread —
+/// never a runtime worker — and a reader that later goes away still fails it.
+/// Armed only under sshd (`SSH_CONNECTION` set) with stdout a pipe or socket,
+/// so a local launcher that reads the handshake and closes the pipe isn't
+/// mistaken for a dead session. Exiting abruptly is safe: resume state is
+/// crash-consistent by design.
 #[cfg(unix)]
 fn spawn_ssh_session_watchdog() {
-    let fd = libc::STDOUT_FILENO;
-    // SAFETY: fstat only writes into the zeroed stat buffer we own.
-    let is_pipe_or_socket = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        libc::fstat(fd, &mut st) == 0
-            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK)
-    };
-    if !is_pipe_or_socket {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    if std::env::var_os("SSH_CONNECTION").is_none() {
         return;
     }
-    tokio::spawn(async move {
-        let mut every = tokio::time::interval(Duration::from_secs(2));
-        loop {
-            every.tick().await;
-            let heartbeat = {
-                use std::io::Write;
-                let mut out = std::io::stdout().lock();
-                out.write_all(b"\n").and_then(|()| out.flush())
-            };
-            if heartbeat.is_err() {
+    let pipe_or_socket = std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(std::fs::File::from)
+        .and_then(|f| f.metadata())
+        .map(|m| m.file_type().is_fifo() || m.file_type().is_socket())
+        .unwrap_or(false);
+    if !pipe_or_socket {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("ssh-session-watchdog".into())
+        .spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let mut out = std::io::stdout().lock();
+            if out.write_all(b"\n").and_then(|()| out.flush()).is_err() {
                 warn!("SSH session closed; exiting one-shot server");
                 std::process::exit(1);
             }
-            let mut pfd = libc::pollfd {
-                fd,
-                events: 0,
-                revents: 0,
-            };
-            // SAFETY: one valid pollfd, zero timeout (never blocks).
-            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
-            if ready > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-                warn!("SSH session closed; exiting one-shot server");
-                std::process::exit(1);
-            }
-        }
-    });
+        });
+    if let Err(e) = spawned {
+        warn!("could not start SSH session watchdog: {e}");
+    }
 }
 
 /// Race QUIC and TCP for one complete transfer.  If the QUIC connection is
@@ -1667,10 +1668,12 @@ where
             .await?
             .ok_or_else(|| anyhow::anyhow!("stream closed before TransferManifest"))?;
     validate_manifest(&manifest)?;
+    let renamed = file_name_override.is_some();
     if let Some(name) = file_name_override {
         manifest.file_name = name;
         validate_manifest(&manifest).context("requested destination name")?;
     }
+    let resume_id = resume_id_for(&manifest, renamed);
 
     // Protocol version 3+: read DirEntries immediately after the manifest.
     // v2 senders don't send this message; skip the read for them.
@@ -1755,7 +1758,7 @@ where
 
     // On failure, send the error to the sender before closing so the sender
     // shows the actual filesystem error instead of "connection lost".
-    let pt = match prepare_transfer(&manifest, dir_entries.as_deref(), &output_dir) {
+    let pt = match prepare_transfer(&manifest, dir_entries.as_deref(), &output_dir, &resume_id) {
         Ok(pt) => pt,
         Err(e) => refuse!(e),
     };
@@ -2584,6 +2587,25 @@ impl Drop for JobGuard {
     }
 }
 
+/// Key for a transfer's resume file. The sender derives `transfer_id` from the
+/// *source* name, so when the receiver stores the transfer under another name
+/// (scp-style rename) the key also covers the destination name: sending one
+/// source to `a.bin` and then `b.bin` must not share a resume bitmap (the
+/// second would skip chunks never written to its file). Unrenamed transfers
+/// keep the plain `transfer_id`, so existing resume files stay valid.
+fn resume_id_for(manifest: &TransferManifest, renamed: bool) -> [u8; 16] {
+    if !renamed {
+        return manifest.transfer_id;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"mftp-resume-rename-v1");
+    h.update(&manifest.transfer_id);
+    h.update(manifest.file_name.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
 /// The regular files a transfer writes, for [`TransferJob::completed`].
 fn transfer_files(
     output_dir: &std::path::Path,
@@ -2810,10 +2832,12 @@ struct PreparedTransfer {
     received_bits: Vec<u64>,
 }
 
+/// `resume_id` keys the resume file (see [`resume_id_for`]).
 fn prepare_transfer(
     manifest: &TransferManifest,
     dir_entries: Option<&[FileEntry]>,
     output_dir: &std::path::Path,
+    resume_id: &[u8; 16],
 ) -> Result<PreparedTransfer> {
     // ── Free-space precondition (checked first, before allocating anything) ─────
     // Refuse if the destination filesystem can't hold the file. Otherwise
@@ -2850,7 +2874,7 @@ fn prepare_transfer(
 
     let resume = Arc::new(Mutex::new(ResumeState::load_or_new(
         output_dir,
-        &manifest.transfer_id,
+        resume_id,
         manifest.total_chunks,
     )));
     let (received_bits, bytes_already_received) = {
@@ -4192,7 +4216,7 @@ mod tests {
         // reject before allocating, with a clear out-of-space error.
         m.file_size = 100 * 1024 * 1024 * 1024 * 1024;
         m.total_chunks = m.file_size.div_ceil(m.chunk_size as u64);
-        match prepare_transfer(&m, None, dir.path()) {
+        match prepare_transfer(&m, None, dir.path(), &m.transfer_id) {
             Ok(_) => panic!("expected an out-of-space rejection"),
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -4446,6 +4470,21 @@ mod tests {
             .await
             .expect("matching data connection delivered")
             .unwrap();
+    }
+
+    /// Renamed transfers get a resume key of their own per destination name;
+    /// unrenamed ones keep the plain transfer_id (existing resume files stay
+    /// valid).
+    #[test]
+    fn resume_id_is_per_destination_name_when_renamed() {
+        let mut m = base_manifest();
+        assert_eq!(resume_id_for(&m, false), m.transfer_id);
+        m.file_name = "a.bin".into();
+        let a = resume_id_for(&m, true);
+        m.file_name = "b.bin".into();
+        let b = resume_id_for(&m, true);
+        assert_ne!(a, b);
+        assert_ne!(a, m.transfer_id);
     }
 
     #[tokio::test]
