@@ -5,6 +5,36 @@ All notable changes to mftp are documented here. The format is based on
 
 ## [Unreleased]
 
+_Nothing user-facing yet._
+
+## [0.3.0] — 2026-10-17
+
+First release of the mftp v2 feature set (`docs/V2_VISION.md` M0–M8): a
+persistent device identity, the `mftpd` daemon with mutual-TLS auth, LAN
+discovery, rendezvous + relay for NAT traversal, multipath bonding, and a
+multi-tenant service layer — plus a full security and correctness review of
+the codebase.
+
+### Protocol
+- `PROTOCOL_VERSION` is now **7**: each data stream starts with a
+  `StreamHello { transfer_id, stream_seq }`. It is only sent/expected when both
+  peers are ≥ 7, so 0.2.x / 0.1.130 peers still interoperate over the direct
+  QUIC/TCP path (tested against 0.1.120 and 0.2.1).
+
+### Upgrading (behaviour changes)
+- **Daemon open mode** requires that *neither* `acl.toml` nor
+  `authorized_devices` exists; an existing-but-empty allowlist denies everyone.
+  A malformed authorization file is a startup error.
+- **Relay**: senders must present the session token `mftp relay` prints, via
+  `MFTP_RELAY_TOKEN`.
+- **At-rest encryption** uses format v2 (`MFE2`); `MFE1` files can't be
+  decrypted.
+- **Open receivers** optionally request a client certificate (senders without
+  an identity still connect), so a reconnecting sender can be recognised.
+- **SSH destinations follow scp**: `host:/dir/new.bin` stores the file as
+  `new.bin` (previously the original name was kept); an existing directory or a
+  trailing `/` keeps the original name.
+
 ### Security
 - **Daemon authorization fails closed.** A malformed/unreadable `acl.toml` or
   `authorized_devices` is a startup error (SIGHUP keeps the previous policy);
@@ -38,15 +68,30 @@ All notable changes to mftp are documented here. The format is based on
 - Receiver-side checks on peer-supplied lengths/indices (FEC frames, repair
   chunks, `Ready`), bounded opening-flight reads, and TLS handshake timeouts.
 
+- A reconnect may supersede an in-progress transfer only with the same
+  `transfer_id` **and** the same client-certificate DeviceId; TCP data
+  connections must match their control connection's IP and client identity.
+- Quota admissions reserve each transfer's size atomically, so parallel
+  transfers from one peer can't each pass against the same remaining budget.
+
 ### Added
+- **v2 (M0–M8):** `Transport` abstraction; persistent Ed25519 device identity
+  and `--trust-device`; multipath bonding; the `mftpd` daemon (control socket,
+  `daemon-status`/`daemon-trust`, mutual-TLS DeviceId auth, SIGHUP reload);
+  LAN discovery (`mftp send <file> <name>`); `mftp rendezvous` broker and
+  `mftp relay` zero-knowledge UDP relay; per-peer ACLs with output subdirs and
+  byte quotas; read-only Web UI / JSON API (`daemon --http`).
 - `mftp daemon --encrypt-at-rest <KEY_FILE>` stores received files encrypted;
   `mftp decrypt` recovers them.
 - The daemon records every transfer in the persistent queue
   (`~/.config/mftp/queue.json`), so the Web UI / `/queue` show real jobs.
 - `TcpServer::serve` (TCP+TLS on `receive`/`listen`) runs transfers
   concurrently, routing data connections by their v7 `StreamHello`.
-- A sender reconnecting for the same transfer supersedes its stale QUIC
-  connection instead of being refused until it times out.
+- A sender reconnecting for the same transfer supersedes its stale connection
+  (QUIC or TCP) instead of being refused until it times out.
+- scp-style SSH destination renames (`host:/dir/newname`), also in the SFTP
+  fallback, with per-destination resume state; a warning if the remote binary
+  is too old to rename, and an early error for a directory sent onto a file.
 
 ### Fixed
 - A single corrupt chunk on a large fresh transfer no longer fails it fatally;
@@ -61,6 +106,13 @@ All notable changes to mftp are documented here. The format is based on
 - `-n 0`, `--chunk-size 0`/absurd sizes and negative/NaN `--tcp-below-rtt`
   (CLI or config.toml) are rejected with a clear error instead of panicking.
 - `--help` no longer recommends `--fec` for lossy links.
+- SSH mode: transfers longer than 5 minutes are no longer cut off (the
+  one-shot server's timeout bounds only the wait for a connection); the
+  post-send acknowledgement wait no longer gives up while data is still in
+  flight on a slow link; the sender no longer hangs waiting for the remote
+  server to exit; and a crashed sender no longer leaves `mftp server` running
+  on the remote (sshd sends no SIGHUP without a TTY — the server now notices
+  the session closing).
 
 ## [0.2.2] — 2026-06-05
 
