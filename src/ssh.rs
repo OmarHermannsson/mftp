@@ -312,8 +312,7 @@ async fn pipe_binary_to_remote(
     dest: &SshDest,
     binary: &[u8],
     platform: &RemotePlatform,
-    remote_port: Option<u16>,
-    require_peer: Option<&str>,
+    launch: ServerLaunch<'_>,
 ) -> Result<tokio::process::Child> {
     let digest: [u8; 32] = Sha256::digest(binary).into();
     let script = remote_bootstrap_script(
@@ -322,8 +321,7 @@ async fn pipe_binary_to_remote(
         &hex::encode(digest),
         binary.len() as u64,
         &dest.remote_path,
-        remote_port,
-        require_peer,
+        launch,
     );
 
     let mut child = ssh_command(dest)
@@ -372,19 +370,17 @@ fn remote_bootstrap_script(
     sha256_hex: &str,
     size: u64,
     remote_path: &str,
-    remote_port: Option<u16>,
-    require_peer: Option<&str>,
+    launch: ServerLaunch<'_>,
 ) -> String {
     let short = &sha256_hex[..16.min(sha256_hex.len())];
-    let env_prefix = require_peer_env(require_peer);
+    let env_prefix = server_env(launch.require_peer);
     let quoted_dir = shell_quote(remote_path);
-    let port_arg = match remote_port {
-        Some(p) => format!(" --port {p}"),
-        None => String::new(),
-    };
+    let port_arg = launch.port_arg();
     [
         "set -e;".to_owned(),
-        "umask 077;".to_owned(),
+        // Private umask for the cache only; the user's own umask is restored
+        // before exec so received files get their normal permissions.
+        "um=$(umask); umask 077;".to_owned(),
         format!("want={sha256_hex};"),
         // Pick a per-user cache directory; never a shared world-writable one.
         r#"if [ -n "${XDG_CACHE_HOME:-}" ]; then c="$XDG_CACHE_HOME/mftp"; elif [ -n "${HOME:-}" ]; then c="$HOME/.cache/mftp"; else c="${TMPDIR:-/tmp}/mftp-$(id -u)"; fi;"#.to_owned(),
@@ -401,29 +397,100 @@ fn remote_bootstrap_script(
         r#"else t="$f.tmp.$$"; rm -f "$t"; cat > "$t";"#.to_owned(),
         r#"if ok "$t"; then chmod 700 "$t"; mv -f "$t" "$f"; echo "[mftp] binary installed ($(wc -c < "$f" | tr -d " ") bytes)" >&2;"#.to_owned(),
         r#"else rm -f "$t"; echo "[mftp] uploaded binary failed integrity verification; refusing to run it" >&2; exit 1; fi; fi;"#.to_owned(),
-        // scp-like destination semantics: a non-directory path is a file
-        // destination whose parent is the output dir.
-        format!(r#"d={quoted_dir}; if [ -d "$d" ]; then :; else d=$(dirname "$d"); fi;"#),
-        format!(r#"exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
+        remote_dest_fragment(&quoted_dir, launch.dir_transfer),
+        format!(r#"umask "$um"; exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
     ]
     .join(" ")
 }
+
+/// How long the sender waits for the remote one-shot server to exit after the
+/// transfer before tearing the SSH session down.
+const REMOTE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Environment variable through which the SSH launcher hands the remote
 /// one-shot `mftp server` the sender's DeviceId to require.
 pub const REQUIRE_PEER_ENV: &str = "MFTP_REQUIRE_PEER";
 
-/// `env MFTP_REQUIRE_PEER=<id> ` prefix for the remote server command (empty
-/// when no id). `env` works from any login shell, and a binary predating the
-/// variable just ignores it. Ids that aren't plain hex are dropped rather than
-/// interpolated into the remote command.
-fn require_peer_env(require_peer: Option<&str>) -> String {
-    match require_peer {
-        Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            format!("env {REQUIRE_PEER_ENV}={id} ")
-        }
-        _ => String::new(),
+/// Environment variable through which the SSH launcher tells the remote
+/// one-shot `mftp server` to store the transfer under a new name (scp-style
+/// `host:/dir/newname`). Empty = keep the sender's name.
+pub const OUTPUT_NAME_ENV: &str = "MFTP_OUTPUT_NAME";
+
+/// scp-like destination semantics, as a shell fragment run on the remote:
+/// sets `$d` to the output directory and `$n` to the name to store the
+/// transfer under (empty = the sender's). An existing directory, or a path
+/// ending in `/`, is the output directory itself; anything else is a file
+/// destination — its parent is the output directory and its last component
+/// the new name.
+///
+/// This must match [`resolve_scp_dest`] (the SFTP fallback's resolver); a test
+/// runs both over the same cases. For a directory transfer an existing
+/// non-directory destination is refused up front (like scp's "not a
+/// directory"). When a rename applies it also prints [`RENAME_MARKER`] so the
+/// sender can tell whether the server it launched honoured it.
+fn remote_dest_fragment(quoted_path: &str, dir_transfer: bool) -> String {
+    let refuse_file = if dir_transfer {
+        r#"if [ -e "$d" ]; then echo "[mftp] destination exists and is not a directory: $d" >&2; exit 1; fi; "#
+    } else {
+        ""
+    };
+    format!(
+        r#"d={quoted_path}; n=; case "$d" in */) ;; *) if [ -d "$d" ]; then :; else {refuse_file}n=$(basename "$d"); d=$(dirname "$d"); fi;; esac; if [ -n "$n" ]; then echo {RENAME_MARKER}; fi;"#
+    )
+}
+
+/// Printed by [`remote_dest_fragment`] when the destination renames the file.
+const RENAME_MARKER: &str = "mftp-rename-requested";
+
+/// scp-like destination resolution (the Rust twin of [`remote_dest_fragment`]):
+/// returns the output directory and, if the destination names a new file,
+/// that name. `is_existing_dir` says whether `path` is an existing directory.
+pub(crate) fn resolve_scp_dest(path: &str, is_existing_dir: bool) -> (String, Option<String>) {
+    if path.is_empty() {
+        return (".".to_owned(), None);
     }
+    if path.ends_with('/') || is_existing_dir {
+        return (path.to_owned(), None);
+    }
+    match path.rsplit_once('/') {
+        Some(("", name)) => ("/".to_owned(), Some(name.to_owned())),
+        Some((dir, name)) => (dir.to_owned(), Some(name.to_owned())),
+        None => (".".to_owned(), Some(path.to_owned())),
+    }
+}
+
+/// How to launch the remote one-shot `mftp server`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ServerLaunch<'a> {
+    /// Fixed listen port (default: random).
+    port: Option<u16>,
+    /// The sender's DeviceId the server must require.
+    require_peer: Option<&'a str>,
+    /// Sending a directory (affects destination checks).
+    dir_transfer: bool,
+}
+
+impl ServerLaunch<'_> {
+    fn port_arg(&self) -> String {
+        match self.port {
+            Some(p) => format!(" --port {p}"),
+            None => String::new(),
+        }
+    }
+}
+
+/// `env MFTP_OUTPUT_NAME="$n" [MFTP_REQUIRE_PEER=<id>] ` prefix for the remote
+/// server command (pairs with [`remote_dest_fragment`]). A binary predating
+/// these variables just ignores them. Ids that aren't plain hex are dropped
+/// rather than interpolated into the remote command.
+fn server_env(require_peer: Option<&str>) -> String {
+    let mut env = format!(r#"env {OUTPUT_NAME_ENV}="$n" "#);
+    if let Some(id) =
+        require_peer.filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        env.push_str(&format!("{REQUIRE_PEER_ENV}={id} "));
+    }
+    env
 }
 
 /// Wrap `script` as a single remote command string `sh -c '<script>'`.
@@ -655,6 +722,10 @@ fn build_dest(
 struct ServerHandshake {
     port: u16,
     fingerprint: String,
+    /// The server applies `MFTP_OUTPUT_NAME` renames (absent from older
+    /// binaries, which silently ignore it).
+    #[serde(default)]
+    rename: bool,
 }
 
 /// RAII guard that kills a child process when dropped.
@@ -704,12 +775,16 @@ pub async fn send_via_ssh(
     // probe first so we fail clearly instead of hanging on a bad exec.
     // Lock the one-shot remote server to our own DeviceId so another host that
     // reaches its port first can't take the transfer slot.
-    let require_peer = config
-        .client_identity
-        .as_ref()
-        .map(|id| id.device_id.as_str());
+    let launch = ServerLaunch {
+        port: remote_port,
+        require_peer: config
+            .client_identity
+            .as_ref()
+            .map(|id| id.device_id.as_str()),
+        dir_transfer: file.is_dir(),
+    };
     let child = match remote_mftp {
-        Some(ref bin) => spawn_remote_binary(&dest, bin, remote_port, require_peer)?,
+        Some(ref bin) => spawn_remote_binary(&dest, bin, launch)?,
         None => {
             let local = local_platform();
             let remote_platform = probe_remote_platform(&dest).await?;
@@ -748,15 +823,7 @@ pub async fn send_via_ssh(
                     match download_remote_binary(rp, binary_sha256.as_deref()).await {
                         Ok(binary) => {
                             eprintln!("[mftp] piping downloaded binary to remote ({remote_desc})…");
-                            match pipe_binary_to_remote(
-                                &dest,
-                                &binary,
-                                rp,
-                                remote_port,
-                                require_peer,
-                            )
-                            .await
-                            {
+                            match pipe_binary_to_remote(&dest, &binary, rp, launch).await {
                                 Ok(child) => child,
                                 Err(e) => {
                                     eprintln!(
@@ -783,7 +850,7 @@ pub async fn send_via_ssh(
                     return crate::sftp::send_via_sftp(file, dest, n).await;
                 }
             } else {
-                pipe_self_to_remote(&dest, remote_port, require_peer).await?
+                pipe_self_to_remote(&dest, launch).await?
             }
         }
     };
@@ -797,6 +864,7 @@ pub async fn send_via_ssh(
     // that begins with '{'.
     let stdout = ssh.0.stdout.take().expect("stdout is piped");
     let mut reader = BufReader::new(stdout);
+    let mut rename_requested = false;
     let hs: ServerHandshake = loop {
         let mut line = String::new();
         let n = reader
@@ -805,8 +873,9 @@ pub async fn send_via_ssh(
             .context("reading server handshake from ssh")?;
         if n == 0 {
             bail!(
-                "remote mftp server exited without printing a handshake \
-                 (check that the remote shell startup files don't produce errors)"
+                "remote mftp server exited without printing a handshake (see any \
+                 [mftp] message above; otherwise check that the remote shell startup \
+                 files don't produce errors)"
             );
         }
         let line = line.trim();
@@ -814,9 +883,28 @@ pub async fn send_via_ssh(
             break serde_json::from_str(line)
                 .with_context(|| format!("invalid server handshake: {line:?}"))?;
         }
+        if line == RENAME_MARKER {
+            rename_requested = true;
+            continue;
+        }
         // Shell preamble noise — log at debug and skip.
         tracing::debug!("ssh preamble: {line}");
     };
+    if rename_requested && !hs.rename {
+        eprintln!(
+            "[mftp] warning: the remote mftp is too old to store the file under the \
+             requested name; it will keep its original name in {}",
+            resolve_scp_dest(&dest.remote_path, false).0
+        );
+    }
+
+    // Keep draining the server's stdout: it writes heartbeats there (see
+    // `spawn_ssh_session_watchdog` in the receiver), and if this process dies
+    // the resulting broken pipe is what tears the SSH session — and so the
+    // remote server — down.
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+    });
 
     eprintln!(
         "Remote server ready  port={}  fp={}…",
@@ -911,9 +999,10 @@ pub async fn send_via_ssh(
         return Ok(());
     }
 
-    // Transfer complete — give the remote server a moment to exit cleanly.
-    // KillOnDrop fires on drop regardless, so this is best-effort.
-    let _ = ssh.0.wait().await;
+    // Transfer complete — give the remote server a moment to exit cleanly,
+    // then KillOnDrop ends the session (bounded: a remote that never exits must
+    // not hang the sender).
+    let _ = tokio::time::timeout(REMOTE_EXIT_GRACE, ssh.0.wait()).await;
     Ok(())
 }
 
@@ -927,28 +1016,23 @@ pub async fn send_via_ssh(
 fn spawn_remote_binary(
     dest: &SshDest,
     bin: &str,
-    remote_port: Option<u16>,
-    require_peer: Option<&str>,
+    launch: ServerLaunch<'_>,
 ) -> Result<tokio::process::Child> {
-    let port_arg = match remote_port {
-        Some(p) => format!(" --port {p}"),
-        None => String::new(),
-    };
-    // Use scp-like semantics: if the remote path is not an existing directory,
-    // treat it as a file destination and use its parent as the output dir.
-    // E.g. host:/data/file writes to /data/file (parent = /data, filename from manifest).
+    let port_arg = launch.port_arg();
+    // scp-like semantics (see `remote_dest_fragment`): host:/data/new.bin
+    // writes /data/new.bin, host:/data/ (or an existing dir) writes inside it.
     let quoted_dir = shell_quote(&dest.remote_path);
-    let remote_cmd = format!(
-        "d={quoted_dir}; if [ ! -d \"$d\" ]; then d=$(dirname \"$d\"); fi; {}{} server --output-dir \"$d\"{}",
-        require_peer_env(require_peer),
+    let script = format!(
+        r#"{} exec {}{} server --output-dir "$d"{}"#,
+        remote_dest_fragment(&quoted_dir, launch.dir_transfer),
+        server_env(launch.require_peer),
         shell_quote(bin),
         port_arg,
     );
-    // Pass the command as a single argument so SSH sends it verbatim to the
-    // remote login shell.  Using `sh -c <script>` here would make `server`
-    // and `--output-dir` become $0/$1 (ignored) instead of mftp arguments.
+    // One `sh -c '<script>'` word, so the POSIX fragment also works when the
+    // remote login shell is csh/fish.
     ssh_command(dest)
-        .arg(&remote_cmd)
+        .arg(remote_sh_command(&script))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -963,8 +1047,7 @@ fn spawn_remote_binary(
 /// [`remote_bootstrap_script`] for the caching and integrity checks.
 async fn pipe_self_to_remote(
     dest: &SshDest,
-    remote_port: Option<u16>,
-    require_peer: Option<&str>,
+    launch: ServerLaunch<'_>,
 ) -> Result<tokio::process::Child> {
     let exe = std::env::current_exe().context("cannot locate current executable")?;
     let binary = tokio::fs::read(&exe)
@@ -972,7 +1055,7 @@ async fn pipe_self_to_remote(
         .with_context(|| format!("cannot read {}", exe.display()))?;
     // OS + arch are part of the cache name so a shared remote receiving from
     // clients of different platforms stores binaries separately.
-    pipe_binary_to_remote(dest, &binary, &local_platform(), remote_port, require_peer).await
+    pipe_binary_to_remote(dest, &binary, &local_platform(), launch).await
 }
 
 /// Single-quote a string for safe embedding in a POSIX shell command.
@@ -1003,9 +1086,63 @@ async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use super::{
         download_url, local_platform, parse_remote_platform_output, parse_sha256_line,
-        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command,
-        require_peer_env, shell_quote, RemotePlatform, REQUIRE_PEER_ENV,
+        parse_ssh_dest, platform_matches, remote_bootstrap_script, remote_sh_command, server_env,
+        shell_quote, RemotePlatform, ServerLaunch, OUTPUT_NAME_ENV, REQUIRE_PEER_ENV,
     };
+
+    /// scp-like destination resolution, run through a real `sh`: an existing
+    /// dir or a trailing `/` is the output dir; anything else is a new name in
+    /// its parent.
+    #[cfg(unix)]
+    #[test]
+    fn remote_dest_fragment_resolves_like_scp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("existing.txt"), b"x").unwrap();
+        // Runs the fragment through sh; returns (succeeded, stdout).
+        let run = |path: &str, dir_transfer: bool| {
+            let script = format!(
+                r#"{} printf "%s|%s" "$d" "$n""#,
+                super::remote_dest_fragment(&shell_quote(path), dir_transfer)
+            );
+            let o = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            (o.status.success(), String::from_utf8(o.stdout).unwrap())
+        };
+        let cases = [
+            root.to_owned(),
+            format!("{root}/"),
+            format!("{root}/new name.bin"),
+            format!("{root}/missing/"),
+            format!("{root}/existing.txt"),
+            "relative.bin".to_owned(),
+        ];
+        for path in &cases {
+            let (ok, out) = run(path, false);
+            assert!(ok, "{path}");
+            let (d, n) = out.lines().last().unwrap().split_once('|').unwrap();
+            // The shell fragment and the SFTP resolver must agree.
+            let (rd, rn) = super::resolve_scp_dest(path, std::path::Path::new(path).is_dir());
+            assert_eq!((d, n), (rd.as_str(), rn.as_deref().unwrap_or("")), "{path}");
+            // The rename marker appears exactly when a new name applies.
+            assert_eq!(
+                out.lines().any(|l| l == super::RENAME_MARKER),
+                !n.is_empty()
+            );
+        }
+        assert_eq!(
+            super::resolve_scp_dest("/top.bin", false),
+            ("/".to_owned(), Some("top.bin".to_owned()))
+        );
+        assert_eq!(super::resolve_scp_dest("", false), (".".to_owned(), None));
+        // Directory transfer onto an existing regular file: refused up front.
+        assert!(!run(&format!("{root}/existing.txt"), true).0);
+        // …but renaming a directory transfer to a new name is fine.
+        assert!(run(&format!("{root}/newdir"), true).0);
+    }
 
     /// The remote command must be ONE shell word after `sh -c`, on one line,
     /// with no `!`/backslashes inside the script (csh/fish compatibility).
@@ -1017,8 +1154,11 @@ mod tests {
             &"ab".repeat(32),
             1234,
             "/data/it's here",
-            Some(9000),
-            Some(&"cd".repeat(32)),
+            ServerLaunch {
+                port: Some(9000),
+                require_peer: Some("cd".repeat(32).as_str()),
+                dir_transfer: false,
+            },
         );
         assert!(!script.contains('\n'), "script must be a single line");
         assert!(!script.contains('!'), "no history-expansion characters");
@@ -1028,9 +1168,10 @@ mod tests {
         assert!(cmd.starts_with("sh -c '"));
         assert!(cmd.ends_with('\''));
         assert!(script.contains("--port 9000"));
-        assert!(script.contains(&format!("env {REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        assert!(script.contains(&format!("{REQUIRE_PEER_ENV}={}", "cd".repeat(32))));
+        assert!(script.contains(&format!(r#"env {OUTPUT_NAME_ENV}="$n""#)));
         // Anything but plain hex is never interpolated into the command.
-        assert_eq!(require_peer_env(Some("x; rm -rf ~")), "");
+        assert!(!server_env(Some("x; rm -rf ~")).contains("rm"));
     }
 
     /// Run the bootstrap exactly as the remote login shell would (`sh -c` of
@@ -1046,7 +1187,8 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let out = tempfile::TempDir::new().unwrap();
-        let binary = b"#!/bin/sh\necho \"ARGS:$*\"\n".to_vec();
+        // Reports its args and the umask it was started with.
+        let binary = b"#!/bin/sh\necho \"ARGS:$* UMASK:$(umask)\"\n".to_vec();
         let hash = hex::encode(Sha256::digest(&binary));
         let script = remote_bootstrap_script(
             "linux",
@@ -1054,15 +1196,16 @@ mod tests {
             &hash,
             binary.len() as u64,
             out.path().to_str().unwrap(),
-            None,
-            None,
+            ServerLaunch::default(),
         );
         let cmd = remote_sh_command(&script);
 
         let run = |stdin_bytes: &[u8]| {
+            // The login shell's umask (0022) must reach the server, not the
+            // bootstrap's private 077.
             let mut child = Command::new("sh")
                 .arg("-c")
-                .arg(&cmd)
+                .arg(format!("umask 0022; {cmd}"))
                 .env("HOME", home.path())
                 .env_remove("XDG_CACHE_HOME")
                 .stdin(Stdio::piped())
@@ -1078,7 +1221,10 @@ mod tests {
                 String::from_utf8_lossy(&o.stderr).into_owned(),
             )
         };
-        let expected = format!("ARGS:server --output-dir {}", out.path().display());
+        let expected = format!(
+            "ARGS:server --output-dir {} UMASK:0022",
+            out.path().display()
+        );
         let cache_dir = home.path().join(".cache/mftp");
         let cached = cache_dir.join(format!("mftp-linux-x86_64-{}", &hash[..16]));
 
@@ -1134,8 +1280,7 @@ mod tests {
             &hash,
             binary.len() as u64,
             out.path().to_str().unwrap(),
-            None,
-            None,
+            ServerLaunch::default(),
         ));
         // Plant a symlink where the per-uid dir would go, pointing elsewhere.
         let uid = unsafe { libc::getuid() };
