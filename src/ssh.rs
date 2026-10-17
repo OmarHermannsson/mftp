@@ -384,7 +384,9 @@ fn remote_bootstrap_script(
     };
     [
         "set -e;".to_owned(),
-        "umask 077;".to_owned(),
+        // Private umask for the cache only; the user's own umask is restored
+        // before exec so received files get their normal permissions.
+        "um=$(umask); umask 077;".to_owned(),
         format!("want={sha256_hex};"),
         // Pick a per-user cache directory; never a shared world-writable one.
         r#"if [ -n "${XDG_CACHE_HOME:-}" ]; then c="$XDG_CACHE_HOME/mftp"; elif [ -n "${HOME:-}" ]; then c="$HOME/.cache/mftp"; else c="${TMPDIR:-/tmp}/mftp-$(id -u)"; fi;"#.to_owned(),
@@ -404,7 +406,7 @@ fn remote_bootstrap_script(
         // scp-like destination semantics: a non-directory path is a file
         // destination whose parent is the output dir.
         format!(r#"d={quoted_dir}; if [ -d "$d" ]; then :; else d=$(dirname "$d"); fi;"#),
-        format!(r#"exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
+        format!(r#"umask "$um"; exec {env_prefix}"$f" server --output-dir "$d"{port_arg}"#),
     ]
     .join(" ")
 }
@@ -1046,7 +1048,8 @@ mod tests {
 
         let home = tempfile::TempDir::new().unwrap();
         let out = tempfile::TempDir::new().unwrap();
-        let binary = b"#!/bin/sh\necho \"ARGS:$*\"\n".to_vec();
+        // Reports its args and the umask it was started with.
+        let binary = b"#!/bin/sh\necho \"ARGS:$* UMASK:$(umask)\"\n".to_vec();
         let hash = hex::encode(Sha256::digest(&binary));
         let script = remote_bootstrap_script(
             "linux",
@@ -1060,9 +1063,11 @@ mod tests {
         let cmd = remote_sh_command(&script);
 
         let run = |stdin_bytes: &[u8]| {
+            // The login shell's umask (0022) must reach the server, not the
+            // bootstrap's private 077.
             let mut child = Command::new("sh")
                 .arg("-c")
-                .arg(&cmd)
+                .arg(format!("umask 0022; {cmd}"))
                 .env("HOME", home.path())
                 .env_remove("XDG_CACHE_HOME")
                 .stdin(Stdio::piped())
@@ -1078,7 +1083,10 @@ mod tests {
                 String::from_utf8_lossy(&o.stderr).into_owned(),
             )
         };
-        let expected = format!("ARGS:server --output-dir {}", out.path().display());
+        let expected = format!(
+            "ARGS:server --output-dir {} UMASK:0022",
+            out.path().display()
+        );
         let cache_dir = home.path().join(".cache/mftp");
         let cached = cache_dir.join(format!("mftp-linux-x86_64-{}", &hash[..16]));
 
